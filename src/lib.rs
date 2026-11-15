@@ -55,6 +55,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Attach the failing operation and path to an I/O error, so a report from a
+/// platform we cannot reproduce on says which step broke.
+fn io_ctx<T>(r: std::io::Result<T>, what: &str, path: &Path) -> Result<T> {
+    r.map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()))))
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -447,7 +453,7 @@ impl Db {
                     && (g.pq_subspaces() > 0 || !self.opts.graph.use_pq || total < pq::MIN_N)
             });
             let mut ids: Vec<u64> = Vec::with_capacity(if incremental { i.delta.len() } else { i.meta.len() });
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&vec_tmp)?);
+            let mut w = std::io::BufWriter::new(io_ctx(std::fs::File::create(&vec_tmp), "create snapshot", &vec_tmp)?);
             use std::io::Write as _;
             if let Some(g) = i.graph.as_ref().filter(|_| !incremental) {
                 for slot in 0..g.len() as u32 {
@@ -470,10 +476,16 @@ impl Db {
         // 2. Build outside the lock. This is the slow part.
         let idx_tmp = self.idx_path.with_extension("idx.tmp");
         let built = (|| -> Result<()> {
-            let file = std::fs::File::open(&vec_tmp)?;
-            // Safety: the snapshot file is complete and never written again.
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            let vectors: &[f32] = if ids.is_empty() { &[] } else { bytemuck::cast_slice(&mmap) };
+            // An empty snapshot is not mapped: Windows refuses to map a
+            // zero-length file.
+            let mmap = if ids.is_empty() {
+                None
+            } else {
+                let file = io_ctx(std::fs::File::open(&vec_tmp), "open snapshot", &vec_tmp)?;
+                // Safety: the snapshot file is complete and never written again.
+                Some(io_ctx(unsafe { memmap2::Mmap::map(&file) }, "map snapshot", &vec_tmp)?)
+            };
+            let vectors: &[f32] = mmap.as_ref().map_or(&[], |m| bytemuck::cast_slice(m));
             match &base {
                 Some((graph, dead)) => graph::update_and_write(&idx_tmp, graph, dead, &ids, vectors, self.opts.graph),
                 None => graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, vectors, self.opts.graph),
@@ -494,10 +506,10 @@ impl Db {
         // a reference, and `base` was dropped above. If the rename fails the
         // old file is still there; reopen it so the store stays usable.
         i.graph = None;
-        if let Err(e) = std::fs::rename(&idx_tmp, &self.idx_path) {
+        if let Err(e) = io_ctx(std::fs::rename(&idx_tmp, &self.idx_path), "replace index", &self.idx_path) {
             i.graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric).ok().flatten().map(Arc::new);
             let _ = std::fs::remove_file(&idx_tmp);
-            return Err(e.into());
+            return Err(e);
         }
         // Map the new file before the log swap so the log we write only names
         // vectors the new index holds.
@@ -531,14 +543,17 @@ impl Db {
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.
         i.wal.release();
-        if let Err(e) = std::fs::rename(&log_tmp, &self.path) {
+        if let Err(e) = io_ctx(std::fs::rename(&log_tmp, &self.path), "replace log", &self.path) {
             let _ = std::fs::remove_file(&log_tmp);
             i.wal = Wal::open(&self.path, self.header)?.0;
             i.graph = Some(Arc::new(graph));
-            return Err(e.into());
+            return Err(e);
         }
+        // Durability of the renames themselves. Directory fsync is a Unix
+        // notion; Windows cannot open a directory as a file.
+        #[cfg(unix)]
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::File::open(dir)?.sync_all()?;
+            io_ctx(std::fs::File::open(dir).and_then(|d| d.sync_all()), "sync directory", dir)?;
         }
 
         let (wal, _) = Wal::open(&self.path, self.header)?;
