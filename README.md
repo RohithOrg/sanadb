@@ -129,8 +129,29 @@ measures CPU cost, not disk). Run it yourself with
 
 Beam 32 is the first pass after the index is opened, so its tail includes
 first-touch page faults on the mapped file; later passes run warm. PQ costs
-about 0.01 recall at a given beam and saves 10–15% CPU hot; its disk-read
-saving is unmeasured until the index exceeds RAM.
+about 0.01 recall at a given beam and saves 10–15% CPU hot.
+
+**Cold cache, SIFT1B prefix (public, real data).** First 5,000,000 vectors of
+big-ann-benchmarks "bigann" (uint8, dim 128, L2), the 1000 first public
+queries, ground truth by brute force. 16 GB laptop, NVMe, single query thread,
+beam 64. The page cache was dropped with `sudo purge` before each cold pass;
+the warm pass re-runs the same queries. Reproduce with `examples/bigann.rs`.
+
+| | PQ on | PQ off |
+|---|---|---|
+| graph build, 10 cores | 731 s | ~720 s |
+| index file | 3.55 GB | 3.40 GB |
+| recall@10 | 0.927 | 0.937 |
+| cold: mean / p50 / p99 | 8.6 ms / 5.6 ms / 39 ms | 21.9 ms / 4.5 ms / 187 ms |
+| warm: mean / p50 / p99 | 270 µs / 264 µs / 372 µs | 289 µs / 283 µs / 404 µs |
+
+Cold, every expanded node is a random 4 KB read. With PQ the walk reads only
+the expanded node's block (its adjacency) and scores neighbours from codes in
+RAM; without PQ it also reads each neighbour's block. That shows as 2.5x lower
+mean and 4.8x lower p99 cold latency with PQ. The medians are close, so for
+most queries the neighbour blocks were already pulled in by earlier hops;
+the gain is in the tail. Cold is still 30x slower than warm: the next step for
+disk-resident search is a block cache with read-ahead and parallel I/O.
 
 ## Roadmap
 
@@ -141,11 +162,14 @@ saving is unmeasured until the index exceeds RAM.
 4. **Done:** Product-quantized codes in RAM for the walk, exact re-rank from disk.
 5. **Done:** SIFT1M harness with published ground truth.
 6. **Done:** Thread-safe `Db`, non-blocking checkpoint, Python bindings, CI.
-7. Cold-cache measurement on a dataset larger than RAM (SIFT1B subset or
-   Cohere 10M). This is the thesis of the project and is still unproven.
-8. Sharded graph build so building, not just searching, scales past RAM.
-9. File lock against a second process opening the same store.
-10. ann-benchmarks and VectorDBBench adapters on top of the Python bindings.
+7. **Done:** Cold-cache measurement on a 5M SIFT1B prefix (3.5 GB index,
+   page cache purged). PQ cuts cold mean latency 2.5x and p99 4.8x.
+8. Cold-path I/O: issue the beam's block reads in parallel instead of one
+   page fault at a time, and cap the per-query tail.
+9. Sharded graph build so building, not just searching, scales past RAM
+   (5M took 731 s and ~7 GB; 10M would not fit a 16 GB machine).
+10. File lock against a second process opening the same store.
+11. ann-benchmarks and VectorDBBench adapters on top of the Python bindings.
 
 ## Development
 
