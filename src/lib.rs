@@ -527,10 +527,16 @@ impl Db {
         let inserts = survivors.iter().map(|&(id, off)| Entry::Insert { id, vector: i.wal.vector_at(off).to_vec(), meta: i.meta[&id].clone() });
         let metas = i.meta.iter().filter(|(id, _)| !survivor_ids.contains(id)).map(|(&id, m)| Entry::Meta { id, meta: m.clone() });
         let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas))?;
-        // Same Windows rule for the log: unmap the old one before replacing it.
-        // `vector_at` is not called again on the old `Wal` after this point.
+        // Same Windows rule for the log: close the old one before replacing
+        // it. If the rename fails, reopen the old log (its contents are
+        // unchanged, so the delta's offsets stay valid) and report the error.
         i.wal.release();
-        std::fs::rename(&log_tmp, &self.path)?;
+        if let Err(e) = std::fs::rename(&log_tmp, &self.path) {
+            let _ = std::fs::remove_file(&log_tmp);
+            i.wal = Wal::open(&self.path, self.header)?.0;
+            i.graph = Some(Arc::new(graph));
+            return Err(e.into());
+        }
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::File::open(dir)?.sync_all()?;
         }

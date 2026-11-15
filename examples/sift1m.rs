@@ -36,6 +36,7 @@ fn main() {
     let n_limit: Option<usize> = args.get(2).and_then(|s| s.parse().ok());
     let n_queries: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
     let use_pq = args.get(4).is_none_or(|s| s != "pq:off");
+    let prune_slack: f32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1.3);
 
     let (dim, base) = read_vecs::<f32, 4>(&dir.join("sift_base.fvecs"), f32::from_le_bytes);
     let n_total = base.len() / dim;
@@ -47,8 +48,10 @@ fn main() {
 
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("sift.sana");
-    let params = GraphParams { use_pq, ..GraphParams::default() };
-    let mut db = Db::open(&path, Options::new(dim as u32).graph(params)).unwrap();
+    let params = GraphParams { use_pq, prune_slack, ..GraphParams::default() };
+    // Bulk load: one explicit build at the end, no automatic ones in between.
+    let mut db = Db::open(&path, Options::new(dim as u32).graph(params).auto_checkpoint_delta(0)).unwrap();
+    println!("prune_slack={prune_slack}");
 
     let t = Instant::now();
     for i in 0..n {
@@ -83,7 +86,7 @@ fn main() {
     println!("{:>6} {:>9} {:>9} {:>9} {:>9}", "beam", "recall@10", "mean", "p50", "p99");
     for beam in [32u32, 64, 128, 256] {
         drop(db);
-        db = Db::open(&path, Options::new(dim as u32).graph(params).search_beam(beam).max_search_beam(beam)).unwrap();
+        db = Db::open(&path, Options::new(dim as u32).graph(params).search_beam(beam).max_search_beam(beam).auto_checkpoint_delta(0)).unwrap();
         let mut hit = 0usize;
         let mut lat: Vec<f64> = Vec::with_capacity(n_queries);
         for qi in 0..n_queries {

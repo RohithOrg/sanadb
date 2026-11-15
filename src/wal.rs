@@ -65,7 +65,8 @@ pub(crate) enum Replayed {
 }
 
 pub(crate) struct Wal {
-    writer: BufWriter<File>,
+    /// `None` after `release`: the file is closed so it can be replaced.
+    writer: Option<BufWriter<File>>,
     /// Logical end of the log: where the next frame goes.
     len: u64,
     /// Read-only mapping of the file, at least `len` bytes long. `None` only
@@ -102,7 +103,11 @@ impl Wal {
         // writer appends past `len`; bytes below `len` never change.
         let map = unsafe { Mmap::map(&file)? };
         file.seek(SeekFrom::Start(len))?;
-        Ok((Wal { writer: BufWriter::new(file), len, map: Some(map), dim: wanted.dim as usize }, entries))
+        Ok((Wal { writer: Some(BufWriter::new(file)), len, map: Some(map), dim: wanted.dim as usize }, entries))
+    }
+
+    fn writer(&mut self) -> Result<&mut BufWriter<File>> {
+        self.writer.as_mut().ok_or(Error::Corrupt("log used after release"))
     }
 
     /// Append a frame. For an insert, returns the byte offset of its vector.
@@ -113,9 +118,10 @@ impl Wal {
         if needed > self.map.as_ref().map_or(0, |m| m.len() as u64) {
             self.grow(needed)?;
         }
-        self.writer.write_all(&(body.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&crc32fast::hash(&body).to_le_bytes())?;
-        self.writer.write_all(&body)?;
+        let w = self.writer()?;
+        w.write_all(&(body.len() as u32).to_le_bytes())?;
+        w.write_all(&crc32fast::hash(&body).to_le_bytes())?;
+        w.write_all(&body)?;
         let vector_off = self.len + 8 + 4 + 8; // frame header, kind+pad, id
         self.len = needed;
         Ok(vector_off)
@@ -124,24 +130,27 @@ impl Wal {
     /// Extend the file in `GROW_STEP` multiples and remap. Called under the
     /// store's write lock, so no reader holds the old mapping's slices.
     fn grow(&mut self, needed: u64) -> Result<()> {
-        self.writer.flush()?;
         let new_len = needed.div_ceil(GROW_STEP) * GROW_STEP;
         self.map = None; // Windows: no resizing while mapped.
-        let file = self.writer.get_ref();
+        let w = self.writer()?;
+        w.flush()?;
+        let file = w.get_ref();
         file.set_len(new_len)?;
         // Safety: as in `open`.
         self.map = Some(unsafe { Mmap::map(file)? });
         Ok(())
     }
 
-    /// Flush, drop the mapping and trim growth slack, leaving the file in a
-    /// state another process (or a rename over it) can take. Called before
-    /// the log is replaced at checkpoint and on drop. The log must not be
-    /// read through this `Wal` afterwards.
+    /// Flush, drop the mapping, trim growth slack and close the file, so a
+    /// rename over it succeeds on every platform. Called before the log is
+    /// replaced at checkpoint and on drop. The `Wal` is unusable afterwards
+    /// and must be replaced (or reopened with `Wal::open`).
     pub fn release(&mut self) {
-        let _ = self.writer.flush();
         self.map = None;
-        let _ = self.writer.get_ref().set_len(self.len);
+        if let Some(mut w) = self.writer.take() {
+            let _ = w.flush();
+            let _ = w.get_ref().set_len(self.len);
+        }
     }
 
     /// The vector stored at an offset returned by `append` or replay.
@@ -152,14 +161,15 @@ impl Wal {
 
     /// Push buffered frames to the OS. Data survives a process crash, not a power loss.
     pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        self.writer()?.flush()?;
         Ok(())
     }
 
     /// Flush and fsync. Data survives power loss.
     pub fn sync(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
+        let w = self.writer()?;
+        w.flush()?;
+        w.get_ref().sync_data()?;
         Ok(())
     }
 }

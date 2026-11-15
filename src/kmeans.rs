@@ -35,8 +35,12 @@ pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: us
     }
     let t = epochs.max(1) as f64;
     let (nf, kf) = (n as f64, k as f64);
-    let raw_b = 0.035134 * kf.powf(0.134749) * nf.powf(0.876473) * t.powf(0.813344);
-    let batch = round_pow2(raw_b).min(round_pow2(nf / 2.0)).clamp(1, n);
+    // The reference's "auto" batch law: the "quality" coefficient (batches
+    // eight times smaller, so more steps) for dim <= 16, "throughput" above.
+    // PQ subspaces are a few floats wide, so they take the quality law.
+    let coefficient = if dim <= 16 { 0.00439175 } else { 0.035134 };
+    let raw_b = coefficient * kf.powf(0.134749) * nf.powf(0.876473) * t.powf(0.813344);
+    let batch = if dim <= 16 { round_pow2(raw_b).min(n / 2) } else { round_pow2(raw_b).min(round_pow2(nf / 2.0)) }.clamp(1, n);
     let alpha0 = (0.8244 * kf.powf(-0.4617) * (batch as f64).powf(0.9003) * nf.powf(-0.4498) * t.powf(-0.1057)).clamp(1e-4, 1.0);
 
     // Init: k-means++ (D^2 sampling) over a subsample. The reference uses a
@@ -230,6 +234,62 @@ mod tests {
             hit[b] = true;
         }
         assert!(hit.iter().all(|&h| h), "every blob gets a centroid: {hit:?}");
+    }
+
+    /// Plain Lloyd's algorithm, the baseline e-means is supposed to match in
+    /// far fewer passes.
+    fn lloyd<'a>(point: &dyn Fn(usize) -> &'a [f32], n: usize, dim: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+        let mut rng = XorShift(seed | 1);
+        let mut cents: Vec<f32> = (0..k).flat_map(|_| point((rng.next() % n as u64) as usize).to_vec()).collect();
+        for _ in 0..iters {
+            let mut sums = vec![0f64; k * dim];
+            let mut counts = vec![0usize; k];
+            for i in 0..n {
+                let a = nearest(&cents, dim, point(i));
+                counts[a] += 1;
+                for (s, x) in sums[a * dim..(a + 1) * dim].iter_mut().zip(point(i)) {
+                    *s += *x as f64;
+                }
+            }
+            for c in 0..k {
+                if counts[c] == 0 {
+                    cents[c * dim..(c + 1) * dim].copy_from_slice(point((rng.next() % n as u64) as usize));
+                } else {
+                    for (dst, s) in cents[c * dim..(c + 1) * dim].iter_mut().zip(&sums[c * dim..(c + 1) * dim]) {
+                        *dst = (s / counts[c] as f64) as f32;
+                    }
+                }
+            }
+        }
+        cents
+    }
+
+    fn distortion<'a>(point: &dyn Fn(usize) -> &'a [f32], n: usize, dim: usize, cents: &[f32]) -> f64 {
+        (0..n).map(|i| {
+            let c = nearest(cents, dim, point(i));
+            sq_dist(point(i), &cents[c * dim..(c + 1) * dim]) as f64
+        }).sum::<f64>() / n as f64
+    }
+
+    /// The setting that matters for PQ: 256 centroids over 4-dimensional
+    /// sub-vectors of a realistic, non-blobby distribution. e-means in 3
+    /// epochs must land within a few percent of Lloyd in 20.
+    #[test]
+    fn pq_sized_codebook_matches_lloyd() {
+        let (dim, n, k) = (4usize, 40_000usize, 256usize);
+        let mut rng = XorShift(11);
+        // Heavy-tailed-ish data: sum of two uniforms, scaled per dimension.
+        let pts: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|d| {
+                let u = |r: &mut XorShift| (r.next() >> 40) as f32 / (1u64 << 24) as f32;
+                (u(&mut rng) + u(&mut rng)) * (1.0 + d as f32)
+            }).collect())
+            .collect();
+        let point = |i: usize| pts[i].as_slice();
+        let e = distortion(&point, n, dim, &emeans(&point, n, dim, k, 3, 1));
+        let l = distortion(&point, n, dim, &lloyd(&point, n, dim, k, 20, 1));
+        eprintln!("distortion e-means(3 epochs)={e:.5} lloyd(20 iters)={l:.5} ratio={:.3}", e / l);
+        assert!(e <= l * 1.05, "e-means distortion {e} vs lloyd {l}");
     }
 
     #[test]

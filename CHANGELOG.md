@@ -36,11 +36,16 @@ the new version migrates old stores on open.
   rebuild the graph; their data is intact.
 
 ### Changed
+- Build is about a third faster (SIFT1M: 115 s to 77 s on 10 cores) with
+  slightly better recall per beam and 5 to 15% lower query latency:
+  adjacency lists may grow to `GraphParams::prune_slack` (default 1.3) times
+  R before being pruned, as DiskANN does, which on hub-heavy data such as word
+  embeddings removed the dominant cost; the walk's visited set uses FxHash
+  instead of SipHash; the walk reuses thread-local scratch buffers.
 - PQ codebooks and shard partitions are trained with e-means (Meta FAIR's
-  mini-batch k-means recipe) seeded by k-means++, instead of 8 to 12 rounds
-  of Lloyd.
-- Build walk reuses thread-local scratch buffers instead of allocating per
-  insertion.
+  mini-batch k-means recipe, with its small-dimension batch law) seeded by
+  k-means++, instead of 8 to 12 rounds of Lloyd. A test keeps its distortion
+  within 5% of a 20-iteration Lloyd baseline on a PQ-sized problem.
 - Locks are `parking_lot`: a panic on one thread no longer poisons the store
   for the others. `Error::Poisoned` is gone.
 

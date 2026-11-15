@@ -36,7 +36,7 @@ use std::fs::File;
 type FxHashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -65,11 +65,15 @@ pub struct GraphParams {
     /// peak RAM is roughly `shard_size * (R*4 + 50)` bytes for the adjacency.
     /// Also the largest graph that is updated in place rather than rebuilt.
     pub shard_size: u32,
+    /// During insertion an adjacency list may grow to `prune_slack * R`
+    /// before it is pruned back to R. 1.0 prunes on every overflow; 1.3 (the
+    /// DiskANN default) cuts prune calls sharply on data with hub nodes.
+    pub prune_slack: f32,
 }
 
 impl Default for GraphParams {
     fn default() -> Self {
-        GraphParams { max_degree: 32, build_beam: 100, alpha: 1.2, use_pq: true, shard_size: 1_000_000 }
+        GraphParams { max_degree: 32, build_beam: 100, alpha: 1.2, use_pq: true, shard_size: 1_000_000, prune_slack: 1.3 }
     }
 }
 
@@ -256,36 +260,59 @@ impl<'a> MemGraph<'a> {
     }
 
     /// Vamana insertion of node `p`: walk from `entry`, prune the visited set
-    /// to R, link back from each chosen neighbour and re-prune it if full.
-    /// `live` filters candidates (a deleted node may be walked through but
-    /// never linked to).
+    /// to R, link back from each chosen neighbour and re-prune it once it
+    /// overflows the slack. `live` filters candidates (a deleted node may be
+    /// walked through but never linked to).
+    ///
+    /// The slack matters: hub nodes in skewed data (word embeddings, for
+    /// instance) receive reverse edges constantly, and pruning on every
+    /// overflow made prune, not distance, the dominant build cost. Lists are
+    /// allowed to grow to `SLACK * R` and pruned back to R then, as DiskANN
+    /// does; `finish` prunes whatever is still over R at the end.
     fn insert(&self, p: u32, entry: u32, metric: Metric, params: GraphParams, live: &(dyn Fn(u32) -> bool + Sync)) {
         let r = params.max_degree as usize;
+        let slack = ((r as f32) * params.prune_slack.max(1.0)).ceil() as usize;
         let l = (params.build_beam as usize).max(r);
         let pv = self.vector(p);
         let mut cands = greedy(self, entry, l, 1, |s| distance(metric, pv, self.vector(s)));
-        cands.extend(self.adj[p as usize].read().unwrap().iter().map(|&s| (distance(metric, pv, self.vector(s)), s)));
+        cands.extend(self.adj[p as usize].read().iter().map(|&s| (distance(metric, pv, self.vector(s)), s)));
         cands.retain(|&(_, s)| live(s));
         let new = prune(self.vec, metric, p, cands, r, params.alpha);
-        *self.adj[p as usize].write().unwrap() = new.clone();
+        *self.adj[p as usize].write() = new.clone();
         for q in new {
-            let mut aq = self.adj[q as usize].write().unwrap();
+            let mut aq = self.adj[q as usize].write();
             if aq.contains(&p) {
                 continue;
             }
             aq.push(p);
-            if aq.len() > r {
+            if aq.len() > slack {
                 let qv = self.vector(q);
                 let c: Vec<(f32, u32)> = aq.iter().map(|&s| (distance(metric, qv, self.vector(s)), s)).collect();
                 *aq = prune(self.vec, metric, q, c, r, params.alpha);
             }
         }
     }
+
+    /// Prune every list still longer than R (they were allowed slack during
+    /// insertion) so the written graph has at most R edges per node.
+    fn finish(&self, metric: Metric, params: GraphParams, live: &(dyn Fn(u32) -> bool + Sync)) {
+        let r = params.max_degree as usize;
+        (0..self.adj.len() as u32).into_par_iter().for_each(|p| {
+            let over = self.adj[p as usize].read().len() > r;
+            if !over || !live(p) {
+                return;
+            }
+            let pv = self.vector(p);
+            let c: Vec<(f32, u32)> = self.adj[p as usize].read().iter().map(|&s| (distance(metric, pv, self.vector(s)), s)).collect();
+            *self.adj[p as usize].write() = prune(self.vec, metric, p, c, r, params.alpha);
+        });
+    }
 }
+
 
 impl Walkable for MemGraph<'_> {
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
-        out.extend_from_slice(&self.adj[slot as usize].read().unwrap());
+        out.extend_from_slice(&self.adj[slot as usize].read());
     }
 }
 
@@ -423,7 +450,7 @@ fn build_shard(vectors: &[f32], dim: usize, metric: Metric, rows: &[u32], params
     let mut g = MemGraph { vec: &vec, adj: (0..n).map(|_| RwLock::new(Vec::new())).collect() };
     // Random initial graph so every node is reachable from the start.
     for a in g.adj.iter_mut() {
-        let a = a.get_mut().unwrap();
+        let a = a.get_mut();
         while a.len() < r.min(n - 1) {
             let t = (rng.next() % n as u64) as u32;
             if !a.contains(&t) {
@@ -435,7 +462,8 @@ fn build_shard(vectors: &[f32], dim: usize, metric: Metric, rows: &[u32], params
     let order = shuffled(n, &mut rng);
     let g = &g;
     order.par_iter().for_each(|&p| g.insert(p, entry, metric, params, &|_| true));
-    g.adj.iter().map(|a| a.read().unwrap().clone()).collect()
+    g.finish(metric, params, &|_| true);
+    g.adj.iter().map(|a| a.read().clone()).collect()
 }
 
 /// k-means on a sample, then every row's two nearest centroids. Returns the
@@ -596,7 +624,7 @@ pub(crate) fn update_and_write(path: &Path, existing: &GraphIndex, dead: &HashSe
     //    dead one inherits the dead node's live neighbours, then re-prunes.
     if !dead.is_empty() {
         (0..old as u32).into_par_iter().filter(|&p| live(p)).for_each(|p| {
-            let mine: Vec<u32> = g.adj[p as usize].read().unwrap().clone();
+            let mine: Vec<u32> = g.adj[p as usize].read().clone();
             if !mine.iter().any(|&q| dead.contains(&q)) {
                 return;
             }
@@ -606,10 +634,10 @@ pub(crate) fn update_and_write(path: &Path, existing: &GraphIndex, dead: &HashSe
                 if live(q) {
                     cands.push((distance(metric, pv, vec(q)), q));
                 } else {
-                    cands.extend(g.adj[q as usize].read().unwrap().iter().copied().filter(|&x| live(x) && x != p).map(|x| (distance(metric, pv, vec(x)), x)));
+                    cands.extend(g.adj[q as usize].read().iter().copied().filter(|&x| live(x) && x != p).map(|x| (distance(metric, pv, vec(x)), x)));
                 }
             }
-            *g.adj[p as usize].write().unwrap() = prune(&vec, metric, p, cands, r, params.alpha);
+            *g.adj[p as usize].write() = prune(&vec, metric, p, cands, r, params.alpha);
         });
     }
 
@@ -624,7 +652,7 @@ pub(crate) fn update_and_write(path: &Path, existing: &GraphIndex, dead: &HashSe
         if old == 0 || dead.len() == old {
             // Nothing live to walk from: seed like a fresh build.
             for &p in &order {
-                let a = &mut *g.adj[p as usize].write().unwrap();
+                let a = &mut *g.adj[p as usize].write();
                 while a.len() < r.min(added - 1) {
                     let t = old as u32 + (rng.next() % added as u64) as u32;
                     if t != p && !a.contains(&t) {
@@ -635,6 +663,7 @@ pub(crate) fn update_and_write(path: &Path, existing: &GraphIndex, dead: &HashSe
         }
         let g = &g;
         order.par_iter().for_each(|&p| g.insert(p, entry, metric, params, &live));
+        g.finish(metric, params, &live);
     }
 
     // 4. Compact: live old slots keep their order, new slots follow.
@@ -663,7 +692,7 @@ pub(crate) fn update_and_write(path: &Path, existing: &GraphIndex, dead: &HashSe
     let pq_ref = pq.as_ref().map(|(cb, codes)| (*cb, codes.as_slice()));
     let edges = |ns: u32| -> Vec<u32> {
         let s = kept[ns as usize];
-        g.adj[s as usize].read().unwrap().iter().filter(|&&q| live(q)).map(|&q| new_slot[q as usize]).take(r).collect()
+        g.adj[s as usize].read().iter().filter(|&&q| live(q)).map(|&q| new_slot[q as usize]).take(r).collect()
     };
     write_index(path, dim, metric, &ids, &vec_new, r, entry_new, pq_ref, &edges)
 }
