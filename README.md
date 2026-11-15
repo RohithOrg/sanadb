@@ -3,7 +3,7 @@
 A disk-first embedded vector + metadata store in Rust. Single file, crash-safe,
 no server. Aimed at on-device and edge AI workloads that outgrow RAM.
 
-Status: milestone 1 (exact search, write-ahead log, checkpoint). Not production-ready.
+Status: milestone 2 (disk-resident graph index). Not production-ready.
 
 ## Usage
 
@@ -20,24 +20,56 @@ db.checkpoint()?; // compact the file
 
 ## Design
 
-- **One file, one log.** The file is a header plus CRC-framed insert/delete
-  frames. Open replays it; a torn tail is truncated. `checkpoint` rewrites the
-  file with only live records via temp-file + rename, so a crash mid-compaction
-  keeps the old file intact.
-- **Durability knobs.** Writes hit the OS page cache immediately (survive a
-  process crash). `sync()` or `Options::sync_every_write` fsync for power-loss safety.
-- **Exact flat index.** Vectors stored contiguously; distance loops use eight
-  independent accumulators so the compiler emits packed FMA. This is the
-  correctness baseline later indexes are measured against.
+Two files: `<path>` is the write-ahead log, `<path>.idx` is the graph index.
+
+- **Log.** Header plus CRC-framed frames: insert (id, vector, metadata),
+  delete (id), meta (id, metadata; the vector lives in the index). Open replays
+  it; a torn tail is truncated. Writes hit the OS page cache immediately and
+  survive a process crash; `sync()` or `Options::sync_every_write` fsync for
+  power-loss safety.
+- **Graph index.** A Vamana graph (the DiskANN layout): one fixed-size block
+  per node holding the vector, neighbour count and up to R neighbour slots.
+  The file is memory-mapped, so a query reads only the blocks it walks and the
+  OS page cache holds the working set. The dataset does not have to fit in RAM;
+  the id table (8 bytes per node) and metadata do.
+- **Delta + tombstones.** Writes since the last checkpoint live in an exact
+  in-RAM flat index. Graph records that were deleted or overwritten are hidden
+  by a tombstone set rebuilt from the log on open. A search walks the graph,
+  scans the delta, and merges.
+- **Checkpoint.** Rebuilds the graph over every live record, swaps the index
+  file in by rename, then rewrites the log as metadata-only frames and swaps
+  that in. Index first, so the log never names a vector the index lacks. A
+  crash between the two renames leaves a consistent, slightly redundant state.
+- **Flat index.** Contiguous `Vec<f32>`; distance loops use eight independent
+  accumulators so the compiler emits packed FMA. Also the correctness baseline
+  the graph is tested against (recall@10 ≥ 0.9 enforced, 0.996 measured).
+
+Graph build currently holds all vectors in RAM and runs single-threaded. Search
+is filter-after-walk: a very selective filter needs a larger `search_beam`.
+
+## Numbers
+
+Apple Silicon laptop, dim 128, k = 10, R = 32, build L = 100, search beam 64.
+
+| n | flat search | graph search | graph build |
+|---|---|---|---|
+| 10,000 | 227 µs | 94 µs | 4.2 s |
+| 100,000 | 3.66 ms | 130 µs | 54 s |
+
+Graph search time is nearly flat in n; the build is the cost to attack next.
 
 ## Roadmap
 
 1. **Done:** WAL, checkpoint, flat index, metadata filter, tests, Criterion bench.
-2. Disk-resident graph index (Vamana/DiskANN style) laid out in page-sized
-   blocks so the working set, not the dataset, must fit in RAM.
-3. Filtered graph traversal (filter-aware search, not post-filtering).
-4. MVCC snapshots for concurrent readers alongside a single writer.
-5. Benchmark against sqlite-vec, usearch and LanceDB on 10M x 768-dim vectors.
+2. **Done:** Disk-resident Vamana graph index, memory-mapped, with delta +
+   tombstones and atomic two-file checkpoint.
+3. Filter-aware graph traversal (keep walking until k accepted candidates).
+4. Product-quantized vectors in RAM for neighbour distances, full vectors on
+   disk only for re-ranking (the actual DiskANN trick). Cuts page faults per hop
+   from R to 1.
+5. Sharded, parallel graph build so building, not just searching, scales past RAM.
+6. MVCC snapshots for concurrent readers alongside a single writer.
+7. Benchmark against sqlite-vec, usearch and LanceDB on 10M x 768-dim vectors.
 
 ## Development
 

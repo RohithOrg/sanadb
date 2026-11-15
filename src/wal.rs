@@ -17,6 +17,8 @@ pub(crate) const HEADER_LEN: u64 = 8 + 4 + 1 + 3; // magic, dim, metric, pad
 
 const KIND_INSERT: u8 = 1;
 const KIND_DELETE: u8 = 2;
+/// Metadata only; the vector lives in the graph index sidecar.
+const KIND_META: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
@@ -28,6 +30,7 @@ pub(crate) struct Header {
 pub(crate) enum Entry {
     Insert { id: u64, vector: Vec<f32>, meta: Metadata },
     Delete { id: u64 },
+    Meta { id: u64, meta: Metadata },
 }
 
 pub(crate) struct Wal {
@@ -163,16 +166,25 @@ fn encode(entry: &Entry, out: &mut Vec<u8>) {
             for x in vector {
                 out.extend_from_slice(&x.to_le_bytes());
             }
-            out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
-            for (k, v) in meta {
-                put_str(out, k);
-                put_str(out, v);
-            }
+            put_meta(out, meta);
         }
         Entry::Delete { id } => {
             out.push(KIND_DELETE);
             out.extend_from_slice(&id.to_le_bytes());
         }
+        Entry::Meta { id, meta } => {
+            out.push(KIND_META);
+            out.extend_from_slice(&id.to_le_bytes());
+            put_meta(out, meta);
+        }
+    }
+}
+
+fn put_meta(out: &mut Vec<u8>, meta: &Metadata) {
+    out.extend_from_slice(&(meta.len() as u16).to_le_bytes());
+    for (k, v) in meta {
+        put_str(out, k);
+        put_str(out, v);
     }
 }
 
@@ -190,18 +202,17 @@ fn decode(body: &[u8], dim: u32) -> Option<Entry> {
             for _ in 0..dim {
                 vector.push(f32::from_le_bytes(c.take(4)?.try_into().ok()?));
             }
-            let n = c.u16()? as usize;
-            let mut meta = HashMap::with_capacity(n);
-            for _ in 0..n {
-                let k = c.str()?;
-                let v = c.str()?;
-                meta.insert(k, v);
-            }
+            let meta = c.meta()?;
             (c.pos == body.len()).then_some(Entry::Insert { id, vector, meta })
         }
         KIND_DELETE => {
             let id = c.u64()?;
             (c.pos == body.len()).then_some(Entry::Delete { id })
+        }
+        KIND_META => {
+            let id = c.u64()?;
+            let meta = c.meta()?;
+            (c.pos == body.len()).then_some(Entry::Meta { id, meta })
         }
         _ => None,
     }
@@ -230,5 +241,15 @@ impl<'a> Cursor<'a> {
     fn str(&mut self) -> Option<String> {
         let n = self.u16()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).ok()
+    }
+    fn meta(&mut self) -> Option<Metadata> {
+        let n = self.u16()? as usize;
+        let mut meta = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let k = self.str()?;
+            let v = self.str()?;
+            meta.insert(k, v);
+        }
+        Some(meta)
     }
 }

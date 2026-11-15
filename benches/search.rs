@@ -36,6 +36,14 @@ fn bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("flat_filtered_10pct", n), &n, |b, _| {
             b.iter(|| db.search_filtered(&q, 10, |m| m["bucket"] == "3").unwrap())
         });
+
+        let t = std::time::Instant::now();
+        db.checkpoint().unwrap();
+        eprintln!("graph build n={n}: {:?}", t.elapsed());
+        group.bench_with_input(BenchmarkId::new("graph", n), &n, |b, _| b.iter(|| db.search(&q, 10).unwrap()));
+        group.bench_with_input(BenchmarkId::new("graph_filtered_10pct", n), &n, |b, _| {
+            b.iter(|| db.search_filtered(&q, 10, |m| m["bucket"] == "3").unwrap())
+        });
     }
     group.finish();
 }

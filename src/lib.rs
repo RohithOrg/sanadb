@@ -1,15 +1,22 @@
 //! sanadb: a disk-first embedded vector + metadata store.
 //!
-//! Milestone 1: single-file, write-ahead-logged store with an exact (flat)
-//! vector index and metadata filtering. Later milestones replace the flat
-//! index with a disk-resident graph index so the dataset can exceed RAM.
+//! Two files: `<path>` is a write-ahead log of inserts, deletes and metadata;
+//! `<path>.idx` is a memory-mapped Vamana graph over every vector present at
+//! the last `checkpoint`. Writes since then live in a small exact in-RAM
+//! "delta" index. A search walks the graph and scans the delta, then merges.
+//!
+//! Records in the graph that were later overwritten or deleted are hidden by
+//! an in-RAM tombstone set until the next checkpoint rebuilds the graph.
 
+mod graph;
 mod index;
 mod wal;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub use graph::GraphParams;
+use graph::GraphIndex;
 use index::Flat;
 use wal::{Entry, Header, Wal};
 
@@ -74,11 +81,15 @@ pub struct Options {
     /// fsync after every write. Off by default: writes reach the OS page
     /// cache immediately and survive a process crash; call `sync` for power-loss safety.
     pub sync_every_write: bool,
+    /// Graph construction parameters used by `checkpoint`.
+    pub graph: GraphParams,
+    /// Candidate list size during graph search. Larger = higher recall, slower.
+    pub search_beam: u32,
 }
 
 impl Options {
     pub fn new(dim: u32) -> Self {
-        Options { dim, metric: Metric::L2, sync_every_write: false }
+        Options { dim, metric: Metric::L2, sync_every_write: false, graph: GraphParams::default(), search_beam: 64 }
     }
     pub fn metric(mut self, m: Metric) -> Self {
         self.metric = m;
@@ -86,6 +97,14 @@ impl Options {
     }
     pub fn sync_every_write(mut self, on: bool) -> Self {
         self.sync_every_write = on;
+        self
+    }
+    pub fn graph(mut self, g: GraphParams) -> Self {
+        self.graph = g;
+        self
+    }
+    pub fn search_beam(mut self, beam: u32) -> Self {
+        self.search_beam = beam;
         self
     }
 }
@@ -99,10 +118,15 @@ pub struct Hit {
 
 pub struct Db {
     path: PathBuf,
+    idx_path: PathBuf,
     header: Header,
-    sync_every_write: bool,
+    opts: Options,
     wal: Wal,
-    index: Flat,
+    graph: Option<GraphIndex>,
+    /// Graph slots whose record was deleted or overwritten since the last checkpoint.
+    tombstones: HashSet<u32>,
+    /// Records written since the last checkpoint.
+    delta: Flat,
     meta: HashMap<u64, Metadata>,
     /// Log entries since the last checkpoint. Drives automatic compaction.
     log_entries: usize,
@@ -111,24 +135,46 @@ pub struct Db {
 impl Db {
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let path = path.as_ref().to_path_buf();
+        let idx_path = sidecar(&path);
         let header = Header { dim: opts.dim, metric: opts.metric };
+        let graph = GraphIndex::open(&idx_path, opts.dim, opts.metric)?;
         let (wal, entries) = Wal::open(&path, header)?;
-        let mut index = Flat::new(opts.dim as usize, opts.metric);
-        let mut meta = HashMap::new();
-        let log_entries = entries.len();
+        let mut db = Db {
+            path,
+            idx_path,
+            header,
+            wal,
+            graph,
+            tombstones: HashSet::new(),
+            delta: Flat::new(opts.dim as usize, opts.metric),
+            meta: HashMap::new(),
+            log_entries: entries.len(),
+            opts,
+        };
         for e in entries {
             match e {
-                Entry::Insert { id, vector, meta: m } => {
-                    index.insert(id, &vector);
-                    meta.insert(id, m);
+                Entry::Insert { id, vector, meta } => {
+                    db.tombstone(id);
+                    db.delta.insert(id, &vector);
+                    db.meta.insert(id, meta);
                 }
                 Entry::Delete { id } => {
-                    index.remove(id);
-                    meta.remove(&id);
+                    db.tombstone(id);
+                    db.delta.remove(id);
+                    db.meta.remove(&id);
+                }
+                Entry::Meta { id, meta } => {
+                    db.meta.insert(id, meta);
                 }
             }
         }
-        Ok(Db { path, header, sync_every_write: opts.sync_every_write, wal, index, meta, log_entries })
+        // Every live record must have a vector somewhere.
+        for &id in db.meta.keys() {
+            if db.delta.vector(id).is_none() && db.graph.as_ref().and_then(|g| g.slot(id)).is_none() {
+                return Err(Error::Corrupt("record has metadata but its vector is missing from the index"));
+            }
+        }
+        Ok(db)
     }
 
     pub fn len(&self) -> usize {
@@ -143,6 +189,11 @@ impl Db {
         self.header.dim
     }
 
+    /// Number of records served from the in-RAM delta rather than the graph.
+    pub fn delta_len(&self) -> usize {
+        self.delta.len()
+    }
+
     /// Insert or replace the record with this id.
     pub fn insert(&mut self, id: u64, vector: &[f32], meta: Metadata) -> Result<()> {
         if vector.len() != self.header.dim as usize {
@@ -152,7 +203,8 @@ impl Db {
             return Err(Error::MetaTooLarge);
         }
         self.append(&Entry::Insert { id, vector: vector.to_vec(), meta: meta.clone() })?;
-        self.index.insert(id, vector);
+        self.tombstone(id);
+        self.delta.insert(id, vector);
         self.meta.insert(id, meta);
         Ok(())
     }
@@ -163,16 +215,20 @@ impl Db {
             return Ok(false);
         }
         self.append(&Entry::Delete { id })?;
-        self.index.remove(id);
+        self.tombstone(id);
+        self.delta.remove(id);
         self.meta.remove(&id);
         Ok(true)
     }
 
     pub fn get(&self, id: u64) -> Option<(&[f32], &Metadata)> {
-        Some((self.index.vector(id)?, self.meta.get(&id)?))
+        let meta = self.meta.get(&id)?;
+        let vector = self.delta.vector(id).or_else(|| self.graph.as_ref()?.vector_of(id))?;
+        Some((vector, meta))
     }
 
-    /// Exact k-nearest-neighbour search over every stored vector.
+    /// k-nearest-neighbour search. Exact over records written since the last
+    /// checkpoint, approximate (graph walk) over the rest.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
         self.search_filtered(query, k, |_| true)
     }
@@ -182,7 +238,19 @@ impl Db {
         if query.len() != self.header.dim as usize {
             return Err(Error::DimMismatch { expected: self.header.dim, got: query.len() });
         }
-        Ok(self.index.search(query, k, |id| self.meta.get(&id).is_some_and(&filter)))
+        let passes = |id: u64| self.meta.get(&id).is_some_and(&filter);
+        let mut hits = self.delta.search(query, k, passes);
+        if let Some(g) = &self.graph {
+            let beam = self.opts.search_beam as usize;
+            hits.extend(
+                g.search(query, k, beam, |slot| !self.tombstones.contains(&slot) && passes(g.id(slot)))
+                    .into_iter()
+                    .map(|(score, slot)| Hit { id: g.id(slot), score }),
+            );
+            hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
+            hits.truncate(k);
+        }
+        Ok(hits)
     }
 
     /// fsync the log so acknowledged writes survive power loss.
@@ -190,26 +258,61 @@ impl Db {
         self.wal.sync()
     }
 
-    /// Rewrite the file to hold only live records, dropping deleted and
-    /// overwritten history. Atomic: a crash mid-checkpoint leaves the old file.
+    /// Rebuild the graph index over every live record and shrink the log to
+    /// metadata only. Each file is replaced atomically; the index is swapped
+    /// first so the log never references a vector the index lacks.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.wal.sync()?;
-        let tmp = self.path.with_extension("tmp");
-        let entries = self.index.iter().map(|(id, vector)| Entry::Insert { id, vector: vector.to_vec(), meta: self.meta[&id].clone() });
-        wal::write_snapshot(&tmp, self.header, entries)?;
-        std::fs::rename(&tmp, &self.path)?;
+        let dim = self.header.dim as usize;
+        let mut ids: Vec<u64> = Vec::with_capacity(self.meta.len());
+        let mut vectors: Vec<f32> = Vec::with_capacity(self.meta.len() * dim);
+        if let Some(g) = &self.graph {
+            for slot in 0..g.len() as u32 {
+                if !self.tombstones.contains(&slot) {
+                    ids.push(g.id(slot));
+                    vectors.extend_from_slice(g.vector_of(g.id(slot)).unwrap());
+                }
+            }
+        }
+        for (id, v) in self.delta.iter() {
+            ids.push(id);
+            vectors.extend_from_slice(v);
+        }
+        debug_assert_eq!(ids.len(), self.meta.len());
+
+        let idx_tmp = self.idx_path.with_extension("idx.tmp");
+        graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, &vectors, self.opts.graph)?;
+        drop(vectors);
+        std::fs::rename(&idx_tmp, &self.idx_path)?;
+        // Mapping the new file before the log swap guarantees the log we are
+        // about to write only names vectors the new index holds.
+        let graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)?;
+
+        let log_tmp = self.path.with_extension("tmp");
+        wal::write_snapshot(&log_tmp, self.header, self.meta.iter().map(|(&id, m)| Entry::Meta { id, meta: m.clone() }))?;
+        std::fs::rename(&log_tmp, &self.path)?;
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::File::open(dir)?.sync_all()?;
         }
+
         let (wal, _) = Wal::open(&self.path, self.header)?;
         self.wal = wal;
+        self.graph = graph;
+        self.tombstones.clear();
+        self.delta = Flat::new(dim, self.header.metric);
         self.log_entries = self.meta.len();
         Ok(())
     }
 
+    fn tombstone(&mut self, id: u64) {
+        if let Some(slot) = self.graph.as_ref().and_then(|g| g.slot(id)) {
+            self.tombstones.insert(slot);
+        }
+    }
+
     fn append(&mut self, e: &Entry) -> Result<()> {
         self.wal.append(e)?;
-        if self.sync_every_write {
+        if self.opts.sync_every_write {
             self.wal.sync()?;
         } else {
             self.wal.flush()?;
@@ -221,4 +324,10 @@ impl Db {
         }
         Ok(())
     }
+}
+
+fn sidecar(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".idx");
+    PathBuf::from(s)
 }

@@ -46,6 +46,10 @@ impl Flat {
         self.data.truncate(last * self.dim);
     }
 
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
     pub fn vector(&self, id: u64) -> Option<&[f32]> {
         self.slot_of.get(&id).map(|&s| self.row(s))
     }

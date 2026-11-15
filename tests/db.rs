@@ -128,6 +128,115 @@ fn header_mismatch_rejected() {
     assert!(db.search(&[0.0; 3], 1).is_err());
 }
 
+fn brute_force_top(vectors: &[Vec<f32>], q: &[f32], k: usize) -> Vec<u64> {
+    let mut all: Vec<(f32, u64)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(), i as u64))
+        .collect();
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    all[..k].iter().map(|e| e.1).collect()
+}
+
+#[test]
+fn graph_recall_vs_brute_force() {
+    let (dim, n, k) = (32usize, 5000u64, 10usize);
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path().join("v.sana"), Options::new(dim as u32)).unwrap();
+    let vectors: Vec<Vec<f32>> = (0..n).map(|i| vec_of(dim, i)).collect();
+    for (i, v) in vectors.iter().enumerate() {
+        db.insert(i as u64, v, HashMap::new()).unwrap();
+    }
+    db.checkpoint().unwrap();
+    assert_eq!(db.delta_len(), 0);
+    assert_eq!(db.len(), n as usize);
+
+    let mut hit = 0;
+    let queries = 50;
+    for qi in 0..queries {
+        let q = vec_of(dim, 1_000_000 + qi);
+        let truth = brute_force_top(&vectors, &q, k);
+        let got = db.search(&q, k).unwrap();
+        assert_eq!(got.len(), k);
+        hit += got.iter().filter(|h| truth.contains(&h.id)).count();
+    }
+    let recall = hit as f32 / (queries * k as u64) as f32;
+    assert!(recall >= 0.9, "recall@10 = {recall}");
+    eprintln!("recall@10 = {recall}");
+}
+
+#[test]
+fn graph_survives_reopen_upsert_delete_and_recheckpoint() {
+    let (dim, n) = (16usize, 300u64);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sana");
+    let mut db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..n {
+        db.insert(i, &vec_of(dim, i), meta(&[("i", &i.to_string())])).unwrap();
+    }
+    db.checkpoint().unwrap();
+    drop(db);
+
+    // Log holds metadata only now: far smaller than the vectors it describes.
+    let log_bytes = std::fs::metadata(&path).unwrap().len();
+    assert!(log_bytes < n * dim as u64 * 4 / 2, "log is {log_bytes} bytes");
+    assert!(path.with_file_name("v.sana.idx").exists());
+
+    let mut db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), n as usize);
+    assert_eq!(db.delta_len(), 0);
+    let (v, m) = db.get(42).unwrap();
+    assert_eq!(v, &vec_of(dim, 42)[..]);
+    assert_eq!(m["i"], "42");
+
+    // Delete hides a graph record; upsert moves one.
+    assert!(db.delete(5).unwrap());
+    let far = vec![100.0; dim];
+    db.insert(7, &far, meta(&[("i", "moved")])).unwrap();
+    assert_eq!(db.delta_len(), 1);
+
+    let q5 = vec_of(dim, 5);
+    assert!(db.search(&q5, 10).unwrap().iter().all(|h| h.id != 5));
+    let q7 = vec_of(dim, 7);
+    assert!(db.search(&q7, 10).unwrap().iter().all(|h| h.id != 7), "old position of 7 still visible");
+    let near_far = db.search(&far, 1).unwrap();
+    assert_eq!(near_far[0].id, 7);
+    assert_eq!(near_far[0].score, 0.0);
+    drop(db);
+
+    // Replay must re-derive the tombstones.
+    let mut db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), n as usize - 1);
+    assert!(db.get(5).is_none());
+    assert_eq!(db.get(7).unwrap().0, &far[..]);
+    assert!(db.search(&q7, 10).unwrap().iter().all(|h| h.id != 7));
+
+    // Second checkpoint folds delta and tombstones into a fresh graph.
+    db.checkpoint().unwrap();
+    assert_eq!(db.delta_len(), 0);
+    assert_eq!(db.len(), n as usize - 1);
+    assert_eq!(db.search(&far, 1).unwrap()[0].id, 7);
+    assert!(db.get(5).is_none());
+    for i in (0..n).filter(|&i| i != 5 && i != 7) {
+        assert_eq!(db.get(i).unwrap().0, &vec_of(dim, i)[..], "id {i}");
+    }
+}
+
+#[test]
+fn filtered_graph_search_respects_filter() {
+    let dim = 8usize;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path().join("v.sana"), Options::new(dim as u32).search_beam(256)).unwrap();
+    for i in 0..1000u64 {
+        db.insert(i, &vec_of(dim, i), meta(&[("parity", if i % 2 == 0 { "even" } else { "odd" })])).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let q = vec_of(dim, 777_777);
+    let hits = db.search_filtered(&q, 5, |m| m["parity"] == "odd").unwrap();
+    assert_eq!(hits.len(), 5);
+    assert!(hits.iter().all(|h| h.id % 2 == 1));
+}
+
 #[test]
 fn exact_search_matches_brute_force() {
     let dim = 32;
