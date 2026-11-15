@@ -24,7 +24,7 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub use graph::GraphParams;
 use graph::GraphIndex;
 use index::Flat;
-use wal::{Entry, Header, Wal};
+use wal::{Entry, Header, Replayed, Wal};
 
 pub type Metadata = HashMap<String, String>;
 
@@ -206,7 +206,8 @@ struct Inner {
     graph: Option<GraphIndex>,
     /// Graph slots whose record was deleted or overwritten since the last checkpoint.
     tombstones: HashSet<u32>,
-    /// Records written since the last checkpoint.
+    /// Records written since the last checkpoint: ids and their vectors'
+    /// offsets in the log. The vectors themselves stay in the mapped log.
     delta: Flat,
     /// Sequence number of the write that produced each delta record.
     delta_seq: HashMap<u64, u64>,
@@ -252,7 +253,7 @@ impl Db {
             wal,
             graph,
             tombstones: HashSet::new(),
-            delta: Flat::new(opts.dim as usize, opts.metric),
+            delta: Flat::new(opts.metric),
             delta_seq: HashMap::new(),
             meta: HashMap::new(),
             write_seq: 0,
@@ -261,16 +262,16 @@ impl Db {
         };
         for e in entries {
             match e {
-                Entry::Insert { id, vector, meta } => inner.apply_insert(id, &vector, meta),
-                Entry::Delete { id } => inner.apply_delete(id),
-                Entry::Meta { id, meta } => {
+                Replayed::Insert { id, vector_off, meta } => inner.apply_insert(id, vector_off, meta),
+                Replayed::Delete { id } => inner.apply_delete(id),
+                Replayed::Meta { id, meta } => {
                     inner.meta.insert(id, meta);
                 }
             }
         }
         // Every live record must have a vector somewhere.
         for &id in inner.meta.keys() {
-            if inner.delta.vector(id).is_none() && inner.graph.as_ref().and_then(|g| g.slot(id)).is_none() {
+            if inner.delta.offset(id).is_none() && inner.graph.as_ref().and_then(|g| g.slot(id)).is_none() {
                 return Err(Error::Corrupt("record has metadata but its vector is missing from the index"));
             }
         }
@@ -319,8 +320,8 @@ impl Db {
         let vector = prepare(self.header.metric, vector)?;
         let garbage = {
             let mut i = self.write()?;
-            i.append(&Entry::Insert { id, vector: vector.to_vec(), meta: meta.clone() }, self.opts.sync_every_write)?;
-            i.apply_insert(id, &vector, meta);
+            let off = i.append(&Entry::Insert { id, vector: vector.to_vec(), meta: meta.clone() }, self.opts.sync_every_write)?;
+            i.apply_insert(id, off, meta);
             i.garbage()
         };
         self.maybe_auto_checkpoint(garbage)
@@ -344,7 +345,7 @@ impl Db {
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Metadata)> {
         let i = self.inner.read().ok()?;
         let meta = i.meta.get(&id)?;
-        let vector = i.delta.vector(id).or_else(|| i.graph.as_ref()?.vector_of(id))?;
+        let vector = i.delta.offset(id).map(|o| i.wal.vector_at(o)).or_else(|| i.graph.as_ref()?.vector_of(id))?;
         Some((vector.to_vec(), meta.clone()))
     }
 
@@ -362,7 +363,7 @@ impl Db {
         let query = &*prepare(self.header.metric, query)?;
         let i = self.read()?;
         let passes = |id: u64| i.meta.get(&id).is_some_and(&filter);
-        let mut hits = i.delta.search(query, k, passes);
+        let mut hits = i.delta.search(query, k, passes, &|off| i.wal.vector_at(off));
         if let Some(g) = &i.graph {
             let (beam, max_beam, width) = (self.opts.search_beam as usize, self.opts.max_search_beam as usize, self.opts.io_width as usize);
             hits.extend(
@@ -411,9 +412,9 @@ impl Db {
                     }
                 }
             }
-            for (id, v) in i.delta.iter() {
+            for (id, off) in i.delta.iter() {
                 ids.push(id);
-                w.write_all(bytemuck::cast_slice(v))?;
+                w.write_all(bytemuck::cast_slice(i.wal.vector_at(off)))?;
             }
             w.flush()?;
             debug_assert_eq!(ids.len(), i.meta.len());
@@ -447,38 +448,41 @@ impl Db {
         let graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)?.ok_or(Error::Corrupt("index vanished after rename"))?;
 
         let deleted = i.deletes_since_snapshot.take().unwrap_or_default();
-        let mut delta = Flat::new(dim, self.header.metric);
-        let mut delta_seq = HashMap::new();
+        // Records written during the build survive in the delta; they are
+        // rewritten into the new log first, in this order, so their new
+        // offsets can be matched up afterwards.
+        let survivors: Vec<(u64, u64)> = i.delta.iter().filter(|(id, _)| i.delta_seq.get(id).is_some_and(|&s| s > snap_seq)).collect();
         let mut tombstones = HashSet::new();
-        for (id, v) in i.delta.iter() {
-            if i.delta_seq.get(&id).is_some_and(|&s| s > snap_seq) {
-                delta.insert(id, v);
-                delta_seq.insert(id, i.delta_seq[&id]);
-                if let Some(slot) = graph.slot(id) {
-                    tombstones.insert(slot);
-                }
+        for (id, _) in &survivors {
+            if let Some(slot) = graph.slot(*id) {
+                tombstones.insert(slot);
             }
         }
         for id in deleted {
             // Deleted during the build: hide its graph slot unless it was
-            // re-inserted (then the delta already tombstoned it above).
+            // re-inserted (then the survivor loop already tombstoned it).
             if let Some(slot) = graph.slot(id).filter(|_| !i.meta.contains_key(&id)) {
                 tombstones.insert(slot);
             }
         }
 
         let log_tmp = self.path.with_extension("tmp");
-        let entries = i.meta.iter().map(|(&id, m)| match delta.vector(id) {
-            Some(v) => Entry::Insert { id, vector: v.to_vec(), meta: m.clone() },
-            None => Entry::Meta { id, meta: m.clone() },
-        });
-        wal::write_snapshot(&log_tmp, self.header, entries)?;
+        let survivor_ids: HashSet<u64> = survivors.iter().map(|(id, _)| *id).collect();
+        let inserts = survivors.iter().map(|&(id, off)| Entry::Insert { id, vector: i.wal.vector_at(off).to_vec(), meta: i.meta[&id].clone() });
+        let metas = i.meta.iter().filter(|(id, _)| !survivor_ids.contains(id)).map(|(&id, m)| Entry::Meta { id, meta: m.clone() });
+        let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas))?;
         std::fs::rename(&log_tmp, &self.path)?;
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::File::open(dir)?.sync_all()?;
         }
 
         let (wal, _) = Wal::open(&self.path, self.header)?;
+        let mut delta = Flat::new(self.header.metric);
+        let mut delta_seq = HashMap::new();
+        for ((id, _), off) in survivors.iter().zip(new_offs) {
+            delta.insert(*id, off);
+            delta_seq.insert(*id, i.delta_seq[id]);
+        }
         i.wal = wal;
         i.graph = Some(graph);
         i.tombstones = tombstones;
@@ -506,12 +510,12 @@ impl Db {
 }
 
 impl Inner {
-    fn apply_insert(&mut self, id: u64, vector: &[f32], meta: Metadata) {
+    fn apply_insert(&mut self, id: u64, vector_off: u64, meta: Metadata) {
         self.write_seq += 1;
         if let Some(slot) = self.graph.as_ref().and_then(|g| g.slot(id)) {
             self.tombstones.insert(slot);
         }
-        self.delta.insert(id, vector);
+        self.delta.insert(id, vector_off);
         self.delta_seq.insert(id, self.write_seq);
         self.meta.insert(id, meta);
     }
@@ -529,15 +533,16 @@ impl Inner {
         }
     }
 
-    fn append(&mut self, e: &Entry, sync: bool) -> Result<()> {
-        self.wal.append(e)?;
+    /// Returns the vector offset for inserts (meaningless for other kinds).
+    fn append(&mut self, e: &Entry, sync: bool) -> Result<u64> {
+        let off = self.wal.append(e)?;
         if sync {
             self.wal.sync()?;
         } else {
             self.wal.flush()?;
         }
         self.log_entries += 1;
-        Ok(())
+        Ok(off)
     }
 
     /// Log entries that no longer describe a live record.

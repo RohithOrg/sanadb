@@ -429,6 +429,38 @@ fn cosine_normalises_and_rejects_non_finite() {
 }
 
 #[test]
+fn delta_survives_log_growth_and_remap() {
+    // 150K x 128 floats is ~80 MB of log: past the 64 MB growth step, so the
+    // mapping is rebuilt at least once while the delta is live.
+    let (dim, n) = (128usize, 150_000u64);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sana");
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..n {
+        db.insert(i, &vec_of(dim, i), HashMap::new()).unwrap();
+    }
+    assert_eq!(db.delta_len(), n as usize);
+    let log = std::fs::metadata(&path).unwrap().len();
+    assert!(log > 64 << 20, "log is {log} bytes");
+
+    let check = |db: &Db| {
+        for &i in &[0u64, 1, 77_777, n - 1] {
+            assert_eq!(db.get(i).unwrap().0, vec_of(dim, i), "id {i}");
+            let hits = db.search(&vec_of(dim, i), 1).unwrap();
+            assert_eq!(hits[0].id, i);
+            assert_eq!(hits[0].score, 0.0);
+        }
+    };
+    check(&db);
+    drop(db);
+    // Reopen trims growth slack and must still serve every vector.
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() < log);
+    assert_eq!(db.len(), n as usize);
+    check(&db);
+}
+
+#[test]
 fn checkpoint_of_empty_store_is_fine() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("v.sana"), Options::new(4)).unwrap();

@@ -111,10 +111,12 @@ asks the kernel to prefetch all their blocks first (`madvise(WILLNEED)`), so a
 cold query overlaps its disk reads instead of taking one page fault at a time.
 `Options::io_width`, default 4.
 
-**Delta and tombstones.** Writes since the last checkpoint live in an exact
-in-RAM index. Graph records that were since deleted or overwritten are hidden
-by a tombstone set rebuilt from the log on open. A search walks the graph,
-scans the delta, merges.
+**Delta and tombstones.** Writes since the last checkpoint are searched
+exactly. The delta keeps only ids and byte offsets into the memory-mapped log,
+16 bytes per record; the vectors are read from the log in place, through the
+page cache. Graph records that were since deleted or overwritten are hidden by
+a tombstone set rebuilt from the log on open. A search walks the graph, scans
+the delta, merges.
 
 **Checkpoint.** Writes the live vectors to a temp file under a brief exclusive
 lock, memory-maps it, builds the new graph with no lock held, then swaps the
@@ -194,8 +196,10 @@ first checkpoint.
 | recall@10, beam 64 | 0.932 | 0.934 |
 
 Sharding halves the build's memory at the cost of doubling its time, since
-every vector is inserted into two shard graphs. Recall does not move. The
-bulk-load delta is now the larger part of peak memory; fixing that is next.
+every vector is inserted into two shard graphs. Recall does not move. Since
+that run the delta stopped holding vectors in RAM (it reads them from the
+mapped log), so the 2.6 GB bulk-load share of that peak is gone; the 5M build
+has not been re-measured since.
 
 ### Synthetic
 
@@ -205,13 +209,12 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. Periodic checkpoints during bulk load, so the delta stops being the memory ceiling.
-2. ann-benchmarks and VectorDBBench adapters on the Python bindings, so the
+1. ann-benchmarks and VectorDBBench adapters on the Python bindings, so the
    comparison with hnswlib, usearch, faiss and LanceDB is run by their harness,
    not ours.
-3. e-means (Meta FAIR's mini-batch k-means) for PQ training and shard partitioning.
-4. Format freeze and 1.0.
-5. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
+2. e-means (Meta FAIR's mini-batch k-means) for PQ training and shard partitioning.
+3. Format freeze and 1.0.
+4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.
 
 ## Development
