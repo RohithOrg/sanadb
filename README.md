@@ -1,43 +1,53 @@
 # sanadb
 
-A disk-first embedded vector + metadata store in Rust. Single file, crash-safe,
-no server. Aimed at on-device and edge AI workloads that outgrow RAM.
+An embedded vector store in Rust, with Python bindings. Crash-safe writes,
+metadata filters, and a graph index that keeps working when the data is
+larger than RAM. No server.
 
 [![CI](https://github.com/RohithOrg/sanadb/actions/workflows/ci.yml/badge.svg)](https://github.com/RohithOrg/sanadb/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/sanadb.svg)](https://crates.io/crates/sanadb)
+[![PyPI](https://img.shields.io/pypi/v/sanadb.svg)](https://pypi.org/project/sanadb/)
 
-## Why this exists, and when not to use it
+```bash
+cargo add sanadb      # Rust
+pip install sanadb    # Python, prebuilt wheels for Linux, macOS, Windows
+```
 
-faiss, hnswlib and usearch are indexes, not stores: in RAM by default, no log,
-no crash safety, no metadata, and updates are your problem. Qdrant, Milvus and
-Weaviate are servers. LanceDB is the closest thing to sanadb: embedded,
-disk-first, Rust with Python bindings, IVF-PQ, mature and well funded. If you
-need something in production this quarter, use LanceDB, or faiss if you only
-need an index.
+## Should you use it
 
-sanadb aims to be the SQLite of vector search: one dependency, a few files, a
-write-ahead log with real fsync semantics, concurrent readers, index rebuilds
-that do not block writers, metadata filters, and a graph index (the DiskANN
-algorithm, not IVF) that keeps working when the data outgrows RAM. Nothing
-else small and embeddable does all of that. It is a thesis with measurements
-behind it (below), not yet a track record.
+Probably not yet for anything that matters. This is a 0.x release: the file
+formats may still change, and nobody has run it in production.
 
-Status: pre-1.0. No release has been cut and the on-disk formats may change.
-What is tested: crash safety (torn log tails, atomic checkpoints), concurrent
-reads and writes during a rebuild, a lock against a second process, recall
-and latency on SIFT1M and a 5M SIFT1B prefix including cold-cache runs. What
-is not provided: replication, encryption, multi-process access, typed
-metadata or range filters, and any guarantee about format stability.
+Where it sits among the alternatives:
+
+- **faiss, hnswlib, usearch** are indexes, not stores. They live in RAM, have
+  no log, no crash safety and no metadata; persistence and updates are your
+  problem. If an index is all you need, use one of them.
+- **Qdrant, Milvus, Weaviate** are servers. Different kind of thing.
+- **LanceDB** is the closest comparison: embedded, disk-based, Rust with Python
+  bindings, mature and funded. It uses IVF-PQ; sanadb uses a DiskANN-style
+  graph. If you need something dependable this quarter, use LanceDB.
+
+What sanadb is trying to be is the SQLite of vector search: one dependency, a
+few files, a write-ahead log with honest fsync semantics, concurrent readers,
+index rebuilds that do not block writers, metadata filters, and a disk-resident
+graph index. Nothing small and embeddable does all of that today. The numbers
+below are real and reproducible; the track record is not there yet.
 
 ## Guarantees
 
 - A write that returned `Ok` survives a process crash. It survives power loss
   only after `sync()` or with `sync_every_write`.
 - A checkpoint either completes or leaves the previous files untouched.
-- Readers never observe a partially written record or index.
-- One `Db` per store at a time; a second open fails with `Error::Locked`.
+- Readers never see a partially written record or index.
+- One open `Db` per store. A second open, from any process, fails with
+  `Error::Locked`.
 - Search over records written since the last checkpoint is exact. Search over
-  the graph is approximate; recall is a function of `search_beam` and is
-  reported below for public datasets.
+  the graph is approximate; recall depends on `search_beam` and is measured
+  below on public datasets.
+
+Not provided: replication, encryption, multi-process access, typed metadata,
+range filters, format stability before 1.0.
 
 ## Usage
 
@@ -55,7 +65,7 @@ db.sync()?;       // fsync: survive power loss
 db.checkpoint()?; // build the graph index, compact the log
 ```
 
-Python (`pip install maturin && cd python && maturin develop --release`):
+Python:
 
 ```python
 import numpy as np, sanadb
@@ -68,176 +78,141 @@ hits = db.search(query, k=10, filter=lambda m: m["doc"].endswith(".md"))
 db.checkpoint()
 ```
 
-`Db` is thread-safe. Reads run concurrently; a checkpoint builds the new
-index without blocking readers or writers, and the GIL is released during
-inserts, searches with dict filters, and checkpoints.
+`Db` is thread-safe. Reads run concurrently, a checkpoint builds the new index
+without blocking readers or writers, and the Python bindings release the GIL
+during inserts, dict-filtered searches and checkpoints. Scores are distances:
+lower is closer. For cosine they are the negative cosine similarity, in
+`[-1, 1]`.
 
-## Design
+## How it works
 
-Three files: `<path>` is the write-ahead log, `<path>.idx` the graph index,
-`<path>.lock` an empty file that is `flock`ed for as long as the store is open.
+A store is three files: `<path>` is the write-ahead log, `<path>.idx` the graph
+index, `<path>.lock` an empty file that is `flock`ed while the store is open.
 
-- **Log.** Header plus CRC-framed frames: insert (id, vector, metadata),
-  delete (id), meta (id, metadata; the vector lives in the index). Open replays
-  it; a torn tail is truncated. Writes hit the OS page cache immediately and
-  survive a process crash; `sync()` or `Options::sync_every_write` fsync for
-  power-loss safety.
-- **Graph index.** A Vamana graph (the DiskANN layout): one fixed-size block
-  per node holding the vector, neighbour count and up to R neighbour slots.
-  The file is memory-mapped, so a query reads only the blocks it walks and the
-  OS page cache holds the working set. The dataset does not have to fit in RAM;
-  the id table (8 bytes per node) and metadata do.
-- **Delta + tombstones.** Writes since the last checkpoint live in an exact
-  in-RAM flat index. Graph records that were deleted or overwritten are hidden
-  by a tombstone set rebuilt from the log on open. A search walks the graph,
-  scans the delta, and merges.
-- **Checkpoint.** Snapshots live vectors under a brief exclusive lock, builds
-  the graph with no lock held, then swaps the index file in by rename, rewrites
-  the log (metadata-only frames, plus full frames for records written during
-  the build) and swaps that in. Index first, so the log never names a vector
-  the index lacks. A crash between the two renames leaves a consistent,
-  slightly redundant state. Writes that land during the build stay in the
-  delta, identified by a per-record write sequence number.
-- **Concurrency.** `Db` is `Send + Sync`: a `RwLock` guards the in-memory
-  state, reads share it, writes take it exclusively, checkpoints serialise on
-  a separate mutex. One process at a time: a second `Db::open` on the same
-  path, from any process, fails with `Error::Locked` until the first is dropped.
-- **Flat index.** Contiguous `Vec<f32>`; distance loops use eight independent
-  accumulators so the compiler emits packed FMA. Also the correctness baseline
-  the graph is tested against (recall@10 ≥ 0.9 enforced, 0.996 measured).
+**Log.** CRC-framed records: insert (id, vector, metadata), delete (id), and
+meta (id, metadata only; the vector lives in the index). Opening replays the
+log and truncates a torn tail. Writes go to the OS page cache at once and
+survive a process crash; `sync()` or `sync_every_write` fsyncs for power loss.
 
-- **Parallel build.** Node insertions run across all cores with a lock per
-  adjacency list; no thread holds two locks. The graph is nondeterministic
-  but recall is unchanged.
-- **Adaptive filtered search.** A filter is applied to visited nodes. When
-  fewer than `k` pass, the walk retries with the beam doubled up to
-  `max_search_beam`, so a 1% filter still returns `k` results with the default
-  beam. Cost grows with selectivity instead of silently returning short.
+**Graph index.** A Vamana graph, the DiskANN layout: one fixed-size block per
+node holding its vector, neighbour count and up to R neighbour slots. The file
+is memory-mapped, so a query touches only the blocks it walks and the page
+cache holds the working set. Per node, RAM holds the 8-byte id, the metadata,
+and a 32-byte product-quantization code; the vectors and edges stay on disk.
 
-- **Product quantization.** Indexes with at least 1024 nodes also store a
-  codebook (256 centroids per subspace, ~4 floats each) and one byte per
-  subspace per node. The codes are loaded into RAM on open (32 bytes per node
-  at dim 128, versus 512 for the vector). The walk scores neighbours from the
-  codes, so expanding a node reads one block from disk, its adjacency, instead
-  of R neighbour vectors. The final candidates are re-ranked with exact
-  distances from the mapped file. `GraphParams::use_pq = false` turns it off.
+**Product quantization.** Indexes of 1024 nodes or more carry a codebook (256
+centroids per subspace of about 4 floats) and one byte per subspace per node.
+The walk scores neighbours from these codes, so expanding a node costs one
+block read, its adjacency, rather than R reads of neighbour vectors. The best
+candidates are re-ranked with exact distances from the mapped file.
 
-Graph build still holds all vectors in RAM.
+**Beam-width expansion.** The walk expands several candidates per step and
+asks the kernel to prefetch all their blocks first (`madvise(WILLNEED)`), so a
+cold query overlaps its disk reads instead of taking one page fault at a time.
+`Options::io_width`, default 4.
+
+**Delta and tombstones.** Writes since the last checkpoint live in an exact
+in-RAM index. Graph records that were since deleted or overwritten are hidden
+by a tombstone set rebuilt from the log on open. A search walks the graph,
+scans the delta, merges.
+
+**Checkpoint.** Writes the live vectors to a temp file under a brief exclusive
+lock, memory-maps it, builds the new graph with no lock held, then swaps the
+index in by rename, rewrites the log and swaps that in. Index first, so the
+log never names a vector the index lacks. Writes that arrive during the build
+stay in the delta, told apart by a per-record sequence number. Sets larger
+than `shard_size` (default 1M) are split by k-means into overlapping shards,
+each shard is built on its own and spilled to disk, and a final pass merges
+and prunes each node's edges. Peak memory is one shard's adjacency, not the
+whole graph's.
+
+**Filters.** A filter is applied to visited nodes. If fewer than `k` pass, the
+walk retries with the beam doubled, up to `max_search_beam`, so a 1% filter
+still returns `k` results. The cost grows with selectivity instead of the
+result silently coming back short.
+
+**Concurrency.** A `RwLock` guards the in-memory state: reads share it, writes
+take it, checkpoints serialise on a separate mutex and hold neither during
+the build.
 
 ## Numbers
 
-**Synthetic data.** Uniform random vectors from `rand`, the easiest case for
-approximate search; recall on real embeddings will be lower. Apple Silicon
-laptop, 10 cores, dim 128, k = 10, R = 32, build L = 100, search beam 64.
-Everything in the OS page cache (hot).
+All on one laptop: Apple Silicon, 10 cores, 16 GB, NVMe. Single query thread.
+Everything here is reproducible with the examples in this repo.
 
-| n | flat search | graph search | graph, 10% filter | graph build |
-|---|---|---|---|---|
-| 10,000 | 227 µs | 117 µs | 115 µs | 1.2 s |
-| 100,000 | 3.8 ms | 140 µs | 146 µs | 14.4 s |
+### SIFT1M
 
-Graph search time is nearly flat in n. Hot-cache latency is the same with and
-without PQ: the win PQ buys is fewer distinct disk blocks touched per query,
-which only shows once the dataset outgrows the page cache. Not yet measured.
+1,000,000 vectors, dim 128, L2. The 10,000 published queries and published
+ground truth. Index fits in RAM, so this measures CPU, not disk.
+`cargo run --release --example sift1m -- data/sift`
 
-Recall@10 against brute force on the synthetic set, from the test suite:
-0.98 (5K x 32, PQ), 0.99 exact walk vs 0.98 PQ walk (3K x 32), 0.93 with a
-1% filter and a beam of 16.
-
-**SIFT1M (public, real data).** 1,000,000 base vectors, dim 128, L2, the
-10,000 published queries and published top-100 ground truth. Same laptop,
-single query thread, hot page cache (the 744 MB index fits in RAM, so this
-measures CPU cost, not disk). Run it yourself with
-`cargo run --release --example sift1m -- data/sift`.
-
-| | PQ on (32 B/node in RAM) | PQ off (walk reads full vectors) |
+| | PQ on | PQ off |
 |---|---|---|
-| build, 10 cores | 115 s | 101 s |
+| build | 115 s | 101 s |
 | index file | 744 MB | 712 MB |
 | beam 32: recall@10, mean, p99 | 0.898, 365 µs, 2.9 ms | 0.925, 378 µs, 3.7 ms |
 | beam 64 | 0.961, 217 µs, 310 µs | 0.969, 246 µs, 346 µs |
 | beam 128 | 0.985, 394 µs, 634 µs | 0.988, 441 µs, 577 µs |
 | beam 256 | 0.995, 694 µs, 910 µs | 0.995, 800 µs, 1.0 ms |
 
-Beam 32 is the first pass after the index is opened, so its tail includes
-first-touch page faults on the mapped file; later passes run warm. PQ costs
-about 0.01 recall at a given beam and saves 10–15% CPU hot.
+Beam 32 was the first pass after opening the index, so its tail includes
+first-touch page faults. PQ costs about 0.01 recall at a given beam and saves
+10 to 15% CPU when the index is warm.
 
-**Cold cache, SIFT1B prefix (public, real data).** First 5,000,000 vectors of
-big-ann-benchmarks "bigann" (uint8, dim 128, L2), the 1000 first public
-queries, ground truth by brute force. 16 GB laptop, NVMe, single query thread,
-beam 64. The page cache was dropped with `sudo purge` before each cold pass;
-the warm pass re-runs the same queries. Reproduce with `examples/bigann.rs`.
+### Cold cache, 5M vectors from SIFT1B
 
-| | PQ on | PQ off |
+First 5,000,000 vectors of big-ann-benchmarks "bigann" (uint8, dim 128, L2),
+the first 1000 public queries, ground truth by brute force. The 3.5 GB index
+was evicted with `sudo purge` before each cold pass; the warm pass repeats the
+same queries. Beam 64. `examples/bigann.rs` has the exact steps.
+
+| | PQ on, width 1 | PQ off, width 1 | PQ on, width 4 | PQ on, width 8 |
+|---|---|---|---|---|
+| recall@10 | 0.927 | 0.937 | 0.932 | 0.937 |
+| cold mean | 8.6 ms | 21.9 ms | 2.75 ms | 2.26 ms |
+| cold p50 | 5.6 ms | 4.5 ms | 2.7 ms | 2.2 ms |
+| cold p99 | 39 ms | 187 ms | 4.2 ms | 3.4 ms |
+| warm mean | 270 µs | 289 µs | 323 µs | 366 µs |
+
+Reading this table: PQ matters in the tail, where the walk without it reads
+every neighbour's block from disk. Beam width matters everywhere cold, because
+it turns a chain of dependent page faults into batches; width 4 is the default
+and costs 20% warm CPU. Cold is still about 8x warm. The rest is the few
+rounds of dependent reads a 64-beam walk cannot avoid without speculative
+prefetch or an explicit block cache.
+
+### Build memory
+
+Same 5M set. Peak resident memory of the whole process from `/usr/bin/time -l`,
+which includes the 2.6 GB of bulk-loaded vectors the delta holds until the
+first checkpoint.
+
+| | single shard | 5 shards of 1M |
 |---|---|---|
-| graph build, 10 cores | 731 s | ~720 s |
-| index file | 3.55 GB | 3.40 GB |
-| recall@10 | 0.927 | 0.937 |
-| cold: mean / p50 / p99 | 8.6 ms / 5.6 ms / 39 ms | 21.9 ms / 4.5 ms / 187 ms |
-| warm: mean / p50 / p99 | 270 µs / 264 µs / 372 µs | 289 µs / 283 µs / 404 µs |
+| build | 731 s | 1396 s |
+| peak RSS | about 7 GB (estimated, not measured) | 4.47 GB |
+| recall@10, beam 64 | 0.932 | 0.934 |
 
-Cold, every expanded node is a random 4 KB read. With PQ the walk reads only
-the expanded node's block (its adjacency) and scores neighbours from codes in
-RAM; without PQ it also reads each neighbour's block. That shows as 2.5x lower
-mean and 4.8x lower p99 cold latency with PQ. The medians are close, so for
-most queries the neighbour blocks were already pulled in by earlier hops;
-the gain is in the tail. Those rows expand one node at a time (`io_width = 1`).
+Sharding halves the build's memory at the cost of doubling its time, since
+every vector is inserted into two shard graphs. Recall does not move. The
+bulk-load delta is now the larger part of peak memory; fixing that is next.
 
-**Beam-width expansion.** `Options::io_width` expands several of the best
-unexpanded candidates per step and issues `madvise(WILLNEED)` for all their
-blocks first, so the kernel overlaps the reads. Same index, queries and
-protocol as above, PQ on:
+### Synthetic
 
-| io_width | cold mean / p50 / p99 | warm mean | recall@10 |
-|---|---|---|---|
-| 1 | 8.6 ms / 5.6 ms / 39 ms | 270 µs | 0.927 |
-| 4 (default) | 2.75 ms / 2.7 ms / 4.2 ms | 323 µs | 0.932 |
-| 8 | 2.26 ms / 2.2 ms / 3.4 ms | 366 µs | 0.937 |
+Uniform random vectors are the easiest case for approximate search and are
+kept only as a regression check: `cargo bench --bench search`. At 100K x 128
+the exact scan takes 3.8 ms and the graph 140 µs.
 
-Width 4 cuts cold mean 3.1x and p99 9x for a 20% warm-CPU cost; width 8 buys
-a little more cold latency for another 13% warm. Cold is now about 8x warm,
-down from 32x. The remaining gap is the ~2 ms of sequential dependent read
-rounds a 64-beam walk needs; closing it means issuing reads for likely next
-hops before they are chosen, or holding hot blocks in an explicit cache.
+## Next
 
-**Sharded build.** Same 5M set rebuilt with the default `shard_size` of 1M
-(5 shards, each vector in its 2 nearest), vectors read from a memory-mapped
-snapshot instead of a RAM copy. Measured with `/usr/bin/time -l`:
-
-| | single shard | 5 shards |
-|---|---|---|
-| build, 10 cores | 731 s | 1396 s |
-| peak RSS (whole process, incl. 2.6 GB delta) | not measured, est. ~7 GB | 4.47 GB |
-| recall@10, beam 64, width 4 | 0.932 | 0.934 |
-| warm mean | 323 µs | 353 µs |
-
-Recall is unchanged; build time roughly doubles because of the 2-way overlap.
-Most of the remaining 4.5 GB is the delta holding the bulk-loaded vectors
-before the first checkpoint, not the build itself.
-
-## Roadmap
-
-1. **Done:** WAL, checkpoint, flat index, metadata filter, tests, Criterion bench.
-2. **Done:** Disk-resident Vamana graph index, memory-mapped, with delta +
-   tombstones and atomic two-file checkpoint.
-3. **Done:** Parallel build; adaptive beam for selective filters.
-4. **Done:** Product-quantized codes in RAM for the walk, exact re-rank from disk.
-5. **Done:** SIFT1M harness with published ground truth.
-6. **Done:** Thread-safe `Db`, non-blocking checkpoint, Python bindings, CI.
-7. **Done:** Cold-cache measurement on a 5M SIFT1B prefix (3.5 GB index,
-   page cache purged). PQ cuts cold mean latency 2.5x and p99 4.8x.
-8. **Done:** Beam-width expansion with block prefetch. Cold mean 8.6 ms to
-   2.75 ms, p99 39 ms to 4.2 ms at the default width.
-9. **Done:** Sharded graph build over a memory-mapped snapshot; peak RSS
-   4.5 GB at 5M with 2.6 GB of that being the bulk-load delta.
-10. **Done:** File lock against a second process opening the same store.
-11. ann-benchmarks and VectorDBBench adapters on top of the Python bindings.
-12. Periodic checkpoints during bulk load so the delta stops being the memory ceiling.
-13. e-means (mini-batch k-means from Meta FAIR) for PQ training and shard partitioning.
-14. Release to crates.io and PyPI; format freeze at 1.0.
-15. `sanadb studio`: local web UI to open a store, map it in 2D, cluster, search,
-    watch the beam walk, and edit metadata.
+1. Periodic checkpoints during bulk load, so the delta stops being the memory ceiling.
+2. ann-benchmarks and VectorDBBench adapters on the Python bindings, so the
+   comparison with hnswlib, usearch, faiss and LanceDB is run by their harness,
+   not ours.
+3. e-means (Meta FAIR's mini-batch k-means) for PQ training and shard partitioning.
+4. Format freeze and 1.0.
+5. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
+   search, watch the beam walk, and edit metadata.
 
 ## Development
 
@@ -248,4 +223,5 @@ cargo bench --bench search
 cd python && maturin develop --release && pytest tests
 ```
 
-See `RESEARCH.md` for the problem survey behind this direction.
+Releases are cut by tagging `vX.Y.Z`; the workflow publishes the crate and
+the wheels. Licensed under MIT or Apache-2.0, at your option.
