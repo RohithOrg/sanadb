@@ -1,0 +1,21 @@
+[package]
+name = "sanadb"
+version = "0.1.0"
+edition = "2024"
+description = "Disk-first embedded vector + metadata store"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+crc32fast = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+rand = "0.8"
+
+[[bench]]
+name = "search"
+harness = false
+
+[profile.release]
+debug = 1
