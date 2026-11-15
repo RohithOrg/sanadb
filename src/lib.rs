@@ -14,12 +14,17 @@
 
 mod graph;
 mod index;
+mod kmeans;
 mod pq;
 mod wal;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
+
+// parking_lot locks do not poison: a panic on one thread (for instance from
+// a filter closure) leaves the store usable by the others.
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub use graph::GraphParams;
 use graph::GraphIndex;
@@ -37,9 +42,6 @@ pub enum Error {
     MetaTooLarge,
     /// A vector contained NaN or infinity.
     InvalidVector,
-    /// A thread panicked while holding the store's lock; in-memory state may
-    /// be inconsistent. Reopen the store to rebuild it from disk.
-    Poisoned,
     /// Another `Db` (in this or another process) has the store open.
     Locked,
     /// The file was written by a newer sanadb whose layout this build cannot
@@ -53,12 +55,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl<T> From<std::sync::PoisonError<T>> for Error {
-    fn from(_: std::sync::PoisonError<T>) -> Self {
-        Error::Poisoned
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -69,8 +65,7 @@ impl std::fmt::Display for Error {
             }
             Error::DimMismatch { expected, got } => write!(f, "vector has {got} dims, store expects {expected}"),
             Error::MetaTooLarge => write!(f, "metadata key/value longer than 65535 bytes or more than 65535 pairs"),
-            Error::InvalidVector => write!(f, "vector contains NaN or infinity"),
-            Error::Poisoned => write!(f, "store lock poisoned by a panic; reopen the store"),
+            Error::InvalidVector => write!(f, "vector contains NaN or infinity, or is all zeros under the cosine metric"),
             Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
             Error::NeedsNewerVersion { file_level, supported } => {
                 write!(f, "file needs reader level {file_level}, this sanadb supports {supported}: upgrade sanadb")
@@ -88,11 +83,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Metric {
     /// Squared Euclidean distance. Lower is closer.
     L2 = 0,
-    /// Negative dot product. Lower is closer. Inputs are stored as given.
+    /// Negative dot product on vectors stored as given. Lower is closer.
+    /// Meant for inner-product scores that are not cosine; graph quality is
+    /// lower than with `Cosine` because inner product is not a metric.
     Dot = 1,
     /// Negative cosine similarity, so scores lie in `[-1, 1]` and lower is
     /// closer. Vectors are L2-normalised on insert and queries on search;
-    /// `get` returns the normalised vector. An all-zero vector stays zero.
+    /// `get` returns the normalised vector. All-zero vectors are rejected
+    /// (`Error::InvalidVector`) because their cosine is undefined.
     Cosine = 2,
 }
 
@@ -117,9 +115,19 @@ fn prepare(metric: Metric, v: &[f32]) -> Result<std::borrow::Cow<'_, [f32]>> {
     }
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm == 0.0 {
-        return Ok(std::borrow::Cow::Borrowed(v));
+        return Err(Error::InvalidVector);
     }
     Ok(std::borrow::Cow::Owned(v.iter().map(|x| x / norm).collect()))
+}
+
+/// Internal distances for `Cosine` are squared L2 on unit vectors; present
+/// them as negative cosine similarity, which is what the metric promises.
+fn present(metric: Metric, hits: &mut [Hit]) {
+    if metric == Metric::Cosine {
+        for h in hits {
+            h.score = h.score / 2.0 - 1.0;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +147,9 @@ pub struct Options {
     /// Run `checkpoint` automatically once the log holds this many entries
     /// more than there are live records. 0 disables.
     pub auto_checkpoint_garbage: usize,
+    /// Run `checkpoint` automatically once this many records sit in the
+    /// delta, whose search is an exact scan and so slows linearly. 0 disables.
+    pub auto_checkpoint_delta: usize,
     /// Graph nodes expanded per walk step, with their disk blocks prefetched
     /// together. 1 is the classic walk; 4–8 overlaps reads when the index is
     /// not in the page cache, at the cost of a few extra expansions.
@@ -155,8 +166,13 @@ impl Options {
             search_beam: 64,
             max_search_beam: 4096,
             auto_checkpoint_garbage: 100_000,
+            auto_checkpoint_delta: 250_000,
             io_width: 4,
         }
+    }
+    pub fn auto_checkpoint_delta(mut self, records: usize) -> Self {
+        self.auto_checkpoint_delta = records;
+        self
     }
     pub fn io_width(mut self, width: u32) -> Self {
         self.io_width = width.max(1);
@@ -209,7 +225,9 @@ pub struct Hit {
 /// Everything behind the lock.
 struct Inner {
     wal: Wal,
-    graph: Option<GraphIndex>,
+    /// Shared so a checkpoint can read the current graph while it builds
+    /// the next one without holding the store lock.
+    graph: Option<Arc<GraphIndex>>,
     /// Graph slots whose record was deleted or overwritten since the last checkpoint.
     tombstones: HashSet<u32>,
     /// Records written since the last checkpoint: ids and their vectors'
@@ -253,7 +271,7 @@ impl Db {
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
         let header = Header { dim: opts.dim, metric: opts.metric };
-        let graph = GraphIndex::open(&idx_path, opts.dim, opts.metric)?;
+        let graph = GraphIndex::open(&idx_path, opts.dim, opts.metric)?.map(Arc::new);
         let (wal, entries) = Wal::open(&path, header)?;
         let mut inner = Inner {
             wal,
@@ -285,15 +303,15 @@ impl Db {
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, Inner>> {
-        Ok(self.inner.read()?)
+        Ok(self.inner.read())
     }
 
     fn write(&self) -> Result<RwLockWriteGuard<'_, Inner>> {
-        Ok(self.inner.write()?)
+        Ok(self.inner.write())
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().map(|i| i.meta.len()).unwrap_or(0)
+        self.inner.read().meta.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -306,12 +324,12 @@ impl Db {
 
     /// Number of records served from the in-RAM delta rather than the graph.
     pub fn delta_len(&self) -> usize {
-        self.inner.read().map(|i| i.delta.len()).unwrap_or(0)
+        self.inner.read().delta.len()
     }
 
     /// Shape of the on-disk graph index, or `None` before the first checkpoint.
     pub fn index_stats(&self) -> Option<IndexStats> {
-        let i = self.inner.read().ok()?;
+        let i = self.inner.read();
         i.graph.as_ref().map(|g| IndexStats { nodes: g.len(), pq_subspaces: g.pq_subspaces(), tombstones: i.tombstones.len() })
     }
 
@@ -349,7 +367,7 @@ impl Db {
     }
 
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Metadata)> {
-        let i = self.inner.read().ok()?;
+        let i = self.inner.read();
         let meta = i.meta.get(&id)?;
         let vector = i.delta.offset(id).map(|o| i.wal.vector_at(o)).or_else(|| i.graph.as_ref()?.vector_of(id))?;
         Some((vector.to_vec(), meta.clone()))
@@ -380,6 +398,7 @@ impl Db {
             hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
             hits.truncate(k);
         }
+        present(self.header.metric, &mut hits);
         Ok(hits)
     }
 
@@ -388,7 +407,14 @@ impl Db {
         self.write()?.wal.sync()
     }
 
-    /// Rebuild the graph index over every live record and shrink the log.
+    /// Bring the graph index up to date with every live record and shrink
+    /// the log.
+    ///
+    /// When a graph exists and the change since it was built is small (fewer
+    /// pending writes and deletes than live graph nodes, and the result fits
+    /// `shard_size`), the existing graph is updated in place: deleted nodes
+    /// are consolidated out and new vectors inserted, so the cost follows the
+    /// change, not the store. Otherwise the graph is rebuilt from scratch.
     ///
     /// The build runs without holding the store lock, so reads and writes
     /// proceed meanwhile; writes that land during the build stay in the delta
@@ -396,21 +422,31 @@ impl Db {
     /// never references a vector the index lacks. Only one checkpoint runs at
     /// a time; a second caller waits for the first.
     pub fn checkpoint(&self) -> Result<()> {
-        let _one_at_a_time = self.checkpoint_lock.lock()?;
+        let _one_at_a_time = self.checkpoint_lock.lock();
         let dim = self.header.dim as usize;
 
-        // 1. Snapshot live vectors to a temp file. Brief exclusive lock: one
-        //    sequential write of the data. Keeping the snapshot on disk and
-        //    memory-mapping it means the build's working set, not the dataset,
-        //    has to fit in RAM.
+        // 1. Snapshot under a brief exclusive lock. For a rebuild, every live
+        //    vector is written to a temp file; for an update, only the delta.
+        //    The temp file is memory-mapped, so the build's working set, not
+        //    the dataset, has to fit in RAM.
         let vec_tmp = self.idx_path.with_extension("vec.tmp");
-        let (ids, snap_seq) = {
+        let (ids, snap_seq, base) = {
             let mut i = self.write()?;
             i.wal.sync()?;
-            let mut ids: Vec<u64> = Vec::with_capacity(i.meta.len());
+            let live_in_graph = i.graph.as_ref().map_or(0, |g| g.len() - i.tombstones.len());
+            let change = i.delta.len() + i.tombstones.len();
+            let total = live_in_graph + i.delta.len();
+            let incremental = i.graph.as_ref().is_some_and(|g| {
+                change < live_in_graph
+                    && total <= self.opts.graph.shard_size as usize
+                    // Keep PQ consistent: an index without codes stays without
+                    // until a rebuild adds them.
+                    && (g.pq_subspaces() > 0 || !self.opts.graph.use_pq || total < pq::MIN_N)
+            });
+            let mut ids: Vec<u64> = Vec::with_capacity(if incremental { i.delta.len() } else { i.meta.len() });
             let mut w = std::io::BufWriter::new(std::fs::File::create(&vec_tmp)?);
             use std::io::Write as _;
-            if let Some(g) = &i.graph {
+            if let Some(g) = i.graph.as_ref().filter(|_| !incremental) {
                 for slot in 0..g.len() as u32 {
                     if !i.tombstones.contains(&slot) {
                         ids.push(g.id(slot));
@@ -423,9 +459,9 @@ impl Db {
                 w.write_all(bytemuck::cast_slice(i.wal.vector_at(off)))?;
             }
             w.flush()?;
-            debug_assert_eq!(ids.len(), i.meta.len());
             i.deletes_since_snapshot = Some(HashSet::new());
-            (ids, i.write_seq)
+            let base = incremental.then(|| (i.graph.clone().unwrap(), i.tombstones.clone()));
+            (ids, i.write_seq, base)
         };
 
         // 2. Build outside the lock. This is the slow part.
@@ -435,14 +471,16 @@ impl Db {
             // Safety: the snapshot file is complete and never written again.
             let mmap = unsafe { memmap2::Mmap::map(&file)? };
             let vectors: &[f32] = if ids.is_empty() { &[] } else { bytemuck::cast_slice(&mmap) };
-            graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, vectors, self.opts.graph)
+            match &base {
+                Some((graph, dead)) => graph::update_and_write(&idx_tmp, graph, dead, &ids, vectors, self.opts.graph),
+                None => graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, vectors, self.opts.graph),
+            }
         })();
+        drop(base);
         let _ = std::fs::remove_file(&vec_tmp);
         if let Err(e) = built {
             let _ = std::fs::remove_file(&idx_tmp);
-            if let Ok(mut i) = self.inner.write() {
-                i.deletes_since_snapshot = None;
-            }
+            self.inner.write().deletes_since_snapshot = None;
             return Err(e);
         }
 
@@ -490,7 +528,7 @@ impl Db {
             delta_seq.insert(*id, i.delta_seq[id]);
         }
         i.wal = wal;
-        i.graph = Some(graph);
+        i.graph = Some(Arc::new(graph));
         i.tombstones = tombstones;
         i.delta = delta;
         i.delta_seq = delta_seq;
@@ -498,19 +536,20 @@ impl Db {
         Ok(())
     }
 
-    fn maybe_auto_checkpoint(&self, garbage: usize) -> Result<()> {
-        let limit = self.opts.auto_checkpoint_garbage;
-        if limit == 0 || garbage < limit {
+    fn maybe_auto_checkpoint(&self, (garbage, delta): (usize, usize)) -> Result<()> {
+        let g = self.opts.auto_checkpoint_garbage;
+        let d = self.opts.auto_checkpoint_delta;
+        let due = (g != 0 && garbage >= g) || (d != 0 && delta >= d);
+        if !due {
             return Ok(());
         }
         // Skip if a checkpoint is already running; it will pick these up.
         match self.checkpoint_lock.try_lock() {
-            Ok(guard) => {
+            Some(guard) => {
                 drop(guard);
                 self.checkpoint()
             }
-            Err(std::sync::TryLockError::WouldBlock) => Ok(()),
-            Err(std::sync::TryLockError::Poisoned(_)) => Err(Error::Poisoned),
+            None => Ok(()),
         }
     }
 }
@@ -551,9 +590,9 @@ impl Inner {
         Ok(off)
     }
 
-    /// Log entries that no longer describe a live record.
-    fn garbage(&self) -> usize {
-        self.log_entries.saturating_sub(self.meta.len())
+    /// (log entries that no longer describe a live record, delta size).
+    fn garbage(&self) -> (usize, usize) {
+        (self.log_entries.saturating_sub(self.meta.len()), self.delta.len())
     }
 }
 

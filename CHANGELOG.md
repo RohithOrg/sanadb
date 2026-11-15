@@ -7,6 +7,41 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Added
+- Incremental checkpoint. When a graph exists and the pending change (new
+  writes plus deletes) is smaller than the live graph, and the result fits
+  `shard_size`, the graph is updated in place: deleted nodes are consolidated
+  out (neighbours inherit their edges and re-prune, as in FreshDiskANN) and
+  new vectors are inserted. Cost follows the change, not the store. Larger
+  changes still rebuild from scratch.
+- `Options::auto_checkpoint_delta` (default 250,000): checkpoint when that
+  many records sit in the delta, whose search is an exact scan.
+- Crash-injection test (a child process is SIGKILLed mid-write and the store
+  reopened) and a corruption fuzz test over the log decoder, both in the
+  regular suite.
+- Rust tests run on Windows in CI.
+
+### Fixed
+- Cosine recall. The cosine metric used negative dot product as its internal
+  distance, and RobustPrune's alpha test (`alpha * d(best, s) > d(p, s)`)
+  inverts on negative values, so the build pruned far too aggressively.
+  Found by ann-benchmarks on glove-100-angular: recall@10 0.24 at beam 64
+  against hnswlib's 0.81. Cosine now stores unit vectors and uses squared L2
+  internally (same ranking), converting scores back to negative cosine at the
+  API. All-zero vectors are rejected under cosine, since their cosine is
+  undefined. Stores built with cosine before this fix should be re-checkpointed
+  (`checkpoint()` after any write, or delete the `.idx` file and reopen) to
+  rebuild the graph; their data is intact.
+
+### Changed
+- PQ codebooks and shard partitions are trained with e-means (Meta FAIR's
+  mini-batch k-means recipe) seeded by k-means++, instead of 8 to 12 rounds
+  of Lloyd.
+- Build walk reuses thread-local scratch buffers instead of allocating per
+  insertion.
+- Locks are `parking_lot`: a panic on one thread no longer poisons the store
+  for the others. `Error::Poisoned` is gone.
+
 ## [0.1.2] - 2026-11-15
 
 First version with Python wheels on PyPI: the 0.1.1 release published the

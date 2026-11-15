@@ -107,9 +107,11 @@ impl Ord for Candidate {
 #[inline]
 pub(crate) fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
-        Metric::L2 => l2_sq(a, b),
-        // Cosine inputs are unit length by the time they reach here.
-        Metric::Dot | Metric::Cosine => -dot(a, b),
+        // Cosine inputs are unit length, so squared L2 = 2 - 2cos: the same
+        // ranking as negative cosine, but non-negative, which RobustPrune's
+        // alpha test needs. The API converts the score back (see `Db::search`).
+        Metric::L2 | Metric::Cosine => l2_sq(a, b),
+        Metric::Dot => -dot(a, b),
     }
 }
 

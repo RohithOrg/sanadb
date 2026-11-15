@@ -407,16 +407,17 @@ fn cosine_normalises_and_rejects_non_finite() {
     db.insert(1, &[2.0, 0.0, 0.0], HashMap::new()).unwrap(); // same direction as query
     db.insert(2, &[0.0, 5.0, 0.0], HashMap::new()).unwrap(); // orthogonal
     db.insert(3, &[-1.0, 0.0, 0.0], HashMap::new()).unwrap(); // opposite
-    db.insert(4, &[0.0, 0.0, 0.0], HashMap::new()).unwrap(); // zero stays zero
+    db.insert(4, &[1.0, 1.0, 0.0], HashMap::new()).unwrap(); // 45 degrees
     let hits = db.search(&[10.0, 0.0, 0.0], 4).unwrap();
-    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 2, 4, 3]);
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 4, 2, 3]);
     assert!((hits[0].score + 1.0).abs() < 1e-6, "score {}", hits[0].score);
-    assert!(hits[1].score.abs() < 1e-6);
+    assert!((hits[1].score + std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5, "score {}", hits[1].score);
+    assert!(hits[2].score.abs() < 1e-6);
     assert!((hits[3].score - 1.0).abs() < 1e-6);
     assert_eq!(db.get(1).unwrap().0, vec![1.0, 0.0, 0.0]);
-    assert_eq!(db.get(4).unwrap().0, vec![0.0, 0.0, 0.0]);
 
     assert!(matches!(db.insert(5, &[f32::NAN, 0.0, 0.0], HashMap::new()), Err(sanadb::Error::InvalidVector)));
+    assert!(matches!(db.insert(6, &[0.0, 0.0, 0.0], HashMap::new()), Err(sanadb::Error::InvalidVector)), "zero vector has no cosine");
     assert!(matches!(db.search(&[f32::INFINITY, 0.0, 0.0], 1), Err(sanadb::Error::InvalidVector)));
     assert_eq!(db.len(), 4);
 
@@ -563,6 +564,192 @@ fn unknown_frame_kinds_are_skipped_and_newer_levels_refused() {
 
 fn bytemuck_free_f32s(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+#[test]
+fn incremental_checkpoint_matches_full_rebuild() {
+    use sanadb::GraphParams;
+    let (dim, n, k) = (24usize, 6000u64, 10usize);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sana");
+    let db = Db::open(&path, Options::new(dim as u32).auto_checkpoint_delta(0)).unwrap();
+    let mut live: std::collections::BTreeMap<u64, Vec<f32>> = (0..n).map(|i| (i, vec_of(dim, i))).collect();
+    for (i, v) in &live {
+        db.insert(*i, v, meta(&[("i", &i.to_string())])).unwrap();
+    }
+    db.checkpoint().unwrap(); // full build
+    let t_full = {
+        let t = std::time::Instant::now();
+        db.insert(999_999, &vec_of(dim, 999_999), HashMap::new()).unwrap();
+        db.delete(999_999).unwrap();
+        t.elapsed()
+    };
+    let _ = t_full;
+
+    // Small change: 300 inserts, 200 deletes, 50 upserts, then an in-place update.
+    for i in n..n + 300 {
+        db.insert(i, &vec_of(dim, i), HashMap::new()).unwrap();
+        live.insert(i, vec_of(dim, i));
+    }
+    for i in 0..200u64 {
+        db.delete(i).unwrap();
+        live.remove(&i);
+    }
+    for i in 1000..1050u64 {
+        let v = vec_of(dim, i + 7_000_000);
+        db.insert(i, &v, meta(&[("moved", "1")])).unwrap();
+        live.insert(i, v);
+    }
+    let t = std::time::Instant::now();
+    db.checkpoint().unwrap();
+    let t_incr = t.elapsed();
+    let stats = db.index_stats().unwrap();
+    assert_eq!(stats.nodes, live.len(), "graph holds exactly the live set");
+    assert_eq!(stats.tombstones, 0);
+    assert_eq!(db.delta_len(), 0);
+    for i in 0..200u64 {
+        assert!(db.get(i).is_none());
+    }
+    assert_eq!(db.get(1000).unwrap().0, live[&1000]);
+
+    // Recall against brute force over the live set, compared with a from-scratch build.
+    let ids: Vec<u64> = live.keys().copied().collect();
+    let vecs: Vec<Vec<f32>> = live.values().cloned().collect();
+    let recall = |db: &Db| {
+        let mut hit = 0;
+        for qi in 0..40u64 {
+            let q = vec_of(dim, 5_000_000 + qi);
+            let truth: Vec<u64> = brute_force_top(&vecs, &q, k).into_iter().map(|j| ids[j as usize]).collect();
+            hit += db.search(&q, k).unwrap().iter().filter(|h| truth.contains(&h.id)).count();
+        }
+        hit as f32 / 400.0
+    };
+    let r_incr = recall(&db);
+    drop(db);
+    let dir2 = tempfile::tempdir().unwrap();
+    let full = Db::open(dir2.path().join("f.sana"), Options::new(dim as u32).graph(GraphParams::default())).unwrap();
+    for (i, v) in &live {
+        full.insert(*i, v, HashMap::new()).unwrap();
+    }
+    let t = std::time::Instant::now();
+    full.checkpoint().unwrap();
+    let t_rebuild = t.elapsed();
+    let r_full = recall(&full);
+    eprintln!("recall incremental={r_incr} rebuild={r_full}; time incremental={t_incr:?} rebuild={t_rebuild:?}");
+    assert!(r_incr >= 0.9 && r_incr >= r_full - 0.03, "incremental {r_incr} vs rebuild {r_full}");
+    assert!(t_incr < t_rebuild, "incremental update should be cheaper than a rebuild");
+
+    // Reopen the incrementally updated store and check it again.
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), live.len());
+    assert!(recall(&db) >= 0.9);
+}
+
+/// Child half of the crash test: write forever until killed. Only runs when
+/// the parent sets the env var; as a plain test it returns at once.
+#[test]
+fn crash_child_writes_until_killed() {
+    let Ok(path) = std::env::var("SANADB_CRASH_CHILD") else { return };
+    let db = Db::open(&path, Options::new(8).auto_checkpoint_delta(400)).unwrap();
+    let mut i = db.len() as u64;
+    loop {
+        db.insert(i, &vec_of(8, i), meta(&[("i", &i.to_string())])).unwrap();
+        if i > 0 && i.is_multiple_of(7) {
+            db.delete(i - 1).unwrap();
+        }
+        i += 1;
+    }
+}
+
+#[test]
+fn survives_being_killed_mid_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crash.sana");
+    let exe = std::env::current_exe().unwrap();
+    let mut expected_min = 0usize;
+    for round in 0..6 {
+        let mut child = std::process::Command::new(&exe)
+            .args(["crash_child_writes_until_killed", "--exact", "--nocapture", "--test-threads=1"])
+            .env("SANADB_CRASH_CHILD", &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Let it write (and, every ~400 records, checkpoint) for a while, then SIGKILL.
+        std::thread::sleep(std::time::Duration::from_millis(150 + 90 * round));
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let db = Db::open(&path, Options::new(8)).unwrap_or_else(|e| panic!("round {round}: reopen failed: {e}"));
+        let n = db.len();
+        assert!(n >= expected_min, "round {round}: records went backwards: {n} < {expected_min}");
+        // Every surviving record must be fully readable and searchable.
+        let mut seen = 0;
+        for id in 0..(n as u64 * 2 + 10) {
+            if let Some((v, m)) = db.get(id) {
+                assert_eq!(v, vec_of(8, id), "round {round}: vector of {id}");
+                assert_eq!(m["i"], id.to_string());
+                let top = db.search(&v, 1).unwrap();
+                assert_eq!(top[0].id, id);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, n, "round {round}: len disagrees with readable records");
+        expected_min = n;
+        eprintln!("round {round}: {n} records survived, stats {:?}", db.index_stats());
+    }
+    assert!(expected_min > 0, "the child never got to write anything");
+}
+
+#[test]
+fn corrupted_logs_never_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fuzz.sana");
+    {
+        let db = Db::open(&path, Options::new(4)).unwrap();
+        for i in 0..50u64 {
+            db.insert(i, &vec_of(4, i), meta(&[("k", "v")])).unwrap();
+        }
+        db.sync().unwrap();
+    }
+    let clean = std::fs::read(&path).unwrap();
+    let mut rng = 0x5EEDu64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut outcomes = [0usize; 3]; // ok, corrupt error, other error
+    for _ in 0..300 {
+        let mut bytes = clean.clone();
+        for _ in 0..1 + next() % 4 {
+            let pos = (next() % bytes.len() as u64) as usize;
+            bytes[pos] ^= 1 << (next() % 8);
+        }
+        if next().is_multiple_of(5) {
+            let cut = (next() % bytes.len() as u64) as usize;
+            bytes.truncate(cut);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let _ = std::fs::remove_file(dir.path().join("fuzz.sana.idx"));
+        match Db::open(&path, Options::new(4)) {
+            Ok(db) => {
+                // Whatever survived must be internally consistent.
+                for id in 0..50u64 {
+                    if let Some((v, _)) = db.get(id) {
+                        assert_eq!(v, vec_of(4, id));
+                    }
+                }
+                let _ = db.search(&[0.0; 4], 5).unwrap();
+                outcomes[0] += 1;
+            }
+            Err(sanadb::Error::Corrupt(_)) | Err(sanadb::Error::HeaderMismatch { .. }) | Err(sanadb::Error::NeedsNewerVersion { .. }) => outcomes[1] += 1,
+            Err(_) => outcomes[2] += 1,
+        }
+    }
+    eprintln!("fuzz outcomes: ok={} corrupt={} other={}", outcomes[0], outcomes[1], outcomes[2]);
+    assert_eq!(outcomes[2], 0, "only Ok or a corruption error is acceptable");
 }
 
 #[test]

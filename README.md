@@ -41,7 +41,9 @@ below are real and reproducible; the track record is not there yet.
 - A checkpoint either completes or leaves the previous files untouched.
 - Readers never see a partially written record or index.
 - One open `Db` per store. A second open, from any process, fails with
-  `Error::Locked`.
+  `Error::Locked`. The lock is an advisory `flock` on `<path>.lock`: reliable
+  on local filesystems, not on NFS, SMB or other network mounts, where two
+  machines can both believe they hold it. Keep stores on local disks.
 - Search over records written since the last checkpoint is exact. Search over
   the graph is approximate; recall depends on `search_beam` and is measured
   below on public datasets.
