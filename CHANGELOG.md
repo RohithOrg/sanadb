@@ -7,6 +7,12 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-15
+
+First version with Python wheels on PyPI: the 0.1.1 release published the
+crate but its macOS Intel wheel job sat on a retired runner label and PyPI
+never ran. Intel macOS wheels now build on `macos-15-intel`.
+
 ### Changed
 - Log format is now `SANADB02`: frames are padded to 4 bytes so vectors sit
   at aligned offsets. The delta index reads vectors from the memory-mapped log
@@ -57,5 +63,6 @@ published.
 - One process per store. No replication, encryption, typed metadata or range
   filters. Formats may change before 1.0 (with migration).
 
-[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/RohithOrg/sanadb/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/RohithOrg/sanadb/releases/tag/v0.1.1
