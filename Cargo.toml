@@ -6,8 +6,13 @@ name = "sanadb"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Disk-first embedded vector + metadata store"
+description = "Disk-first embedded vector + metadata store: write-ahead log, memory-mapped DiskANN-style graph index, product quantization, metadata filters"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/RohithOrg/sanadb"
+readme = "README.md"
+keywords = ["vector", "database", "embedded", "ann", "search"]
+categories = ["database-implementations", "data-structures"]
+exclude = ["/python", "/data", "/.github"]
 
 [dependencies]
 crc32fast = "1"
