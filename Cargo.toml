@@ -3,7 +3,7 @@ members = [".", "python"]
 
 [package]
 name = "sanadb"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Disk-first embedded vector + metadata store: write-ahead log, memory-mapped DiskANN-style graph index, product quantization, metadata filters"

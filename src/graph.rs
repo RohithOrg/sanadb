@@ -204,6 +204,7 @@ impl Walkable for GraphIndex {
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
         out.extend_from_slice(bytemuck::cast_slice(&self.mmap[o + 4..o + 4 + count.min(self.r) * 4]));
     }
+    #[cfg(unix)]
     fn prefetch(&self, slots: &[u32]) {
         if slots.len() < 2 {
             return;
@@ -214,6 +215,7 @@ impl Walkable for GraphIndex {
             let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, o, self.block);
         }
     }
+    // Windows has no madvise; the walk still works, one page fault at a time.
 }
 
 fn block_size(dim: usize, r: usize) -> usize {
