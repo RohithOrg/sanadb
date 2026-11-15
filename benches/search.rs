@@ -12,7 +12,7 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert");
     group.throughput(Throughput::Elements(1));
     group.bench_function("dim128_no_sync", |b| {
-        let mut db = Db::open(dir.path().join("ins.sana"), Options::new(dim)).unwrap();
+        let db = Db::open(dir.path().join("ins.sana"), Options::new(dim)).unwrap();
         let v: Vec<f32> = (0..dim).map(|_| rng.r#gen()).collect();
         let mut id = 0u64;
         b.iter(|| {
@@ -24,7 +24,7 @@ fn bench(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("search_k10");
     for &n in &[10_000usize, 100_000] {
-        let mut db = Db::open(dir.path().join(format!("s{n}.sana")), Options::new(dim)).unwrap();
+        let db = Db::open(dir.path().join(format!("s{n}.sana")), Options::new(dim)).unwrap();
         for i in 0..n {
             let v: Vec<f32> = (0..dim).map(|_| rng.r#gen()).collect();
             let meta = HashMap::from([("bucket".to_string(), (i % 10).to_string())]);

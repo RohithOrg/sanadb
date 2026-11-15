@@ -82,7 +82,25 @@ Recall@10 against brute force on the synthetic set, from the test suite:
 0.98 (5K x 32, PQ), 0.99 exact walk vs 0.98 PQ walk (3K x 32), 0.93 with a
 1% filter and a beam of 16.
 
-No public benchmark dataset (SIFT1M, GloVe, DBpedia embeddings) has been run yet.
+**SIFT1M (public, real data).** 1,000,000 base vectors, dim 128, L2, the
+10,000 published queries and published top-100 ground truth. Same laptop,
+single query thread, hot page cache (the 744 MB index fits in RAM, so this
+measures CPU cost, not disk). Run it yourself with
+`cargo run --release --example sift1m -- data/sift`.
+
+| | PQ on (32 B/node in RAM) | PQ off (walk reads full vectors) |
+|---|---|---|
+| build, 10 cores | 115 s | 101 s |
+| index file | 744 MB | 712 MB |
+| beam 32: recall@10, mean, p99 | 0.898, 365 µs, 2.9 ms | 0.925, 378 µs, 3.7 ms |
+| beam 64 | 0.961, 217 µs, 310 µs | 0.969, 246 µs, 346 µs |
+| beam 128 | 0.985, 394 µs, 634 µs | 0.988, 441 µs, 577 µs |
+| beam 256 | 0.995, 694 µs, 910 µs | 0.995, 800 µs, 1.0 ms |
+
+Beam 32 is the first pass after the index is opened, so its tail includes
+first-touch page faults on the mapped file; later passes run warm. PQ costs
+about 0.01 recall at a given beam and saves 10–15% CPU hot; its disk-read
+saving is unmeasured until the index exceeds RAM.
 
 ## Roadmap
 
