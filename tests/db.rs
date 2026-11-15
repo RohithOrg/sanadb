@@ -366,6 +366,24 @@ fn selective_filter_fills_k_with_small_beam() {
 }
 
 #[test]
+fn second_open_is_refused_until_first_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sana");
+    let first = Db::open(&path, Options::new(4)).unwrap();
+    match Db::open(&path, Options::new(4)) {
+        Err(sanadb::Error::Locked) => {}
+        other => panic!("expected Locked, got {:?}", other.map(|_| ())),
+    }
+    // The lock survives a checkpoint, which replaces the data files.
+    first.insert(1, &[0.0; 4], HashMap::new()).unwrap();
+    first.checkpoint().unwrap();
+    assert!(matches!(Db::open(&path, Options::new(4)), Err(sanadb::Error::Locked)));
+    drop(first);
+    let again = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(again.len(), 1);
+}
+
+#[test]
 fn exact_search_matches_brute_force() {
     let dim = 32;
     let dir = tempfile::tempdir().unwrap();

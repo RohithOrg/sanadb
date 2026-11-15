@@ -44,7 +44,8 @@ inserts, searches with dict filters, and checkpoints.
 
 ## Design
 
-Two files: `<path>` is the write-ahead log, `<path>.idx` is the graph index.
+Three files: `<path>` is the write-ahead log, `<path>.idx` the graph index,
+`<path>.lock` an empty file that is `flock`ed for as long as the store is open.
 
 - **Log.** Header plus CRC-framed frames: insert (id, vector, metadata),
   delete (id), meta (id, metadata; the vector lives in the index). Open replays
@@ -69,7 +70,8 @@ Two files: `<path>` is the write-ahead log, `<path>.idx` is the graph index.
   delta, identified by a per-record write sequence number.
 - **Concurrency.** `Db` is `Send + Sync`: a `RwLock` guards the in-memory
   state, reads share it, writes take it exclusively, checkpoints serialise on
-  a separate mutex. One process at a time; there is no file lock yet.
+  a separate mutex. One process at a time: a second `Db::open` on the same
+  path, from any process, fails with `Error::Locked` until the first is dropped.
 - **Flat index.** Contiguous `Vec<f32>`; distance loops use eight independent
   accumulators so the compiler emits packed FMA. Also the correctness baseline
   the graph is tested against (recall@10 ≥ 0.9 enforced, 0.996 measured).
@@ -184,7 +186,7 @@ hops before they are chosen, or holding hot blocks in an explicit cache.
    2.75 ms, p99 39 ms to 4.2 ms at the default width.
 9. Sharded graph build so building, not just searching, scales past RAM
    (5M took 731 s and ~7 GB; 10M would not fit a 16 GB machine).
-10. File lock against a second process opening the same store.
+10. **Done:** File lock against a second process opening the same store.
 11. ann-benchmarks and VectorDBBench adapters on top of the Python bindings.
 
 ## Development

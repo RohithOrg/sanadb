@@ -38,6 +38,8 @@ pub enum Error {
     /// A thread panicked while holding the store's lock; in-memory state may
     /// be inconsistent. Reopen the store to rebuild it from disk.
     Poisoned,
+    /// Another `Db` (in this or another process) has the store open.
+    Locked,
 }
 
 impl From<std::io::Error> for Error {
@@ -63,6 +65,7 @@ impl std::fmt::Display for Error {
             Error::DimMismatch { expected, got } => write!(f, "vector has {got} dims, store expects {expected}"),
             Error::MetaTooLarge => write!(f, "metadata key/value longer than 65535 bytes or more than 65535 pairs"),
             Error::Poisoned => write!(f, "store lock poisoned by a panic; reopen the store"),
+            Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
         }
     }
 }
@@ -202,12 +205,23 @@ pub struct Db {
     inner: RwLock<Inner>,
     /// Serialises checkpoints; held for the whole build.
     checkpoint_lock: Mutex<()>,
+    /// `<path>.lock`, exclusively flock'ed for as long as this `Db` lives.
+    /// A separate file because the log and index are replaced by rename.
+    _file_lock: std::fs::File,
 }
 
 impl Db {
+    /// Open or create a store. Fails with `Error::Locked` if another `Db`
+    /// has the same path open, in this process or any other.
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let path = path.as_ref().to_path_buf();
-        let idx_path = sidecar(&path);
+        let idx_path = sidecar(&path, ".idx");
+        let file_lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(sidecar(&path, ".lock"))?;
+        match file_lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Locked),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
         let header = Header { dim: opts.dim, metric: opts.metric };
         let graph = GraphIndex::open(&idx_path, opts.dim, opts.metric)?;
         let (wal, entries) = Wal::open(&path, header)?;
@@ -237,7 +251,7 @@ impl Db {
                 return Err(Error::Corrupt("record has metadata but its vector is missing from the index"));
             }
         }
-        Ok(Db { path, idx_path, header, opts, inner: RwLock::new(inner), checkpoint_lock: Mutex::new(()) })
+        Ok(Db { path, idx_path, header, opts, inner: RwLock::new(inner), checkpoint_lock: Mutex::new(()), _file_lock: file_lock })
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, Inner>> {
@@ -495,8 +509,8 @@ impl Inner {
     }
 }
 
-fn sidecar(path: &Path) -> PathBuf {
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
-    s.push(".idx");
+    s.push(suffix);
     PathBuf::from(s)
 }
