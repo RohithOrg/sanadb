@@ -30,6 +30,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+
+/// Visited-set hasher for the walk. SipHash (the std default) was a third of
+/// the walk's time in profiles; the keys are node ids, not attacker input.
+type FxHashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -313,7 +317,7 @@ fn greedy<G: Walkable>(g: &G, start: u32, beam: usize, width: usize, dist: impl 
 struct Scratch {
     /// (dist, slot, expanded), kept sorted ascending by dist.
     cand: Vec<(f32, u32, bool)>,
-    seen: HashSet<u32>,
+    seen: FxHashSet<u32>,
     nbrs: Vec<u32>,
     picks: Vec<u32>,
 }
@@ -325,7 +329,7 @@ fn greedy_in<G: Walkable>(
     width: usize,
     dist: &impl Fn(u32) -> f32,
     cand: &mut Vec<(f32, u32, bool)>,
-    seen: &mut HashSet<u32>,
+    seen: &mut FxHashSet<u32>,
     nbrs: &mut Vec<u32>,
     picks: &mut Vec<u32>,
 ) -> Vec<(f32, u32)> {

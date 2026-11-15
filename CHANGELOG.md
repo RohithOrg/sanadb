@@ -14,8 +14,10 @@ the new version migrates old stores on open.
   out (neighbours inherit their edges and re-prune, as in FreshDiskANN) and
   new vectors are inserted. Cost follows the change, not the store. Larger
   changes still rebuild from scratch.
-- `Options::auto_checkpoint_delta` (default 250,000): checkpoint when that
-  many records sit in the delta, whose search is an exact scan.
+- `Options::auto_checkpoint_delta` (default 250,000): checkpoint when at
+  least that many records sit in the delta and the delta is at least as large
+  as the indexed graph, so a bulk load costs a geometric series of builds
+  rather than one per N records.
 - Crash-injection test (a child process is SIGKILLed mid-write and the store
   reopened) and a corruption fuzz test over the log decoder, both in the
   regular suite.

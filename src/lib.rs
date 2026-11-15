@@ -147,8 +147,11 @@ pub struct Options {
     /// Run `checkpoint` automatically once the log holds this many entries
     /// more than there are live records. 0 disables.
     pub auto_checkpoint_garbage: usize,
-    /// Run `checkpoint` automatically once this many records sit in the
-    /// delta, whose search is an exact scan and so slows linearly. 0 disables.
+    /// Run `checkpoint` automatically once at least this many records sit in
+    /// the delta (whose search is an exact scan) and the delta is at least as
+    /// large as the indexed graph. The second condition keeps a bulk load to
+    /// a geometric series of builds, at most about twice the work of one
+    /// build at the end, instead of a rebuild every N records. 0 disables.
     pub auto_checkpoint_delta: usize,
     /// Graph nodes expanded per walk step, with their disk blocks prefetched
     /// together. 1 is the classic walk; 4–8 overlaps reads when the index is
@@ -536,10 +539,10 @@ impl Db {
         Ok(())
     }
 
-    fn maybe_auto_checkpoint(&self, (garbage, delta): (usize, usize)) -> Result<()> {
+    fn maybe_auto_checkpoint(&self, (garbage, delta, indexed): (usize, usize, usize)) -> Result<()> {
         let g = self.opts.auto_checkpoint_garbage;
         let d = self.opts.auto_checkpoint_delta;
-        let due = (g != 0 && garbage >= g) || (d != 0 && delta >= d);
+        let due = (g != 0 && garbage >= g) || (d != 0 && delta >= d && delta >= indexed);
         if !due {
             return Ok(());
         }
@@ -590,9 +593,11 @@ impl Inner {
         Ok(off)
     }
 
-    /// (log entries that no longer describe a live record, delta size).
-    fn garbage(&self) -> (usize, usize) {
-        (self.log_entries.saturating_sub(self.meta.len()), self.delta.len())
+    /// (log entries that no longer describe a live record, delta size, live
+    /// records in the graph).
+    fn garbage(&self) -> (usize, usize, usize) {
+        let indexed = self.graph.as_ref().map_or(0, |g| g.len() - self.tombstones.len());
+        (self.log_entries.saturating_sub(self.meta.len()), self.delta.len(), indexed)
     }
 }
 
