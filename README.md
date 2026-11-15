@@ -159,16 +159,43 @@ ground truth. Index fits in RAM, so this measures CPU, not disk.
 
 | | PQ on | PQ off |
 |---|---|---|
-| build | 115 s | 101 s |
+| build | 77 s | 76 s |
 | index file | 744 MB | 712 MB |
-| beam 32: recall@10, mean, p99 | 0.898, 365 µs, 2.9 ms | 0.925, 378 µs, 3.7 ms |
-| beam 64 | 0.961, 217 µs, 310 µs | 0.969, 246 µs, 346 µs |
-| beam 128 | 0.985, 394 µs, 634 µs | 0.988, 441 µs, 577 µs |
-| beam 256 | 0.995, 694 µs, 910 µs | 0.995, 800 µs, 1.0 ms |
+| beam 32: recall@10, mean, p99 | 0.914, 250 µs, 1.1 ms | |
+| beam 64 | 0.966, 207 µs, 305 µs | 0.965, 311 µs |
+| beam 128 | 0.987, 343 µs, 478 µs | 0.985, 506 µs |
+| beam 256 | 0.995, 586 µs, 806 µs | 0.995, 840 µs |
 
 Beam 32 was the first pass after opening the index, so its tail includes
-first-touch page faults. PQ costs about 0.01 recall at a given beam and saves
-10 to 15% CPU when the index is warm.
+first-touch page faults. PQ costs nothing in recall here and saves about a
+third of the CPU when the index is warm. The PQ-off row was measured with
+1,000 queries per beam rather than 10,000, so its cache was colder; treat it
+as an upper bound.
+
+### ann-benchmarks, glove-100-angular (cosine), against hnswlib
+
+Same harness, 1,183,514 GloVe word vectors, dim 100, angular ground truth,
+their 10,000 queries. The adapter maps `angular` to `Metric::Cosine`. This
+dataset is hard for every graph index; hnswlib reaches 0.98 only at ef = 800.
+Queries per second at the nearest measured recall:
+
+| recall@10 | hnswlib M=16 | hnswlib M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
+|---|---|---|---|---|---|
+| ~0.73 | 5,174 (0.728) | | 4,561 (0.706) | 3,843 (0.732) | 4,562 (0.750) |
+| ~0.81 | 2,979 (0.811) | | 2,695 (0.795) | 2,273 (0.810) | 3,775 (0.790) |
+| ~0.86 | | 2,266 (0.853) | 1,517 (0.858) | 1,314 (0.866) | 2,248 (0.860) |
+| ~0.89 | 1,401 (0.889) | 1,610 (0.887) | 1,066 (0.885) | 927 (0.891) | 1,608 (0.890) |
+| ~0.93 | 787 (0.933) | 1,047 (0.923) | | | 882 (0.929) |
+| ~0.95 | 553 (0.952) | 577 (0.960) | | | 697 (0.942) |
+| build | 319 s | 434 s | 378 s | 322 s | 658 s |
+
+At R=48 sanadb matches hnswlib's curve up to recall 0.93; at R=32 it trails
+by 20 to 30%, and PQ costs about 0.02 recall per beam on these 100-dim
+vectors (25 subspaces of 4). Builds above 1M vectors are sharded, which is
+why the R=48 build is slow. This table exists because the first run of it
+found a real defect: before 0.1.3 cosine recall at beam 64 was 0.24, since
+RobustPrune's alpha test misbehaves on negative distances and cosine used
+negative dot product internally. See CHANGELOG.
 
 ### ann-benchmarks, sift-128-euclidean, against hnswlib
 
@@ -245,8 +272,8 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. More ann-benchmarks coverage: glove-100-angular (cosine), faiss HNSW and
-   usearch alongside hnswlib; a VectorDBBench client.
+1. More ann-benchmarks coverage: faiss HNSW and usearch alongside hnswlib; a
+   VectorDBBench client. Close the R=32 gap on cosine data.
 2. e-means (Meta FAIR's mini-batch k-means) for PQ training and shard partitioning.
 3. Format freeze and 1.0.
 4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
