@@ -366,6 +366,82 @@ fn selective_filter_fills_k_with_small_beam() {
 }
 
 #[test]
+fn sharded_build_matches_single_shard_recall() {
+    use sanadb::GraphParams;
+    let (dim, n, k) = (32usize, 6000u64, 10usize);
+    let vectors: Vec<Vec<f32>> = (0..n).map(|i| vec_of(dim, i)).collect();
+    let mut recalls = Vec::new();
+    for shard_size in [u32::MAX, 1000] {
+        let dir = tempfile::tempdir().unwrap();
+        let params = GraphParams { shard_size, ..GraphParams::default() };
+        let db = Db::open(dir.path().join("v.sana"), Options::new(dim as u32).graph(params)).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            db.insert(i as u64, v, meta(&[("i", &i.to_string())])).unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert_eq!(db.len(), n as usize);
+        assert_eq!(db.index_stats().unwrap().nodes, n as usize);
+        // No temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|f| f.contains("shard") || f.contains("tmp")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        for i in [0u64, 2999, 5999] {
+            assert_eq!(db.get(i).unwrap().0, vectors[i as usize]);
+        }
+        let mut hit = 0;
+        for qi in 0..40u64 {
+            let q = vec_of(dim, 4_000_000 + qi);
+            let truth = brute_force_top(&vectors, &q, k);
+            hit += db.search(&q, k).unwrap().iter().filter(|h| truth.contains(&h.id)).count();
+        }
+        recalls.push(hit as f32 / 400.0);
+    }
+    eprintln!("recall@10 single={} sharded(6 shards)={}", recalls[0], recalls[1]);
+    assert!(recalls[1] >= 0.9, "{recalls:?}");
+}
+
+#[test]
+fn cosine_normalises_and_rejects_non_finite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sana");
+    let db = Db::open(&path, Options::new(3).metric(Metric::Cosine)).unwrap();
+    db.insert(1, &[2.0, 0.0, 0.0], HashMap::new()).unwrap(); // same direction as query
+    db.insert(2, &[0.0, 5.0, 0.0], HashMap::new()).unwrap(); // orthogonal
+    db.insert(3, &[-1.0, 0.0, 0.0], HashMap::new()).unwrap(); // opposite
+    db.insert(4, &[0.0, 0.0, 0.0], HashMap::new()).unwrap(); // zero stays zero
+    let hits = db.search(&[10.0, 0.0, 0.0], 4).unwrap();
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 2, 4, 3]);
+    assert!((hits[0].score + 1.0).abs() < 1e-6, "score {}", hits[0].score);
+    assert!(hits[1].score.abs() < 1e-6);
+    assert!((hits[3].score - 1.0).abs() < 1e-6);
+    assert_eq!(db.get(1).unwrap().0, vec![1.0, 0.0, 0.0]);
+    assert_eq!(db.get(4).unwrap().0, vec![0.0, 0.0, 0.0]);
+
+    assert!(matches!(db.insert(5, &[f32::NAN, 0.0, 0.0], HashMap::new()), Err(sanadb::Error::InvalidVector)));
+    assert!(matches!(db.search(&[f32::INFINITY, 0.0, 0.0], 1), Err(sanadb::Error::InvalidVector)));
+    assert_eq!(db.len(), 4);
+
+    // Metric survives reopen and a checkpoint keeps normalised vectors.
+    db.checkpoint().unwrap();
+    drop(db);
+    assert!(Db::open(&path, Options::new(3)).is_err());
+    let db = Db::open(&path, Options::new(3).metric(Metric::Cosine)).unwrap();
+    assert_eq!(db.search(&[1.0, 0.0, 0.0], 1).unwrap()[0].id, 1);
+}
+
+#[test]
+fn checkpoint_of_empty_store_is_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("v.sana"), Options::new(4)).unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(db.index_stats().unwrap().nodes, 0);
+    assert!(db.search(&[0.0; 4], 5).unwrap().is_empty());
+    db.insert(1, &[1.0; 4], HashMap::new()).unwrap();
+    assert_eq!(db.search(&[1.0; 4], 5).unwrap()[0].id, 1);
+    db.checkpoint().unwrap();
+    assert_eq!(db.search(&[1.0; 4], 5).unwrap()[0].id, 1);
+}
+
+#[test]
 fn second_open_is_refused_until_first_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.sana");

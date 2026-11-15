@@ -12,7 +12,9 @@ use sanadb_core::{GraphParams, Metadata, Metric, Options};
 fn err(e: sanadb_core::Error) -> PyErr {
     match e {
         sanadb_core::Error::Io(io) => PyIOError::new_err(io.to_string()),
-        sanadb_core::Error::DimMismatch { .. } | sanadb_core::Error::MetaTooLarge | sanadb_core::Error::HeaderMismatch { .. } => PyValueError::new_err(e.to_string()),
+        sanadb_core::Error::DimMismatch { .. } | sanadb_core::Error::MetaTooLarge | sanadb_core::Error::HeaderMismatch { .. } | sanadb_core::Error::InvalidVector => {
+            PyValueError::new_err(e.to_string())
+        }
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -62,8 +64,9 @@ struct PyDb {
 impl PyDb {
     /// Open or create a store.
     ///
-    /// metric: "l2" (squared Euclidean) or "dot" (negative inner product;
-    /// normalise your vectors for cosine).
+    /// metric: "l2" (squared Euclidean), "dot" (negative inner product, vectors
+    /// stored as given) or "cosine" (negative cosine similarity; vectors are
+    /// normalised on insert and query).
     #[new]
     #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2))]
     #[allow(clippy::too_many_arguments)]
@@ -84,7 +87,8 @@ impl PyDb {
         let metric = match metric {
             "l2" => Metric::L2,
             "dot" | "ip" => Metric::Dot,
-            other => return Err(PyValueError::new_err(format!("unknown metric {other:?}; use \"l2\" or \"dot\""))),
+            "cosine" => Metric::Cosine,
+            other => return Err(PyValueError::new_err(format!("unknown metric {other:?}; use \"l2\", \"dot\" or \"cosine\""))),
         };
         let opts = Options::new(dim)
             .metric(metric)
@@ -92,7 +96,7 @@ impl PyDb {
             .max_search_beam(max_search_beam)
             .io_width(io_width)
             .sync_every_write(sync_every_write)
-            .graph(GraphParams { max_degree, build_beam, alpha, use_pq: pq });
+            .graph(GraphParams { max_degree, build_beam, alpha, use_pq: pq, ..GraphParams::default() });
         let db = py.allow_threads(|| sanadb_core::Db::open(path, opts)).map_err(err)?;
         Ok(PyDb { inner: Arc::new(db) })
     }

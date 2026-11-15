@@ -113,7 +113,7 @@ impl Codebook {
                 let cent = self.centroid(s, c);
                 lut[s * K + c] = match metric {
                     Metric::L2 => qs.iter().zip(cent).map(|(a, b)| (a - b) * (a - b)).sum(),
-                    Metric::Dot => -qs.iter().zip(cent).map(|(a, b)| a * b).sum::<f32>(),
+                    Metric::Dot | Metric::Cosine => -qs.iter().zip(cent).map(|(a, b)| a * b).sum::<f32>(),
                 };
             }
         }

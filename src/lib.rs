@@ -35,6 +35,8 @@ pub enum Error {
     HeaderMismatch { on_disk: (u32, Metric), requested: (u32, Metric) },
     DimMismatch { expected: u32, got: usize },
     MetaTooLarge,
+    /// A vector contained NaN or infinity.
+    InvalidVector,
     /// A thread panicked while holding the store's lock; in-memory state may
     /// be inconsistent. Reopen the store to rebuild it from disk.
     Poisoned,
@@ -64,6 +66,7 @@ impl std::fmt::Display for Error {
             }
             Error::DimMismatch { expected, got } => write!(f, "vector has {got} dims, store expects {expected}"),
             Error::MetaTooLarge => write!(f, "metadata key/value longer than 65535 bytes or more than 65535 pairs"),
+            Error::InvalidVector => write!(f, "vector contains NaN or infinity"),
             Error::Poisoned => write!(f, "store lock poisoned by a panic; reopen the store"),
             Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
         }
@@ -79,8 +82,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Metric {
     /// Squared Euclidean distance. Lower is closer.
     L2 = 0,
-    /// Negative dot product. Lower is closer. Normalize inputs for cosine.
+    /// Negative dot product. Lower is closer. Inputs are stored as given.
     Dot = 1,
+    /// Negative cosine similarity, so scores lie in `[-1, 1]` and lower is
+    /// closer. Vectors are L2-normalised on insert and queries on search;
+    /// `get` returns the normalised vector. An all-zero vector stays zero.
+    Cosine = 2,
 }
 
 impl Metric {
@@ -88,9 +95,25 @@ impl Metric {
         match b {
             0 => Some(Metric::L2),
             1 => Some(Metric::Dot),
+            2 => Some(Metric::Cosine),
             _ => None,
         }
     }
+}
+
+/// Reject NaN/inf (they poison every distance) and normalise for cosine.
+fn prepare(metric: Metric, v: &[f32]) -> Result<std::borrow::Cow<'_, [f32]>> {
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err(Error::InvalidVector);
+    }
+    if metric != Metric::Cosine {
+        return Ok(std::borrow::Cow::Borrowed(v));
+    }
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return Ok(std::borrow::Cow::Borrowed(v));
+    }
+    Ok(std::borrow::Cow::Owned(v.iter().map(|x| x / norm).collect()))
 }
 
 #[derive(Debug, Clone)]
@@ -293,10 +316,11 @@ impl Db {
         if meta.len() > u16::MAX as usize || meta.iter().any(|(k, v)| k.len() > u16::MAX as usize || v.len() > u16::MAX as usize) {
             return Err(Error::MetaTooLarge);
         }
+        let vector = prepare(self.header.metric, vector)?;
         let garbage = {
             let mut i = self.write()?;
             i.append(&Entry::Insert { id, vector: vector.to_vec(), meta: meta.clone() }, self.opts.sync_every_write)?;
-            i.apply_insert(id, vector, meta);
+            i.apply_insert(id, &vector, meta);
             i.garbage()
         };
         self.maybe_auto_checkpoint(garbage)
@@ -335,6 +359,7 @@ impl Db {
         if query.len() != self.header.dim as usize {
             return Err(Error::DimMismatch { expected: self.header.dim, got: query.len() });
         }
+        let query = &*prepare(self.header.metric, query)?;
         let i = self.read()?;
         let passes = |id: u64| i.meta.get(&id).is_some_and(&filter);
         let mut hits = i.delta.search(query, k, passes);
@@ -367,33 +392,45 @@ impl Db {
         let _one_at_a_time = self.checkpoint_lock.lock()?;
         let dim = self.header.dim as usize;
 
-        // 1. Snapshot live vectors. Brief exclusive lock: a memcpy of the data.
-        let (ids, vectors, snap_seq) = {
+        // 1. Snapshot live vectors to a temp file. Brief exclusive lock: one
+        //    sequential write of the data. Keeping the snapshot on disk and
+        //    memory-mapping it means the build's working set, not the dataset,
+        //    has to fit in RAM.
+        let vec_tmp = self.idx_path.with_extension("vec.tmp");
+        let (ids, snap_seq) = {
             let mut i = self.write()?;
             i.wal.sync()?;
             let mut ids: Vec<u64> = Vec::with_capacity(i.meta.len());
-            let mut vectors: Vec<f32> = Vec::with_capacity(i.meta.len() * dim);
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&vec_tmp)?);
+            use std::io::Write as _;
             if let Some(g) = &i.graph {
                 for slot in 0..g.len() as u32 {
                     if !i.tombstones.contains(&slot) {
                         ids.push(g.id(slot));
-                        vectors.extend_from_slice(g.vector(slot));
+                        w.write_all(bytemuck::cast_slice(g.vector(slot)))?;
                     }
                 }
             }
             for (id, v) in i.delta.iter() {
                 ids.push(id);
-                vectors.extend_from_slice(v);
+                w.write_all(bytemuck::cast_slice(v))?;
             }
+            w.flush()?;
             debug_assert_eq!(ids.len(), i.meta.len());
             i.deletes_since_snapshot = Some(HashSet::new());
-            (ids, vectors, i.write_seq)
+            (ids, i.write_seq)
         };
 
         // 2. Build outside the lock. This is the slow part.
         let idx_tmp = self.idx_path.with_extension("idx.tmp");
-        let built = graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, &vectors, self.opts.graph);
-        drop(vectors);
+        let built = (|| -> Result<()> {
+            let file = std::fs::File::open(&vec_tmp)?;
+            // Safety: the snapshot file is complete and never written again.
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let vectors: &[f32] = if ids.is_empty() { &[] } else { bytemuck::cast_slice(&mmap) };
+            graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, vectors, self.opts.graph)
+        })();
+        let _ = std::fs::remove_file(&vec_tmp);
         if let Err(e) = built {
             let _ = std::fs::remove_file(&idx_tmp);
             if let Ok(mut i) = self.inner.write() {

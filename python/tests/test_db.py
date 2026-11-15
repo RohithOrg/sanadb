@@ -46,7 +46,19 @@ def test_dim_mismatch_is_value_error(db):
 
 def test_bad_metric(tmp_path):
     with pytest.raises(ValueError):
-        sanadb.Db(str(tmp_path / "x.sana"), dim=4, metric="cosine")
+        sanadb.Db(str(tmp_path / "x.sana"), dim=4, metric="hamming")
+
+
+def test_cosine_and_nan(tmp_path):
+    db = sanadb.Db(str(tmp_path / "c.sana"), dim=3, metric="cosine")
+    db.insert(1, [2.0, 0.0, 0.0])
+    db.insert(2, [0.0, 1.0, 0.0])
+    hits = db.search([9.0, 0.0, 0.0], k=2)
+    assert [h[0] for h in hits] == [1, 2]
+    assert hits[0][1] == pytest.approx(-1.0)
+    assert db.get(1)[0].tolist() == [1.0, 0.0, 0.0]
+    with pytest.raises(ValueError):
+        db.insert(3, [float("nan"), 0.0, 0.0])
 
 
 def test_insert_many_checkpoint_reopen(tmp_path):

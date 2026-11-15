@@ -11,13 +11,21 @@
 //! neighbour's vector). Full-precision vectors are read only to re-rank the
 //! final candidates.
 //!
+//! Building: up to `GraphParams::shard_size` vectors are indexed in one pass.
+//! Larger sets are split by k-means into overlapping shards (each vector in
+//! its two nearest), each shard gets its own Vamana graph in RAM, the shard
+//! adjacencies are spilled to temp files, and a final pass merges each node's
+//! edge lists and prunes them to R. Peak memory is one shard's adjacency plus
+//! a few words per node, not the whole graph. The vectors themselves are read
+//! through whatever slice the caller passes, which the store memory-maps.
+//!
 //! File: `SANAIDX2 | dim u32 | metric u8 | pad[3] | n u32 | r u32 | entry u32 |
 //! block u32 | m u32 | ids u64*n | pad to 64 | blocks | codebook f32*(m*256*dim/m) | codes u8*(n*m)`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use memmap2::Mmap;
@@ -30,6 +38,7 @@ use crate::{Error, Metric, Result};
 const MAGIC: &[u8; 8] = b"SANAIDX2";
 const HEADER_LEN: usize = 8 + 4 + 1 + 3 + 4 + 4 + 4 + 4 + 4;
 const ALIGN: usize = 64;
+const NONE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GraphParams {
@@ -42,11 +51,14 @@ pub struct GraphParams {
     /// Store product-quantized codes and walk on them. Off means every hop
     /// reads R full vectors from the mapped file.
     pub use_pq: bool,
+    /// Largest set built as a single graph. Above this the build is sharded;
+    /// peak RAM is roughly `shard_size * (R*4 + 50)` bytes for the adjacency.
+    pub shard_size: u32,
 }
 
 impl Default for GraphParams {
     fn default() -> Self {
-        GraphParams { max_degree: 32, build_beam: 100, alpha: 1.2, use_pq: true }
+        GraphParams { max_degree: 32, build_beam: 100, alpha: 1.2, use_pq: true, shard_size: 1_000_000 }
     }
 }
 
@@ -148,6 +160,7 @@ impl GraphIndex {
     /// filter leaves fewer than `k` accepted nodes, the walk is retried with
     /// the beam doubled, up to `max_beam`, so filtered queries still fill `k`
     /// without the caller tuning anything.
+    ///
     /// `width` is how many candidates are expanded per step; their blocks are
     /// prefetched together, which is what makes a cold (disk-bound) query
     /// cheaper. 1 reproduces the classic one-at-a-time walk.
@@ -207,18 +220,20 @@ fn block_size(dim: usize, r: usize) -> usize {
     (dim * 4 + 4 + r * 4).next_multiple_of(ALIGN)
 }
 
-/// Graph under construction. Per-node locks let many threads insert at once;
-/// no thread ever holds two locks, so there is no deadlock.
+/// Graph under construction over a subset (`rows`) of the vector set. Local
+/// slot `i` is global row `rows[i]`. Per-node locks let many threads insert
+/// at once; no thread ever holds two locks, so there is no deadlock.
 struct MemGraph<'a> {
     dim: usize,
     vectors: &'a [f32],
+    rows: &'a [u32],
     adj: Vec<RwLock<Vec<u32>>>,
 }
 
 impl MemGraph<'_> {
-    fn vector(&self, slot: u32) -> &[f32] {
-        let s = slot as usize * self.dim;
-        &self.vectors[s..s + self.dim]
+    fn vector(&self, local: u32) -> &[f32] {
+        let g = self.rows[local as usize] as usize * self.dim;
+        &self.vectors[g..g + self.dim]
     }
 }
 
@@ -276,7 +291,8 @@ fn greedy<G: Walkable>(g: &G, start: u32, beam: usize, width: usize, dist: impl 
 
 /// RobustPrune: pick the closest candidate, then drop every candidate that is
 /// closer to the pick than to `p` by a factor of `alpha`. Repeat until R edges.
-fn prune(g: &MemGraph, metric: Metric, p: u32, mut cands: Vec<(f32, u32)>, r: usize, alpha: f32) -> Vec<u32> {
+/// `vec` resolves a slot (in whatever space `cands` use) to its vector.
+fn prune<'a>(vec: &dyn Fn(u32) -> &'a [f32], metric: Metric, p: u32, mut cands: Vec<(f32, u32)>, r: usize, alpha: f32) -> Vec<u32> {
     cands.retain(|&(_, s)| s != p);
     cands.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     cands.dedup_by_key(|c| c.1);
@@ -286,73 +302,227 @@ fn prune(g: &MemGraph, metric: Metric, p: u32, mut cands: Vec<(f32, u32)>, r: us
         if out.len() == r {
             break;
         }
-        let bv = g.vector(best);
-        cands.retain(|&(d_pq, s)| s != best && alpha * distance(metric, bv, g.vector(s)) > d_pq);
+        let bv = vec(best);
+        cands.retain(|&(d_pq, s)| s != best && alpha * distance(metric, bv, vec(s)) > d_pq);
     }
     out
 }
 
-/// Build a Vamana graph over `vectors` (row-major, `n * dim`) and write the
-/// index file to `path`. `ids[i]` is the external id of row `i`.
+/// Row closest to the mean of `rows`.
+fn medoid(vectors: &[f32], dim: usize, metric: Metric, rows: &[u32]) -> u32 {
+    let mut centroid = vec![0f32; dim];
+    for &row in rows {
+        let v = &vectors[row as usize * dim..(row as usize + 1) * dim];
+        for (c, x) in centroid.iter_mut().zip(v) {
+            *c += x;
+        }
+    }
+    centroid.iter_mut().for_each(|c| *c /= rows.len() as f32);
+    let d = |i: usize| distance(metric, &centroid, &vectors[rows[i] as usize * dim..(rows[i] as usize + 1) * dim]);
+    (0..rows.len()).min_by(|&a, &b| d(a).total_cmp(&d(b))).unwrap() as u32
+}
+
+/// Vamana over the subset `rows`. Returns each local node's edges as local
+/// slots. This is the whole algorithm for sets up to `shard_size`.
+fn build_shard(vectors: &[f32], dim: usize, metric: Metric, rows: &[u32], params: GraphParams, seed: u64) -> Vec<Vec<u32>> {
+    let n = rows.len();
+    let r = params.max_degree as usize;
+    let l = (params.build_beam as usize).max(r);
+    let mut rng = XorShift(seed | 1);
+    let mut g = MemGraph { dim, vectors, rows, adj: (0..n).map(|_| RwLock::new(Vec::new())).collect() };
+    if n == 0 {
+        return Vec::new();
+    }
+    // Random initial graph so every node is reachable from the start.
+    for a in g.adj.iter_mut() {
+        let a = a.get_mut().unwrap();
+        while a.len() < r.min(n - 1) {
+            let t = (rng.next() % n as u64) as u32;
+            if !a.contains(&t) {
+                a.push(t);
+            }
+        }
+    }
+    let entry = medoid(vectors, dim, metric, rows);
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    for i in (1..n).rev() {
+        order.swap(i, (rng.next() % (i as u64 + 1)) as usize);
+    }
+    // Each node's insertion is independent apart from the adjacency it
+    // touches; per-node locks serialise only those.
+    let g = &g;
+    let vec = |s: u32| g.vector(s);
+    order.par_iter().for_each(|&p| {
+        let pv = g.vector(p);
+        let mut cands = greedy(g, entry, l, 1, |s| distance(metric, pv, g.vector(s)));
+        cands.extend(g.adj[p as usize].read().unwrap().iter().map(|&s| (distance(metric, pv, g.vector(s)), s)));
+        let new = prune(&vec, metric, p, cands, r, params.alpha);
+        *g.adj[p as usize].write().unwrap() = new.clone();
+        for q in new {
+            let mut aq = g.adj[q as usize].write().unwrap();
+            if aq.contains(&p) {
+                continue;
+            }
+            aq.push(p);
+            if aq.len() > r {
+                let qv = g.vector(q);
+                let c: Vec<(f32, u32)> = aq.iter().map(|&s| (distance(metric, qv, g.vector(s)), s)).collect();
+                *aq = prune(&vec, metric, q, c, r, params.alpha);
+            }
+        }
+    });
+    g.adj.iter().map(|a| a.read().unwrap().clone()).collect()
+}
+
+/// k-means on a sample, then every row's two nearest centroids. Returns the
+/// shard membership lists (global rows) and, per row, its (shard, local)
+/// position in each of its two shards.
+fn partition(vectors: &[f32], dim: usize, metric: Metric, n: usize, k: usize, seed: u64) -> (Vec<Vec<u32>>, Vec<[u32; 4]>) {
+    let mut rng = XorShift(seed | 1);
+    let sample: Vec<u32> = (0..n.min(200_000)).map(|_| (rng.next() % n as u64) as u32).collect();
+    let row = |i: u32| &vectors[i as usize * dim..(i as usize + 1) * dim];
+    let mut cents: Vec<f32> = (0..k).flat_map(|_| row(sample[(rng.next() % sample.len() as u64) as usize]).to_vec()).collect();
+    let nearest = |cents: &[f32], v: &[f32]| -> usize { (0..k).min_by(|&a, &b| distance(metric, v, &cents[a * dim..(a + 1) * dim]).total_cmp(&distance(metric, v, &cents[b * dim..(b + 1) * dim]))).unwrap() };
+    for _ in 0..8 {
+        let assign: Vec<usize> = sample.par_iter().map(|&i| nearest(&cents, row(i))).collect();
+        let mut sums = vec![0f32; k * dim];
+        let mut counts = vec![0u32; k];
+        for (&a, &i) in assign.iter().zip(&sample) {
+            counts[a] += 1;
+            for (acc, x) in sums[a * dim..(a + 1) * dim].iter_mut().zip(row(i)) {
+                *acc += x;
+            }
+        }
+        for c in 0..k {
+            if counts[c] == 0 {
+                cents[c * dim..(c + 1) * dim].copy_from_slice(row(sample[(rng.next() % sample.len() as u64) as usize]));
+            } else {
+                for (dst, acc) in cents[c * dim..(c + 1) * dim].iter_mut().zip(&sums[c * dim..(c + 1) * dim]) {
+                    *dst = acc / counts[c] as f32;
+                }
+            }
+        }
+    }
+    // Two nearest centroids per row.
+    let pair: Vec<(u32, u32)> = (0..n as u32)
+        .into_par_iter()
+        .map(|i| {
+            let v = row(i);
+            let (mut b0, mut b1) = ((f32::INFINITY, NONE), (f32::INFINITY, NONE));
+            for c in 0..k {
+                let d = distance(metric, v, &cents[c * dim..(c + 1) * dim]);
+                if d < b0.0 {
+                    b1 = b0;
+                    b0 = (d, c as u32);
+                } else if d < b1.0 {
+                    b1 = (d, c as u32);
+                }
+            }
+            (b0.1, b1.1)
+        })
+        .collect();
+    let mut shards: Vec<Vec<u32>> = vec![Vec::new(); k];
+    let mut pos = vec![[NONE; 4]; n];
+    for (i, &(a, b)) in pair.iter().enumerate() {
+        pos[i][0] = a;
+        pos[i][1] = shards[a as usize].len() as u32;
+        shards[a as usize].push(i as u32);
+        if b != NONE && b != a {
+            pos[i][2] = b;
+            pos[i][3] = shards[b as usize].len() as u32;
+            shards[b as usize].push(i as u32);
+        }
+    }
+    (shards, pos)
+}
+
+/// Spilled shard adjacency: `rows.len() * R` u32 slots, `NONE`-padded, as
+/// global rows.
+struct ShardFile {
+    mmap: Mmap,
+    r: usize,
+}
+
+impl ShardFile {
+    fn write(path: &Path, rows: &[u32], adj: &[Vec<u32>], r: usize) -> Result<ShardFile> {
+        // Read + write: the mapping below needs read access on the same handle.
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        let mut w = BufWriter::new(file);
+        for a in adj {
+            let mut i = 0;
+            for &local in a.iter().take(r) {
+                w.write_all(&rows[local as usize].to_le_bytes())?;
+                i += 1;
+            }
+            for _ in i..r {
+                w.write_all(&NONE.to_le_bytes())?;
+            }
+        }
+        w.flush()?;
+        let file = w.into_inner().map_err(|e| e.into_error())?;
+        // Safety: written and flushed above, never modified again.
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(ShardFile { mmap, r })
+    }
+    fn edges(&self, local: u32) -> impl Iterator<Item = u32> + '_ {
+        let o = local as usize * self.r * 4;
+        self.mmap[o..o + self.r * 4].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).filter(|&e| e != NONE)
+    }
+}
+
+/// Build a Vamana graph over `vectors` (row-major, `n * dim`, typically a
+/// memory-mapped file) and write the index to `path`. `ids[i]` is the external
+/// id of row `i`. Temp files are created next to `path` and removed.
 pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u64], vectors: &[f32], params: GraphParams) -> Result<()> {
     let n = ids.len();
     assert_eq!(vectors.len(), n * dim);
     let r = params.max_degree as usize;
-    let l = (params.build_beam as usize).max(r);
-    let mut rng = XorShift(0x9E3779B97F4A7C15);
+    let all: Vec<u32> = (0..n as u32).collect();
+    let entry = if n == 0 { 0 } else { medoid(vectors, dim, metric, &all) };
+    let vec = |s: u32| &vectors[s as usize * dim..(s as usize + 1) * dim];
 
-    let mut g = MemGraph { dim, vectors, adj: (0..n).map(|_| RwLock::new(Vec::new())).collect() };
-    let mut entry = 0u32;
-    if n > 0 {
-        // Random initial graph so every node is reachable from the start.
-        for a in g.adj.iter_mut() {
-            let a = a.get_mut().unwrap();
-            while a.len() < r.min(n - 1) {
-                let t = (rng.next() % n as u64) as u32;
-                if !a.contains(&t) {
-                    a.push(t);
-                }
-            }
-        }
-        // Medoid: the row closest to the centroid.
-        let mut centroid = vec![0f32; dim];
-        for row in vectors.chunks_exact(dim) {
-            for (c, x) in centroid.iter_mut().zip(row) {
-                *c += x;
-            }
-        }
-        centroid.iter_mut().for_each(|c| *c /= n as f32);
-        entry = (0..n as u32).min_by(|&a, &b| distance(metric, &centroid, g.vector(a)).total_cmp(&distance(metric, &centroid, g.vector(b)))).unwrap();
-
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        for i in (1..n).rev() {
-            order.swap(i, (rng.next() % (i as u64 + 1)) as usize);
-        }
-        // Each node's insertion is independent apart from the adjacency it
-        // touches; per-node locks serialise only those. Same algorithm as the
-        // sequential build, run over the whole order in parallel.
-        let g = &g;
-        order.par_iter().for_each(|&p| {
-            let pv = g.vector(p);
-            let mut cands = greedy(g, entry, l, 1, |s| distance(metric, pv, g.vector(s)));
-            cands.extend(g.adj[p as usize].read().unwrap().iter().map(|&s| (distance(metric, pv, g.vector(s)), s)));
-            let new = prune(g, metric, p, cands, r, params.alpha);
-            *g.adj[p as usize].write().unwrap() = new.clone();
-            for q in new {
-                let mut aq = g.adj[q as usize].write().unwrap();
-                if aq.contains(&p) {
-                    continue;
-                }
-                aq.push(p);
-                if aq.len() > r {
-                    let qv = g.vector(q);
-                    let c: Vec<(f32, u32)> = aq.iter().map(|&s| (distance(metric, qv, g.vector(s)), s)).collect();
-                    *aq = prune(g, metric, q, c, r, params.alpha);
-                }
-            }
-        });
+    if n <= params.shard_size.max(1) as usize {
+        let adj = build_shard(vectors, dim, metric, &all, params, 0x9E3779B97F4A7C15);
+        return write_index(path, dim, metric, ids, vectors, r, entry, params, &|s| adj[s as usize].clone());
     }
 
+    // Sharded: k-means split with 2-way overlap, one Vamana per shard spilled
+    // to disk, then a merge-and-prune pass per node.
+    let k = n.div_ceil(params.shard_size as usize);
+    let (shards, pos) = partition(vectors, dim, metric, n, k, 0xC0FFEE);
+    let mut files: Vec<ShardFile> = Vec::with_capacity(k);
+    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(k);
+    for (s, rows) in shards.iter().enumerate() {
+        let adj = build_shard(vectors, dim, metric, rows, params, 0x5EED + s as u64);
+        let p = PathBuf::from(format!("{}.shard{s}", path.display()));
+        files.push(ShardFile::write(&p, rows, &adj, r)?);
+        tmp_paths.push(p);
+    }
+    drop(shards);
+    let merged = |g: u32| -> Vec<u32> {
+        let p = pos[g as usize];
+        let gv = vec(g);
+        let mut cands: Vec<(f32, u32)> = Vec::with_capacity(2 * r);
+        for (shard, local) in [(p[0], p[1]), (p[2], p[3])] {
+            if shard != NONE {
+                cands.extend(files[shard as usize].edges(local).map(|e| (distance(metric, gv, vec(e)), e)));
+            }
+        }
+        prune(&vec, metric, g, cands, r, params.alpha)
+    };
+    let result = write_index(path, dim, metric, ids, vectors, r, entry, params, &merged);
+    drop(files);
+    for p in tmp_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    result
+}
+
+/// Serialise the index. `edges(slot)` yields a node's final adjacency and is
+/// evaluated in parallel chunks ahead of the sequential write.
+#[allow(clippy::too_many_arguments)]
+fn write_index(path: &Path, dim: usize, metric: Metric, ids: &[u64], vectors: &[f32], r: usize, entry: u32, params: GraphParams, edges: &(dyn Fn(u32) -> Vec<u32> + Sync)) -> Result<()> {
+    let n = ids.len();
     let pq = (params.use_pq && n >= pq::MIN_N).then(|| {
         let cb = Codebook::train(vectors, dim, pq::choose_m(dim), 0xC0DEB00C);
         let codes = cb.encode_all(vectors);
@@ -376,13 +546,18 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
     let pad = (HEADER_LEN + n * 8).next_multiple_of(ALIGN) - (HEADER_LEN + n * 8);
     w.write_all(&vec![0u8; pad])?;
     let mut buf = vec![0u8; block];
-    for s in 0..n {
-        buf.fill(0);
-        buf[..dim * 4].copy_from_slice(bytemuck::cast_slice(g.vector(s as u32)));
-        let a = g.adj[s].read().unwrap();
-        buf[dim * 4..dim * 4 + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
-        buf[dim * 4 + 4..dim * 4 + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(&a));
-        w.write_all(&buf)?;
+    const CHUNK: usize = 1 << 15;
+    for start in (0..n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(n);
+        let chunk: Vec<Vec<u32>> = (start as u32..end as u32).into_par_iter().map(edges).collect();
+        for (s, a) in (start..end).zip(&chunk) {
+            buf.fill(0);
+            buf[..dim * 4].copy_from_slice(bytemuck::cast_slice(&vectors[s * dim..(s + 1) * dim]));
+            let a = &a[..a.len().min(r)];
+            buf[dim * 4..dim * 4 + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
+            buf[dim * 4 + 4..dim * 4 + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(a));
+            w.write_all(&buf)?;
+        }
     }
     if let Some((cb, codes)) = &pq {
         w.write_all(bytemuck::cast_slice(&cb.centroids))?;

@@ -5,10 +5,39 @@ no server. Aimed at on-device and edge AI workloads that outgrow RAM.
 
 [![CI](https://github.com/RohithOrg/sanadb/actions/workflows/ci.yml/badge.svg)](https://github.com/RohithOrg/sanadb/actions/workflows/ci.yml)
 
-Status: pre-1.0. The on-disk formats may still change between versions, and
-no release has been cut. Crash safety, concurrent access and real-data recall
-are tested (see below); multi-process access, replication and encryption are
-not provided.
+## Why this exists, and when not to use it
+
+faiss, hnswlib and usearch are indexes, not stores: in RAM by default, no log,
+no crash safety, no metadata, and updates are your problem. Qdrant, Milvus and
+Weaviate are servers. LanceDB is the closest thing to sanadb: embedded,
+disk-first, Rust with Python bindings, IVF-PQ, mature and well funded. If you
+need something in production this quarter, use LanceDB, or faiss if you only
+need an index.
+
+sanadb aims to be the SQLite of vector search: one dependency, a few files, a
+write-ahead log with real fsync semantics, concurrent readers, index rebuilds
+that do not block writers, metadata filters, and a graph index (the DiskANN
+algorithm, not IVF) that keeps working when the data outgrows RAM. Nothing
+else small and embeddable does all of that. It is a thesis with measurements
+behind it (below), not yet a track record.
+
+Status: pre-1.0. No release has been cut and the on-disk formats may change.
+What is tested: crash safety (torn log tails, atomic checkpoints), concurrent
+reads and writes during a rebuild, a lock against a second process, recall
+and latency on SIFT1M and a 5M SIFT1B prefix including cold-cache runs. What
+is not provided: replication, encryption, multi-process access, typed
+metadata or range filters, and any guarantee about format stability.
+
+## Guarantees
+
+- A write that returned `Ok` survives a process crash. It survives power loss
+  only after `sync()` or with `sync_every_write`.
+- A checkpoint either completes or leaves the previous files untouched.
+- Readers never observe a partially written record or index.
+- One `Db` per store at a time; a second open fails with `Error::Locked`.
+- Search over records written since the last checkpoint is exact. Search over
+  the graph is approximate; recall is a function of `search_beam` and is
+  reported below for public datasets.
 
 ## Usage
 
@@ -18,7 +47,8 @@ Rust:
 use sanadb::{Db, Options, Metric};
 use std::collections::HashMap;
 
-let mut db = Db::open("vectors.sana", Options::new(768).metric(Metric::Dot))?;
+// Metric::L2, Metric::Dot, or Metric::Cosine (normalises on insert and query).
+let db = Db::open("vectors.sana", Options::new(768).metric(Metric::Cosine))?;
 db.insert(1, &embedding, HashMap::from([("doc".into(), "intro.md".into())]))?;
 let hits = db.search_filtered(&query, 10, |m| m["doc"].ends_with(".md"))?;
 db.sync()?;       // fsync: survive power loss
@@ -30,7 +60,7 @@ Python (`pip install maturin && cd python && maturin develop --release`):
 ```python
 import numpy as np, sanadb
 
-db = sanadb.Db("vectors.sana", dim=768, metric="dot")
+db = sanadb.Db("vectors.sana", dim=768, metric="cosine")   # or "l2", "dot"
 db.insert(1, embedding, {"doc": "intro.md"})
 db.insert_many(ids, np.asarray(vectors, dtype=np.float32), metas)
 hits = db.search(query, k=10, filter={"doc": "intro.md"})   # [(id, score), ...]
@@ -171,6 +201,21 @@ down from 32x. The remaining gap is the ~2 ms of sequential dependent read
 rounds a 64-beam walk needs; closing it means issuing reads for likely next
 hops before they are chosen, or holding hot blocks in an explicit cache.
 
+**Sharded build.** Same 5M set rebuilt with the default `shard_size` of 1M
+(5 shards, each vector in its 2 nearest), vectors read from a memory-mapped
+snapshot instead of a RAM copy. Measured with `/usr/bin/time -l`:
+
+| | single shard | 5 shards |
+|---|---|---|
+| build, 10 cores | 731 s | 1396 s |
+| peak RSS (whole process, incl. 2.6 GB delta) | not measured, est. ~7 GB | 4.47 GB |
+| recall@10, beam 64, width 4 | 0.932 | 0.934 |
+| warm mean | 323 µs | 353 µs |
+
+Recall is unchanged; build time roughly doubles because of the 2-way overlap.
+Most of the remaining 4.5 GB is the delta holding the bulk-loaded vectors
+before the first checkpoint, not the build itself.
+
 ## Roadmap
 
 1. **Done:** WAL, checkpoint, flat index, metadata filter, tests, Criterion bench.
@@ -184,10 +229,15 @@ hops before they are chosen, or holding hot blocks in an explicit cache.
    page cache purged). PQ cuts cold mean latency 2.5x and p99 4.8x.
 8. **Done:** Beam-width expansion with block prefetch. Cold mean 8.6 ms to
    2.75 ms, p99 39 ms to 4.2 ms at the default width.
-9. Sharded graph build so building, not just searching, scales past RAM
-   (5M took 731 s and ~7 GB; 10M would not fit a 16 GB machine).
+9. **Done:** Sharded graph build over a memory-mapped snapshot; peak RSS
+   4.5 GB at 5M with 2.6 GB of that being the bulk-load delta.
 10. **Done:** File lock against a second process opening the same store.
 11. ann-benchmarks and VectorDBBench adapters on top of the Python bindings.
+12. Periodic checkpoints during bulk load so the delta stops being the memory ceiling.
+13. e-means (mini-batch k-means from Meta FAIR) for PQ training and shard partitioning.
+14. Release to crates.io and PyPI; format freeze at 1.0.
+15. `sanadb studio`: local web UI to open a store, map it in 2D, cluster, search,
+    watch the beam walk, and edit metadata.
 
 ## Development
 

@@ -117,7 +117,8 @@ impl Ord for Candidate {
 pub(crate) fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         Metric::L2 => l2_sq(a, b),
-        Metric::Dot => -dot(a, b),
+        // Cosine inputs are unit length by the time they reach here.
+        Metric::Dot | Metric::Cosine => -dot(a, b),
     }
 }
 
