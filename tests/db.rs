@@ -150,6 +150,9 @@ fn graph_recall_vs_brute_force() {
     db.checkpoint().unwrap();
     assert_eq!(db.delta_len(), 0);
     assert_eq!(db.len(), n as usize);
+    let stats = db.index_stats().unwrap();
+    assert_eq!(stats.nodes, n as usize);
+    assert_eq!(stats.pq_subspaces, 8, "dim 32 should quantize to 8 subspaces");
 
     let mut hit = 0;
     let queries = 50;
@@ -185,6 +188,8 @@ fn graph_survives_reopen_upsert_delete_and_recheckpoint() {
     let mut db = Db::open(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(db.len(), n as usize);
     assert_eq!(db.delta_len(), 0);
+    // Too few nodes for k-means: walk on full vectors.
+    assert_eq!(db.index_stats().unwrap().pq_subspaces, 0);
     let (v, m) = db.get(42).unwrap();
     assert_eq!(v, &vec_of(dim, 42)[..]);
     assert_eq!(m["i"], "42");
@@ -235,6 +240,33 @@ fn filtered_graph_search_respects_filter() {
     let hits = db.search_filtered(&q, 5, |m| m["parity"] == "odd").unwrap();
     assert_eq!(hits.len(), 5);
     assert!(hits.iter().all(|h| h.id % 2 == 1));
+}
+
+#[test]
+fn pq_off_matches_pq_on_recall() {
+    use sanadb::GraphParams;
+    let (dim, n, k) = (32usize, 3000u64, 10usize);
+    let vectors: Vec<Vec<f32>> = (0..n).map(|i| vec_of(dim, i)).collect();
+    let mut recalls = Vec::new();
+    for use_pq in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let params = GraphParams { use_pq, ..GraphParams::default() };
+        let mut db = Db::open(dir.path().join("v.sana"), Options::new(dim as u32).graph(params)).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            db.insert(i as u64, v, HashMap::new()).unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert_eq!(db.index_stats().unwrap().pq_subspaces, if use_pq { 8 } else { 0 });
+        let mut hit = 0;
+        for qi in 0..30u64 {
+            let q = vec_of(dim, 3_000_000 + qi);
+            let truth = brute_force_top(&vectors, &q, k);
+            hit += db.search(&q, k).unwrap().iter().filter(|h| truth.contains(&h.id)).count();
+        }
+        recalls.push(hit as f32 / 300.0);
+    }
+    eprintln!("recall@10 exact-walk={} pq-walk={}", recalls[0], recalls[1]);
+    assert!(recalls[0] >= 0.9 && recalls[1] >= 0.9, "{recalls:?}");
 }
 
 #[test]

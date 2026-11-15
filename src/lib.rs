@@ -10,6 +10,7 @@
 
 mod graph;
 mod index;
+mod pq;
 mod wal;
 
 use std::collections::{HashMap, HashSet};
@@ -116,6 +117,17 @@ impl Options {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStats {
+    /// Records in the graph, including tombstoned ones.
+    pub nodes: usize,
+    /// Product-quantization subspaces (bytes per node held in RAM). 0 means the
+    /// walk reads full vectors from the mapped file.
+    pub pq_subspaces: usize,
+    /// Graph records hidden by a later delete or overwrite.
+    pub tombstones: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub id: u64,
@@ -199,6 +211,11 @@ impl Db {
     /// Number of records served from the in-RAM delta rather than the graph.
     pub fn delta_len(&self) -> usize {
         self.delta.len()
+    }
+
+    /// Shape of the on-disk graph index, or `None` before the first checkpoint.
+    pub fn index_stats(&self) -> Option<IndexStats> {
+        self.graph.as_ref().map(|g| IndexStats { nodes: g.len(), pq_subspaces: g.pq_subspaces(), tombstones: self.tombstones.len() })
     }
 
     /// Insert or replace the record with this id.

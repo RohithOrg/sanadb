@@ -52,20 +52,37 @@ Two files: `<path>` is the write-ahead log, `<path>.idx` is the graph index.
   `max_search_beam`, so a 1% filter still returns `k` results with the default
   beam. Cost grows with selectivity instead of silently returning short.
 
+- **Product quantization.** Indexes with at least 1024 nodes also store a
+  codebook (256 centroids per subspace, ~4 floats each) and one byte per
+  subspace per node. The codes are loaded into RAM on open (32 bytes per node
+  at dim 128, versus 512 for the vector). The walk scores neighbours from the
+  codes, so expanding a node reads one block from disk, its adjacency, instead
+  of R neighbour vectors. The final candidates are re-ranked with exact
+  distances from the mapped file. `GraphParams::use_pq = false` turns it off.
+
 Graph build still holds all vectors in RAM.
 
 ## Numbers
 
-Apple Silicon laptop, 10 cores, dim 128, k = 10, R = 32, build L = 100,
-search beam 64.
+**Synthetic data.** Uniform random vectors from `rand`, the easiest case for
+approximate search; recall on real embeddings will be lower. Apple Silicon
+laptop, 10 cores, dim 128, k = 10, R = 32, build L = 100, search beam 64.
+Everything in the OS page cache (hot).
 
 | n | flat search | graph search | graph, 10% filter | graph build |
 |---|---|---|---|---|
-| 10,000 | 227 µs | 99 µs | 101 µs | 0.87 s |
-| 100,000 | 3.8 ms | 139 µs | 358 µs | 12.5 s |
+| 10,000 | 227 µs | 117 µs | 115 µs | 1.2 s |
+| 100,000 | 3.8 ms | 140 µs | 146 µs | 14.4 s |
 
-Graph search time is nearly flat in n. The 10% filter at 100K needs one beam
-doubling to fill k = 10, hence the 2.6x.
+Graph search time is nearly flat in n. Hot-cache latency is the same with and
+without PQ: the win PQ buys is fewer distinct disk blocks touched per query,
+which only shows once the dataset outgrows the page cache. Not yet measured.
+
+Recall@10 against brute force on the synthetic set, from the test suite:
+0.98 (5K x 32, PQ), 0.99 exact walk vs 0.98 PQ walk (3K x 32), 0.93 with a
+1% filter and a beam of 16.
+
+No public benchmark dataset (SIFT1M, GloVe, DBpedia embeddings) has been run yet.
 
 ## Roadmap
 
@@ -73,12 +90,12 @@ doubling to fill k = 10, hence the 2.6x.
 2. **Done:** Disk-resident Vamana graph index, memory-mapped, with delta +
    tombstones and atomic two-file checkpoint.
 3. **Done:** Parallel build; adaptive beam for selective filters.
-4. Product-quantized vectors in RAM for neighbour distances, full vectors on
-   disk only for re-ranking (the actual DiskANN trick). Cuts page faults per hop
-   from R to 1.
-5. Sharded graph build so building, not just searching, scales past RAM.
-6. MVCC snapshots for concurrent readers alongside a single writer.
-7. Benchmark against sqlite-vec, usearch and LanceDB on 10M x 768-dim vectors.
+4. **Done:** Product-quantized codes in RAM for the walk, exact re-rank from disk.
+5. Real-dataset harness: SIFT1M (public, with ground truth) for recall and
+   latency, including a cold-cache run where the data exceeds RAM.
+6. Sharded graph build so building, not just searching, scales past RAM.
+7. MVCC snapshots for concurrent readers alongside a single writer.
+8. Benchmark against sqlite-vec, usearch and LanceDB on 10M x 768-dim vectors.
 
 ## Development
 

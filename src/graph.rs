@@ -2,11 +2,17 @@
 //!
 //! One node per fixed-size block: `vector f32*dim | count u32 | neighbors u32*R`.
 //! The file is memory-mapped, so a query touches only the blocks it visits and
-//! the OS page cache holds the working set. The dataset no longer has to fit
-//! in RAM; the per-node id table (8 bytes/node) still does.
+//! the OS page cache holds the working set.
 //!
-//! File: `SANAIDX1 | dim u32 | metric u8 | pad[3] | n u32 | r u32 | entry u32 |
-//! block u32 | ids u64*n | pad to 64 | blocks`.
+//! For indexes of at least `pq::MIN_N` nodes the file also carries a product
+//! quantization codebook and one `m`-byte code per node. The codes are loaded
+//! into RAM on open, and the walk scores neighbours from them, so expanding a
+//! node costs one block read (its adjacency) instead of `R` reads (each
+//! neighbour's vector). Full-precision vectors are read only to re-rank the
+//! final candidates.
+//!
+//! File: `SANAIDX2 | dim u32 | metric u8 | pad[3] | n u32 | r u32 | entry u32 |
+//! block u32 | m u32 | ids u64*n | pad to 64 | blocks | codebook f32*(m*256*dim/m) | codes u8*(n*m)`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -18,10 +24,11 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::index::distance;
+use crate::pq::{self, Codebook};
 use crate::{Error, Metric, Result};
 
-const MAGIC: &[u8; 8] = b"SANAIDX1";
-const HEADER_LEN: usize = 8 + 4 + 1 + 3 + 4 + 4 + 4 + 4;
+const MAGIC: &[u8; 8] = b"SANAIDX2";
+const HEADER_LEN: usize = 8 + 4 + 1 + 3 + 4 + 4 + 4 + 4 + 4;
 const ALIGN: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
@@ -32,18 +39,20 @@ pub struct GraphParams {
     pub build_beam: u32,
     /// Pruning slack. 1.0 is a pure RNG graph; 1.2 adds long edges that cut hops.
     pub alpha: f32,
+    /// Store product-quantized codes and walk on them. Off means every hop
+    /// reads R full vectors from the mapped file.
+    pub use_pq: bool,
 }
 
 impl Default for GraphParams {
     fn default() -> Self {
-        GraphParams { max_degree: 32, build_beam: 100, alpha: 1.2 }
+        GraphParams { max_degree: 32, build_beam: 100, alpha: 1.2, use_pq: true }
     }
 }
 
 /// Anything the greedy walk can traverse: the in-RAM graph under construction
 /// or the memory-mapped file.
 trait Walkable: Sync {
-    fn vector(&self, slot: u32) -> &[f32];
     /// Append `slot`'s neighbours to `out`. A callback rather than a slice so
     /// the in-RAM graph can hand out lock-guarded adjacency.
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>);
@@ -59,6 +68,7 @@ pub(crate) struct GraphIndex {
     blocks_off: usize,
     ids: Vec<u64>,
     slot_of: HashMap<u64, u32>,
+    pq: Option<(Codebook, Vec<u8>)>,
 }
 
 impl GraphIndex {
@@ -81,19 +91,33 @@ impl GraphIndex {
         if fdim != dim || fmetric != metric {
             return Err(Error::HeaderMismatch { on_disk: (fdim, fmetric), requested: (dim, metric) });
         }
-        let (n, r, entry, block) = (u32_at(16) as usize, u32_at(20) as usize, u32_at(24), u32_at(28) as usize);
+        let dim = dim as usize;
+        let (n, r, entry, block, m) = (u32_at(16) as usize, u32_at(20) as usize, u32_at(24), u32_at(28) as usize, u32_at(32) as usize);
         let ids_off = HEADER_LEN;
         let blocks_off = (ids_off + n * 8).next_multiple_of(ALIGN);
-        if block != block_size(dim as usize, r) || mmap.len() < blocks_off + n * block || (n > 0 && entry as usize >= n) {
+        let pq_off = blocks_off + n * block;
+        let pq_len = if m == 0 { 0 } else { m * pq::K * (dim / m) * 4 + n * m };
+        if block != block_size(dim, r) || (m != 0 && !dim.is_multiple_of(m)) || mmap.len() < pq_off + pq_len || (n > 0 && entry as usize >= n) {
             return Err(Error::Corrupt("index geometry inconsistent"));
         }
         let ids: Vec<u64> = mmap[ids_off..ids_off + n * 8].as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
         let slot_of = ids.iter().enumerate().map(|(s, &id)| (id, s as u32)).collect();
-        Ok(Some(GraphIndex { mmap, dim: dim as usize, metric, r, entry, block, blocks_off, ids, slot_of }))
+        let pq = (m != 0).then(|| {
+            let cb_len = m * pq::K * (dim / m) * 4;
+            let centroids = mmap[pq_off..pq_off + cb_len].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+            let codes = mmap[pq_off + cb_len..pq_off + pq_len].to_vec();
+            (Codebook { dim, m, centroids }, codes)
+        });
+        Ok(Some(GraphIndex { mmap, dim, metric, r, entry, block, blocks_off, ids, slot_of, pq }))
     }
 
     pub fn len(&self) -> usize {
         self.ids.len()
+    }
+
+    /// Number of PQ subspaces, 0 when the walk uses full vectors.
+    pub fn pq_subspaces(&self) -> usize {
+        self.pq.as_ref().map_or(0, |(cb, _)| cb.m)
     }
 
     pub fn slot(&self, id: u64) -> Option<u32> {
@@ -104,12 +128,18 @@ impl GraphIndex {
         self.ids[slot as usize]
     }
 
+    pub fn vector(&self, slot: u32) -> &[f32] {
+        let o = self.blocks_off + slot as usize * self.block;
+        bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])
+    }
+
     pub fn vector_of(&self, id: u64) -> Option<&[f32]> {
         self.slot(id).map(|s| self.vector(s))
     }
 
     /// Beam search from the medoid. Returns up to `k` `(distance, slot)` pairs
-    /// among visited nodes that pass `accept`, closest first.
+    /// among visited nodes that pass `accept`, closest first, with exact
+    /// distances.
     ///
     /// `beam` bounds the candidate list on the first attempt. When a selective
     /// filter leaves fewer than `k` accepted nodes, the walk is retried with
@@ -121,11 +151,26 @@ impl GraphIndex {
         }
         let mut beam = beam.max(k);
         let cap = max_beam.max(beam).min(self.ids.len());
+        let lut = self.pq.as_ref().map(|(cb, _)| cb.lut(q, self.metric));
         loop {
-            let mut visited = greedy(self, self.metric, self.entry, q, beam);
+            let mut visited = match (&self.pq, &lut) {
+                (Some((cb, codes)), Some(lut)) => {
+                    let m = cb.m;
+                    greedy(self, self.entry, beam, |s| pq::lut_distance(lut, &codes[s as usize * m..(s as usize + 1) * m]))
+                }
+                _ => greedy(self, self.entry, beam, |s| distance(self.metric, q, self.vector(s))),
+            };
             let exhausted = visited.len() >= self.ids.len();
             visited.retain(|&(_, s)| accept(s));
             if visited.len() >= k || beam >= cap || exhausted {
+                if self.pq.is_some() {
+                    // Re-rank the best `beam` approximate candidates exactly.
+                    visited.truncate(beam.max(k));
+                    for c in visited.iter_mut() {
+                        c.0 = distance(self.metric, q, self.vector(c.1));
+                    }
+                    visited.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                }
                 visited.truncate(k);
                 return visited;
             }
@@ -135,10 +180,6 @@ impl GraphIndex {
 }
 
 impl Walkable for GraphIndex {
-    fn vector(&self, slot: u32) -> &[f32] {
-        let o = self.blocks_off + slot as usize * self.block;
-        bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])
-    }
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
         let o = self.blocks_off + slot as usize * self.block + self.dim * 4;
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
@@ -158,21 +199,24 @@ struct MemGraph<'a> {
     adj: Vec<RwLock<Vec<u32>>>,
 }
 
-impl Walkable for MemGraph<'_> {
+impl MemGraph<'_> {
     fn vector(&self, slot: u32) -> &[f32] {
         let s = slot as usize * self.dim;
         &self.vectors[s..s + self.dim]
     }
+}
+
+impl Walkable for MemGraph<'_> {
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
         out.extend_from_slice(&self.adj[slot as usize].read().unwrap());
     }
 }
 
-/// Greedy best-first walk. Returns every expanded node as `(distance, slot)`,
-/// closest first. The candidate list is capped at `beam`.
-fn greedy<G: Walkable>(g: &G, metric: Metric, start: u32, q: &[f32], beam: usize) -> Vec<(f32, u32)> {
+/// Greedy best-first walk scored by `dist`. Returns every expanded node as
+/// `(distance, slot)`, closest first. The candidate list is capped at `beam`.
+fn greedy<G: Walkable>(g: &G, start: u32, beam: usize, dist: impl Fn(u32) -> f32) -> Vec<(f32, u32)> {
     // (dist, slot, expanded), kept sorted ascending by dist.
-    let mut cand: Vec<(f32, u32, bool)> = vec![(distance(metric, q, g.vector(start)), start, false)];
+    let mut cand: Vec<(f32, u32, bool)> = vec![(dist(start), start, false)];
     let mut seen: HashSet<u32> = HashSet::from([start]);
     let mut out = Vec::new();
     let mut nbrs = Vec::new();
@@ -186,7 +230,7 @@ fn greedy<G: Walkable>(g: &G, metric: Metric, start: u32, q: &[f32], beam: usize
             if !seen.insert(nb) {
                 continue;
             }
-            let nd = distance(metric, q, g.vector(nb));
+            let nd = dist(nb);
             if cand.len() >= beam && nd >= cand[beam - 1].0 {
                 continue;
             }
@@ -259,7 +303,7 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
         let g = &g;
         order.par_iter().for_each(|&p| {
             let pv = g.vector(p);
-            let mut cands = greedy(g, metric, entry, pv, l);
+            let mut cands = greedy(g, entry, l, |s| distance(metric, pv, g.vector(s)));
             cands.extend(g.adj[p as usize].read().unwrap().iter().map(|&s| (distance(metric, pv, g.vector(s)), s)));
             let new = prune(g, metric, p, cands, r, params.alpha);
             *g.adj[p as usize].write().unwrap() = new.clone();
@@ -278,6 +322,13 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
         });
     }
 
+    let pq = (params.use_pq && n >= pq::MIN_N).then(|| {
+        let cb = Codebook::train(vectors, dim, pq::choose_m(dim), 0xC0DEB00C);
+        let codes = cb.encode_all(vectors);
+        (cb, codes)
+    });
+    let m = pq.as_ref().map_or(0, |(cb, _)| cb.m);
+
     let block = block_size(dim, r);
     let mut w = BufWriter::new(File::create(path)?);
     w.write_all(MAGIC)?;
@@ -287,6 +338,7 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
     w.write_all(&(r as u32).to_le_bytes())?;
     w.write_all(&entry.to_le_bytes())?;
     w.write_all(&(block as u32).to_le_bytes())?;
+    w.write_all(&(m as u32).to_le_bytes())?;
     for id in ids {
         w.write_all(&id.to_le_bytes())?;
     }
@@ -300,6 +352,10 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
         buf[dim * 4..dim * 4 + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
         buf[dim * 4 + 4..dim * 4 + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(&a));
         w.write_all(&buf)?;
+    }
+    if let Some((cb, codes)) = &pq {
+        w.write_all(bytemuck::cast_slice(&cb.centroids))?;
+        w.write_all(codes)?;
     }
     w.flush()?;
     w.get_ref().sync_all()?;
