@@ -489,7 +489,16 @@ impl Db {
 
         // 3. Swap files and reconcile with writes that happened meanwhile.
         let mut i = self.write()?;
-        std::fs::rename(&idx_tmp, &self.idx_path)?;
+        // Windows cannot replace a file that is still mapped, so the old
+        // index mapping goes first. We hold the write lock, so no reader has
+        // a reference, and `base` was dropped above. If the rename fails the
+        // old file is still there; reopen it so the store stays usable.
+        i.graph = None;
+        if let Err(e) = std::fs::rename(&idx_tmp, &self.idx_path) {
+            i.graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric).ok().flatten().map(Arc::new);
+            let _ = std::fs::remove_file(&idx_tmp);
+            return Err(e.into());
+        }
         // Map the new file before the log swap so the log we write only names
         // vectors the new index holds.
         let graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)?.ok_or(Error::Corrupt("index vanished after rename"))?;
@@ -518,6 +527,9 @@ impl Db {
         let inserts = survivors.iter().map(|&(id, off)| Entry::Insert { id, vector: i.wal.vector_at(off).to_vec(), meta: i.meta[&id].clone() });
         let metas = i.meta.iter().filter(|(id, _)| !survivor_ids.contains(id)).map(|(&id, m)| Entry::Meta { id, meta: m.clone() });
         let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas))?;
+        // Same Windows rule for the log: unmap the old one before replacing it.
+        // `vector_at` is not called again on the old `Wal` after this point.
+        i.wal.release();
         std::fs::rename(&log_tmp, &self.path)?;
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::File::open(dir)?.sync_all()?;

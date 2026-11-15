@@ -68,8 +68,10 @@ pub(crate) struct Wal {
     writer: BufWriter<File>,
     /// Logical end of the log: where the next frame goes.
     len: u64,
-    /// Read-only mapping of the file, at least `len` bytes long.
-    map: Mmap,
+    /// Read-only mapping of the file, at least `len` bytes long. `None` only
+    /// transiently: Windows refuses to resize or replace a mapped file, so
+    /// the mapping is dropped around `set_len` and before a rename.
+    map: Option<Mmap>,
     dim: usize,
 }
 
@@ -100,7 +102,7 @@ impl Wal {
         // writer appends past `len`; bytes below `len` never change.
         let map = unsafe { Mmap::map(&file)? };
         file.seek(SeekFrom::Start(len))?;
-        Ok((Wal { writer: BufWriter::new(file), len, map, dim: wanted.dim as usize }, entries))
+        Ok((Wal { writer: BufWriter::new(file), len, map: Some(map), dim: wanted.dim as usize }, entries))
     }
 
     /// Append a frame. For an insert, returns the byte offset of its vector.
@@ -108,7 +110,7 @@ impl Wal {
         let mut body = Vec::new();
         encode(entry, &mut body);
         let needed = self.len + 8 + body.len() as u64;
-        if needed > self.map.len() as u64 {
+        if needed > self.map.as_ref().map_or(0, |m| m.len() as u64) {
             self.grow(needed)?;
         }
         self.writer.write_all(&(body.len() as u32).to_le_bytes())?;
@@ -124,17 +126,28 @@ impl Wal {
     fn grow(&mut self, needed: u64) -> Result<()> {
         self.writer.flush()?;
         let new_len = needed.div_ceil(GROW_STEP) * GROW_STEP;
+        self.map = None; // Windows: no resizing while mapped.
         let file = self.writer.get_ref();
         file.set_len(new_len)?;
         // Safety: as in `open`.
-        self.map = unsafe { Mmap::map(file)? };
+        self.map = Some(unsafe { Mmap::map(file)? });
         Ok(())
+    }
+
+    /// Flush, drop the mapping and trim growth slack, leaving the file in a
+    /// state another process (or a rename over it) can take. Called before
+    /// the log is replaced at checkpoint and on drop. The log must not be
+    /// read through this `Wal` afterwards.
+    pub fn release(&mut self) {
+        let _ = self.writer.flush();
+        self.map = None;
+        let _ = self.writer.get_ref().set_len(self.len);
     }
 
     /// The vector stored at an offset returned by `append` or replay.
     pub fn vector_at(&self, off: u64) -> &[f32] {
         let o = off as usize;
-        bytemuck::cast_slice(&self.map[o..o + self.dim * 4])
+        bytemuck::cast_slice(&self.map.as_ref().expect("log mapping released")[o..o + self.dim * 4])
     }
 
     /// Push buffered frames to the OS. Data survives a process crash, not a power loss.
@@ -155,8 +168,7 @@ impl Drop for Wal {
     /// Give back the growth slack so a closed store is exactly as large as
     /// its contents. Errors are ignored: the slack is harmless on reopen.
     fn drop(&mut self) {
-        let _ = self.writer.flush();
-        let _ = self.writer.get_ref().set_len(self.len);
+        self.release();
     }
 }
 
