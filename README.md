@@ -168,6 +168,33 @@ Beam 32 was the first pass after opening the index, so its tail includes
 first-touch page faults. PQ costs about 0.01 recall at a given beam and saves
 10 to 15% CPU when the index is warm.
 
+### ann-benchmarks, sift-128-euclidean, against hnswlib
+
+Run by the [ann-benchmarks](https://github.com/erikbern/ann-benchmarks) harness
+in local mode with the adapter in `benchmarks/ann-benchmarks/`, so the
+queries, ground truth, timing and recall computation are theirs. hnswlib is
+the in-RAM HNSW implementation that sits at the top of their published
+plots; here at M=16 and M=24, efConstruction 500, as in their config.
+Same laptop, single query thread, k=10, warm. Queries per second at the
+nearest measured recall, higher is better:
+
+| recall@10 | hnswlib M=16 | hnswlib M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
+|---|---|---|---|---|---|
+| ~0.93 | 5,938 (0.931) | | | 5,457 (0.934) | 4,579 (0.939) |
+| ~0.96 | | 4,797 (0.958) | 3,947 (0.964) | 4,229 (0.957) | 3,482 (0.971) |
+| ~0.98 | 3,452 (0.977) | | 2,800 (0.980) | 2,400 (0.983) | 3,003 (0.984) |
+| ~0.99 | 2,520 (0.990) | 2,808 (0.989) | 2,322 (0.987) | 2,041 (0.989) | 2,229 (0.993) |
+| ~0.996 | 1,639 (0.997) | 2,011 (0.996) | 1,348 (0.995) | 1,154 (0.996) | 1,774 (0.996) |
+| ~0.999 | 922 (0.9996) | 1,323 (0.999) | 743 (0.9985) | | 1,029 (0.999) |
+| build | 209 s | 266 s | 119 s | 112 s | 222 s |
+
+sanadb lands within 10 to 25% of hnswlib's throughput at the same recall
+across the curve, with a faster build, while holding 32 bytes per vector in
+RAM instead of the whole index. The harness's "index size" column is omitted:
+it measures process memory growth during build, which is near zero for a
+memory-mapped index and says nothing useful here. Raw CSV:
+`benchmarks/ann-benchmarks/results/sift-128-euclidean.csv`.
+
 ### Cold cache, 5M vectors from SIFT1B
 
 First 5,000,000 vectors of big-ann-benchmarks "bigann" (uint8, dim 128, L2),
@@ -216,9 +243,8 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. ann-benchmarks and VectorDBBench adapters on the Python bindings, so the
-   comparison with hnswlib, usearch, faiss and LanceDB is run by their harness,
-   not ours.
+1. More ann-benchmarks coverage: glove-100-angular (cosine), faiss HNSW and
+   usearch alongside hnswlib; a VectorDBBench client.
 2. e-means (Meta FAIR's mini-batch k-means) for PQ training and shard partitioning.
 3. Format freeze and 1.0.
 4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
