@@ -540,6 +540,7 @@ dependencies = [
  "criterion",
  "memmap2",
  "rand",
+ "rayon",
  "tempfile",
 ]
 

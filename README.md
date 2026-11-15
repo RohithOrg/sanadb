@@ -44,30 +44,39 @@ Two files: `<path>` is the write-ahead log, `<path>.idx` is the graph index.
   accumulators so the compiler emits packed FMA. Also the correctness baseline
   the graph is tested against (recall@10 ≥ 0.9 enforced, 0.996 measured).
 
-Graph build currently holds all vectors in RAM and runs single-threaded. Search
-is filter-after-walk: a very selective filter needs a larger `search_beam`.
+- **Parallel build.** Node insertions run across all cores with a lock per
+  adjacency list; no thread holds two locks. The graph is nondeterministic
+  but recall is unchanged.
+- **Adaptive filtered search.** A filter is applied to visited nodes. When
+  fewer than `k` pass, the walk retries with the beam doubled up to
+  `max_search_beam`, so a 1% filter still returns `k` results with the default
+  beam. Cost grows with selectivity instead of silently returning short.
+
+Graph build still holds all vectors in RAM.
 
 ## Numbers
 
-Apple Silicon laptop, dim 128, k = 10, R = 32, build L = 100, search beam 64.
+Apple Silicon laptop, 10 cores, dim 128, k = 10, R = 32, build L = 100,
+search beam 64.
 
-| n | flat search | graph search | graph build |
-|---|---|---|---|
-| 10,000 | 227 µs | 94 µs | 4.2 s |
-| 100,000 | 3.66 ms | 130 µs | 54 s |
+| n | flat search | graph search | graph, 10% filter | graph build |
+|---|---|---|---|---|
+| 10,000 | 227 µs | 99 µs | 101 µs | 0.87 s |
+| 100,000 | 3.8 ms | 139 µs | 358 µs | 12.5 s |
 
-Graph search time is nearly flat in n; the build is the cost to attack next.
+Graph search time is nearly flat in n. The 10% filter at 100K needs one beam
+doubling to fill k = 10, hence the 2.6x.
 
 ## Roadmap
 
 1. **Done:** WAL, checkpoint, flat index, metadata filter, tests, Criterion bench.
 2. **Done:** Disk-resident Vamana graph index, memory-mapped, with delta +
    tombstones and atomic two-file checkpoint.
-3. Filter-aware graph traversal (keep walking until k accepted candidates).
+3. **Done:** Parallel build; adaptive beam for selective filters.
 4. Product-quantized vectors in RAM for neighbour distances, full vectors on
    disk only for re-ranking (the actual DiskANN trick). Cuts page faults per hop
    from R to 1.
-5. Sharded, parallel graph build so building, not just searching, scales past RAM.
+5. Sharded graph build so building, not just searching, scales past RAM.
 6. MVCC snapshots for concurrent readers alongside a single writer.
 7. Benchmark against sqlite-vec, usearch and LanceDB on 10M x 768-dim vectors.
 

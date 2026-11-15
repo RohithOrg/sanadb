@@ -85,11 +85,18 @@ pub struct Options {
     pub graph: GraphParams,
     /// Candidate list size during graph search. Larger = higher recall, slower.
     pub search_beam: u32,
+    /// Upper bound the beam may grow to when a filter leaves fewer than `k`
+    /// results. Set equal to `search_beam` to disable the retry.
+    pub max_search_beam: u32,
 }
 
 impl Options {
     pub fn new(dim: u32) -> Self {
-        Options { dim, metric: Metric::L2, sync_every_write: false, graph: GraphParams::default(), search_beam: 64 }
+        Options { dim, metric: Metric::L2, sync_every_write: false, graph: GraphParams::default(), search_beam: 64, max_search_beam: 4096 }
+    }
+    pub fn max_search_beam(mut self, beam: u32) -> Self {
+        self.max_search_beam = beam;
+        self
     }
     pub fn metric(mut self, m: Metric) -> Self {
         self.metric = m;
@@ -241,9 +248,9 @@ impl Db {
         let passes = |id: u64| self.meta.get(&id).is_some_and(&filter);
         let mut hits = self.delta.search(query, k, passes);
         if let Some(g) = &self.graph {
-            let beam = self.opts.search_beam as usize;
+            let (beam, max_beam) = (self.opts.search_beam as usize, self.opts.max_search_beam as usize);
             hits.extend(
-                g.search(query, k, beam, |slot| !self.tombstones.contains(&slot) && passes(g.id(slot)))
+                g.search(query, k, beam, max_beam, |slot| !self.tombstones.contains(&slot) && passes(g.id(slot)))
                     .into_iter()
                     .map(|(score, slot)| Hit { id: g.id(slot), score }),
             );

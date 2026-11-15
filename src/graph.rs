@@ -12,8 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::RwLock;
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::index::distance;
 use crate::{Error, Metric, Result};
@@ -40,9 +42,11 @@ impl Default for GraphParams {
 
 /// Anything the greedy walk can traverse: the in-RAM graph under construction
 /// or the memory-mapped file.
-trait Walkable {
+trait Walkable: Sync {
     fn vector(&self, slot: u32) -> &[f32];
-    fn neighbors(&self, slot: u32) -> &[u32];
+    /// Append `slot`'s neighbours to `out`. A callback rather than a slice so
+    /// the in-RAM graph can hand out lock-guarded adjacency.
+    fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>);
 }
 
 pub(crate) struct GraphIndex {
@@ -105,16 +109,28 @@ impl GraphIndex {
     }
 
     /// Beam search from the medoid. Returns up to `k` `(distance, slot)` pairs
-    /// among visited nodes that pass `accept`, closest first. `beam` bounds the
-    /// candidate list; raise it for better recall or very selective filters.
-    pub fn search(&self, q: &[f32], k: usize, beam: usize, accept: impl Fn(u32) -> bool) -> Vec<(f32, u32)> {
+    /// among visited nodes that pass `accept`, closest first.
+    ///
+    /// `beam` bounds the candidate list on the first attempt. When a selective
+    /// filter leaves fewer than `k` accepted nodes, the walk is retried with
+    /// the beam doubled, up to `max_beam`, so filtered queries still fill `k`
+    /// without the caller tuning anything.
+    pub fn search(&self, q: &[f32], k: usize, beam: usize, max_beam: usize, accept: impl Fn(u32) -> bool) -> Vec<(f32, u32)> {
         if self.ids.is_empty() || k == 0 {
             return Vec::new();
         }
-        let mut visited = greedy(self, self.metric, self.entry, q, beam.max(k));
-        visited.retain(|&(_, s)| accept(s));
-        visited.truncate(k);
-        visited
+        let mut beam = beam.max(k);
+        let cap = max_beam.max(beam).min(self.ids.len());
+        loop {
+            let mut visited = greedy(self, self.metric, self.entry, q, beam);
+            let exhausted = visited.len() >= self.ids.len();
+            visited.retain(|&(_, s)| accept(s));
+            if visited.len() >= k || beam >= cap || exhausted {
+                visited.truncate(k);
+                return visited;
+            }
+            beam = (beam * 2).min(cap);
+        }
     }
 }
 
@@ -123,10 +139,10 @@ impl Walkable for GraphIndex {
         let o = self.blocks_off + slot as usize * self.block;
         bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])
     }
-    fn neighbors(&self, slot: u32) -> &[u32] {
+    fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
         let o = self.blocks_off + slot as usize * self.block + self.dim * 4;
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
-        bytemuck::cast_slice(&self.mmap[o + 4..o + 4 + count.min(self.r) * 4])
+        out.extend_from_slice(bytemuck::cast_slice(&self.mmap[o + 4..o + 4 + count.min(self.r) * 4]));
     }
 }
 
@@ -134,10 +150,12 @@ fn block_size(dim: usize, r: usize) -> usize {
     (dim * 4 + 4 + r * 4).next_multiple_of(ALIGN)
 }
 
+/// Graph under construction. Per-node locks let many threads insert at once;
+/// no thread ever holds two locks, so there is no deadlock.
 struct MemGraph<'a> {
     dim: usize,
     vectors: &'a [f32],
-    adj: Vec<Vec<u32>>,
+    adj: Vec<RwLock<Vec<u32>>>,
 }
 
 impl Walkable for MemGraph<'_> {
@@ -145,8 +163,8 @@ impl Walkable for MemGraph<'_> {
         let s = slot as usize * self.dim;
         &self.vectors[s..s + self.dim]
     }
-    fn neighbors(&self, slot: u32) -> &[u32] {
-        &self.adj[slot as usize]
+    fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
+        out.extend_from_slice(&self.adj[slot as usize].read().unwrap());
     }
 }
 
@@ -157,11 +175,14 @@ fn greedy<G: Walkable>(g: &G, metric: Metric, start: u32, q: &[f32], beam: usize
     let mut cand: Vec<(f32, u32, bool)> = vec![(distance(metric, q, g.vector(start)), start, false)];
     let mut seen: HashSet<u32> = HashSet::from([start]);
     let mut out = Vec::new();
+    let mut nbrs = Vec::new();
     while let Some(i) = cand.iter().position(|c| !c.2) {
         cand[i].2 = true;
         let (d, s, _) = cand[i];
         out.push((d, s));
-        for &nb in g.neighbors(s) {
+        nbrs.clear();
+        g.neighbors_into(s, &mut nbrs);
+        for &nb in &nbrs {
             if !seen.insert(nb) {
                 continue;
             }
@@ -205,11 +226,12 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
     let l = (params.build_beam as usize).max(r);
     let mut rng = XorShift(0x9E3779B97F4A7C15);
 
-    let mut g = MemGraph { dim, vectors, adj: vec![Vec::new(); n] };
+    let mut g = MemGraph { dim, vectors, adj: (0..n).map(|_| RwLock::new(Vec::new())).collect() };
     let mut entry = 0u32;
     if n > 0 {
         // Random initial graph so every node is reachable from the start.
         for a in g.adj.iter_mut() {
+            let a = a.get_mut().unwrap();
             while a.len() < r.min(n - 1) {
                 let t = (rng.next() % n as u64) as u32;
                 if !a.contains(&t) {
@@ -231,21 +253,29 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
         for i in (1..n).rev() {
             order.swap(i, (rng.next() % (i as u64 + 1)) as usize);
         }
-        for &p in &order {
+        // Each node's insertion is independent apart from the adjacency it
+        // touches; per-node locks serialise only those. Same algorithm as the
+        // sequential build, run over the whole order in parallel.
+        let g = &g;
+        order.par_iter().for_each(|&p| {
             let pv = g.vector(p);
-            let mut cands = greedy(&g, metric, entry, pv, l);
-            cands.extend(g.adj[p as usize].iter().map(|&s| (distance(metric, pv, g.vector(s)), s)));
-            let new = prune(&g, metric, p, cands, r, params.alpha);
-            g.adj[p as usize] = new.clone();
+            let mut cands = greedy(g, metric, entry, pv, l);
+            cands.extend(g.adj[p as usize].read().unwrap().iter().map(|&s| (distance(metric, pv, g.vector(s)), s)));
+            let new = prune(g, metric, p, cands, r, params.alpha);
+            *g.adj[p as usize].write().unwrap() = new.clone();
             for q in new {
-                g.adj[q as usize].push(p);
-                if g.adj[q as usize].len() > r {
+                let mut aq = g.adj[q as usize].write().unwrap();
+                if aq.contains(&p) {
+                    continue;
+                }
+                aq.push(p);
+                if aq.len() > r {
                     let qv = g.vector(q);
-                    let c: Vec<(f32, u32)> = g.adj[q as usize].iter().map(|&s| (distance(metric, qv, g.vector(s)), s)).collect();
-                    g.adj[q as usize] = prune(&g, metric, q, c, r, params.alpha);
+                    let c: Vec<(f32, u32)> = aq.iter().map(|&s| (distance(metric, qv, g.vector(s)), s)).collect();
+                    *aq = prune(g, metric, q, c, r, params.alpha);
                 }
             }
-        }
+        });
     }
 
     let block = block_size(dim, r);
@@ -266,9 +296,9 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
     for s in 0..n {
         buf.fill(0);
         buf[..dim * 4].copy_from_slice(bytemuck::cast_slice(g.vector(s as u32)));
-        let a = &g.adj[s];
+        let a = g.adj[s].read().unwrap();
         buf[dim * 4..dim * 4 + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
-        buf[dim * 4 + 4..dim * 4 + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(a));
+        buf[dim * 4 + 4..dim * 4 + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(&a));
         w.write_all(&buf)?;
     }
     w.flush()?;

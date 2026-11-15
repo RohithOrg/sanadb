@@ -238,6 +238,41 @@ fn filtered_graph_search_respects_filter() {
 }
 
 #[test]
+fn selective_filter_fills_k_with_small_beam() {
+    // 1% of records pass the filter; a beam of 16 visits far fewer than the
+    // ~1000 nodes needed to see 10 of them. The adaptive retry must widen it.
+    let (dim, n, k) = (16usize, 5000u64, 10usize);
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Db::open(dir.path().join("v.sana"), Options::new(dim as u32).search_beam(16)).unwrap();
+    let vectors: Vec<Vec<f32>> = (0..n).map(|i| vec_of(dim, i)).collect();
+    for (i, v) in vectors.iter().enumerate() {
+        db.insert(i as u64, v, meta(&[("tag", if i % 100 == 0 { "rare" } else { "common" })])).unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    let mut hit = 0;
+    let queries = 20;
+    for qi in 0..queries {
+        let q = vec_of(dim, 2_000_000 + qi);
+        let rare: Vec<Vec<f32>> = vectors.iter().step_by(100).cloned().collect();
+        let truth: Vec<u64> = brute_force_top(&rare, &q, k).iter().map(|i| i * 100).collect();
+        let got = db.search_filtered(&q, k, |m| m["tag"] == "rare").unwrap();
+        assert_eq!(got.len(), k, "query {qi} returned {} hits", got.len());
+        assert!(got.iter().all(|h| h.id % 100 == 0));
+        hit += got.iter().filter(|h| truth.contains(&h.id)).count();
+    }
+    let recall = hit as f32 / (queries * k as u64) as f32;
+    eprintln!("filtered recall@10 = {recall}");
+    assert!(recall >= 0.8, "filtered recall@10 = {recall}");
+
+    // With the retry disabled the same query comes back short.
+    drop(db);
+    let db = Db::open(dir.path().join("v.sana"), Options::new(dim as u32).search_beam(16).max_search_beam(16)).unwrap();
+    let got = db.search_filtered(&vec_of(dim, 2_000_000), k, |m| m["tag"] == "rare").unwrap();
+    assert!(got.len() < k);
+}
+
+#[test]
 fn exact_search_matches_brute_force() {
     let dim = 32;
     let dir = tempfile::tempdir().unwrap();
