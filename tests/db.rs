@@ -460,6 +460,111 @@ fn delta_survives_log_growth_and_remap() {
     check(&db);
 }
 
+type V1Record<'a> = (u64, Vec<f32>, &'a [(&'a str, &'a str)]);
+
+/// Write a log in the 0.1.1 format (`SANADB01`, unpadded frames) by hand.
+fn write_v1_log(path: &std::path::Path, dim: u32, records: &[V1Record], deletes: &[u64]) {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"SANADB01");
+    out.extend_from_slice(&dim.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]); // metric L2, pad
+    let mut frame = |body: &[u8]| {
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+        out.extend_from_slice(body);
+    };
+    for (id, v, m) in records {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&id.to_le_bytes());
+        for x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b.extend_from_slice(&(m.len() as u16).to_le_bytes());
+        for (k, val) in m.iter() {
+            b.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&(val.len() as u16).to_le_bytes());
+            b.extend_from_slice(val.as_bytes());
+        }
+        frame(&b);
+    }
+    for id in deletes {
+        let mut b = vec![2u8];
+        b.extend_from_slice(&id.to_le_bytes());
+        frame(&b);
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn opens_and_migrates_a_0_1_1_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.sana");
+    write_v1_log(&path, 4, &[(1, vec![1.0, 0.0, 0.0, 0.0], &[("k", "a")]), (2, vec![0.0, 1.0, 0.0, 0.0], &[]), (3, vec![0.0, 0.0, 1.0, 0.0], &[("k", "c")])], &[2]);
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(db.len(), 2);
+    assert_eq!(db.get(1).unwrap(), (vec![1.0, 0.0, 0.0, 0.0], meta(&[("k", "a")])));
+    assert!(db.get(2).is_none());
+    assert_eq!(db.search(&[0.0, 0.0, 0.9, 0.0], 1).unwrap()[0].id, 3);
+    db.insert(4, &[0.0, 0.0, 0.0, 1.0], HashMap::new()).unwrap();
+    drop(db);
+    // Now a current-format file; opens again without migration.
+    let head = &std::fs::read(&path).unwrap()[..8];
+    assert_eq!(head, b"SANADB02");
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(db.len(), 3);
+    // Dimension mismatch is reported before anything is rewritten.
+    let other = dir.path().join("old2.sana");
+    write_v1_log(&other, 4, &[(1, vec![1.0; 4], &[])], &[]);
+    assert!(matches!(Db::open(&other, Options::new(8)), Err(sanadb::Error::HeaderMismatch { .. })));
+    assert_eq!(&std::fs::read(&other).unwrap()[..8], b"SANADB01");
+}
+
+#[test]
+fn unknown_frame_kinds_are_skipped_and_newer_levels_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sana");
+    {
+        let db = Db::open(&path, Options::new(2)).unwrap();
+        db.insert(1, &[1.0, 0.0], HashMap::new()).unwrap();
+        db.sync().unwrap();
+    }
+    // Append a well-formed frame of kind 200, as a future version might.
+    let body = [200u8, 0, 0, 0, 7, 7, 7, 7];
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    f.write_all(&crc32fast::hash(&body).to_le_bytes()).unwrap();
+    f.write_all(&body).unwrap();
+    // And a record after it, which a reader must still reach.
+    let mut rec = vec![1u8, 0, 0, 0];
+    rec.extend_from_slice(&2u64.to_le_bytes());
+    rec.extend_from_slice(&bytemuck_free_f32s(&[0.0, 1.0]));
+    rec.extend_from_slice(&0u16.to_le_bytes());
+    while rec.len() % 4 != 0 {
+        rec.push(0);
+    }
+    f.write_all(&(rec.len() as u32).to_le_bytes()).unwrap();
+    f.write_all(&crc32fast::hash(&rec).to_le_bytes()).unwrap();
+    f.write_all(&rec).unwrap();
+    drop(f);
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    let db = Db::open(&path, Options::new(2)).unwrap();
+    assert_eq!(db.len(), 2, "record after the unknown frame must survive");
+    assert_eq!(db.get(2).unwrap().0, vec![0.0, 1.0]);
+    drop(db);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before, "nothing truncated");
+
+    // A header that demands a newer reader is refused, not misread.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[13] = 99;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(matches!(Db::open(&path, Options::new(2)), Err(sanadb::Error::NeedsNewerVersion { file_level: 99, .. })));
+}
+
+fn bytemuck_free_f32s(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 #[test]
 fn checkpoint_of_empty_store_is_fine() {
     let dir = tempfile::tempdir().unwrap();

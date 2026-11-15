@@ -46,6 +46,13 @@ below are real and reproducible; the track record is not there yet.
   the graph is approximate; recall depends on `search_beam` and is measured
   below on public datasets.
 
+- A newer sanadb opens any store an older one wrote, converting it on first
+  open if the layout changed. An older sanadb opens a newer store as long as
+  the layout is one it knows, skipping record kinds it does not understand;
+  if the layout is newer than it can read, it fails with
+  `Error::NeedsNewerVersion` rather than misreading. `CHANGELOG.md` lists
+  every format change and its upgrade notes.
+
 Not provided: replication, encryption, multi-process access, typed metadata,
 range filters, format stability before 1.0.
 

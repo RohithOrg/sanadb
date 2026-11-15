@@ -42,6 +42,9 @@ pub enum Error {
     Poisoned,
     /// Another `Db` (in this or another process) has the store open.
     Locked,
+    /// The file was written by a newer sanadb whose layout this build cannot
+    /// read. Upgrade sanadb; the data is intact.
+    NeedsNewerVersion { file_level: u8, supported: u8 },
 }
 
 impl From<std::io::Error> for Error {
@@ -69,6 +72,9 @@ impl std::fmt::Display for Error {
             Error::InvalidVector => write!(f, "vector contains NaN or infinity"),
             Error::Poisoned => write!(f, "store lock poisoned by a panic; reopen the store"),
             Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
+            Error::NeedsNewerVersion { file_level, supported } => {
+                write!(f, "file needs reader level {file_level}, this sanadb supports {supported}: upgrade sanadb")
+            }
         }
     }
 }

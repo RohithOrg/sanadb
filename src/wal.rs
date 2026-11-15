@@ -24,6 +24,14 @@ use memmap2::Mmap;
 use crate::{Error, Metadata, Metric, Result};
 
 const MAGIC: &[u8; 8] = b"SANADB02";
+/// Header byte 13. A file sets it to the lowest reader level that can open
+/// it; this build reads levels up to `READER_LEVEL`. Additive changes (new
+/// frame kinds, which old readers skip) leave it alone; only a change that
+/// an old reader would misread raises it.
+pub(crate) const READER_LEVEL: u8 = 1;
+/// Format of 0.1.1: same frames without the 4-byte padding or the pad bytes
+/// after `kind`. Converted in place on open.
+const MAGIC_V1: &[u8; 8] = b"SANADB01";
 pub(crate) const HEADER_LEN: u64 = 8 + 4 + 1 + 3; // magic, dim, metric, pad
 /// The file is extended in steps of this size; each step costs one remap.
 const GROW_STEP: u64 = 64 << 20;
@@ -69,6 +77,9 @@ impl Wal {
     /// Open or create the log. Returns the header and every intact entry.
     pub fn open(path: &Path, wanted: Header) -> Result<(Self, Vec<Replayed>)> {
         let exists = path.exists() && std::fs::metadata(path)?.len() > 0;
+        if exists {
+            migrate_v1(path, wanted)?;
+        }
         let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let (entries, len) = if exists {
             let header = read_header(&mut file)?;
@@ -174,12 +185,70 @@ pub(crate) fn write_snapshot(path: &Path, header: Header, entries: impl Iterator
     Ok(offs)
 }
 
+/// If `path` is a 0.1.1 (`SANADB01`) log, rewrite it in the current format
+/// via a temp file and rename. Frames there were `len | crc | kind | payload`
+/// with no padding; payloads are otherwise identical.
+fn migrate_v1(path: &Path, wanted: Header) -> Result<()> {
+    let mut file = File::open(path)?;
+    let mut magic = [0u8; 8];
+    if file.read_exact(&mut magic).is_err() || &magic != MAGIC_V1 {
+        return Ok(());
+    }
+    let mut rest = [0u8; 8];
+    file.read_exact(&mut rest).map_err(|_| Error::Corrupt("v1 file shorter than header"))?;
+    let dim = u32::from_le_bytes(rest[..4].try_into().unwrap());
+    let metric = Metric::from_u8(rest[4]).ok_or(Error::Corrupt("v1 unknown metric"))?;
+    let header = Header { dim, metric };
+    if header != wanted {
+        return Err(Error::HeaderMismatch { on_disk: (dim, metric), requested: (wanted.dim, wanted.metric) });
+    }
+    let bytes = std::fs::read(path)?;
+    let mut pos = HEADER_LEN as usize;
+    let mut entries = Vec::new();
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else { break };
+        if len == 0 || crc32fast::hash(body) != crc {
+            break;
+        }
+        // Re-frame the v1 body as a v2 body: insert the three pad bytes.
+        let mut v2 = Vec::with_capacity(body.len() + 3);
+        v2.push(body[0]);
+        v2.extend_from_slice(&[0, 0, 0]);
+        v2.extend_from_slice(&body[1..]);
+        let e = match decode(&v2, dim, 0) {
+            Decoded::Entry(e) => e,
+            Decoded::Unknown => {
+                pos += 8 + len;
+                continue;
+            }
+            Decoded::Bad => break,
+        };
+        let entry = match e {
+            Replayed::Insert { id, meta, .. } => {
+                let vb = &body[1 + 8..1 + 8 + dim as usize * 4];
+                let vector = vb.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                Entry::Insert { id, vector, meta }
+            }
+            Replayed::Delete { id } => Entry::Delete { id },
+            Replayed::Meta { id, meta } => Entry::Meta { id, meta },
+        };
+        entries.push(entry);
+        pos += 8 + len;
+    }
+    let tmp = path.with_extension("migrate.tmp");
+    write_snapshot(&tmp, header, entries.into_iter())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn write_header(file: &mut File, h: Header) -> io::Result<()> {
     let mut buf = Vec::with_capacity(HEADER_LEN as usize);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&h.dim.to_le_bytes());
     buf.push(h.metric as u8);
-    buf.extend_from_slice(&[0, 0, 0]);
+    buf.extend_from_slice(&[READER_LEVEL, 0, 0]);
     file.write_all(&buf)
 }
 
@@ -188,6 +257,9 @@ fn read_header(file: &mut File) -> Result<Header> {
     file.read_exact(&mut buf).map_err(|_| Error::Corrupt("file shorter than header"))?;
     if &buf[..8] != MAGIC {
         return Err(Error::Corrupt("bad magic"));
+    }
+    if buf[13] > READER_LEVEL {
+        return Err(Error::NeedsNewerVersion { file_level: buf[13], supported: READER_LEVEL });
     }
     let dim = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let metric = Metric::from_u8(buf[12]).ok_or(Error::Corrupt("unknown metric"))?;
@@ -218,12 +290,21 @@ fn read_entries(file: &mut File, dim: u32) -> Result<(Vec<Replayed>, u64)> {
             break;
         }
         match decode(&body, dim, offset + 8) {
-            Some(e) => out.push(e),
-            None => break,
+            Decoded::Entry(e) => out.push(e),
+            // A well-formed frame of a kind this build does not know: written
+            // by a newer version. Skip it rather than treat it as damage.
+            Decoded::Unknown => {}
+            Decoded::Bad => break,
         }
         offset += 8 + len as u64;
     }
     Ok((out, offset))
+}
+
+enum Decoded {
+    Entry(Replayed),
+    Unknown,
+    Bad,
 }
 
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -274,7 +355,16 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 }
 
 /// `body_off` is the file offset of `body`, used to report where a vector lies.
-fn decode(body: &[u8], dim: u32, body_off: u64) -> Option<Replayed> {
+fn decode(body: &[u8], dim: u32, body_off: u64) -> Decoded {
+    match decode_known(body, dim, body_off) {
+        Some(Some(e)) => Decoded::Entry(e),
+        Some(None) => Decoded::Unknown,
+        None => Decoded::Bad,
+    }
+}
+
+/// Outer `None`: malformed. Inner `None`: unknown kind.
+fn decode_known(body: &[u8], dim: u32, body_off: u64) -> Option<Option<Replayed>> {
     let mut c = Cursor { buf: body, pos: 0 };
     let kind = c.u8()?;
     c.take(3)?;
@@ -291,10 +381,10 @@ fn decode(body: &[u8], dim: u32, body_off: u64) -> Option<Replayed> {
             let id = c.u64()?;
             Replayed::Meta { id, meta: c.meta()? }
         }
-        _ => return None,
+        _ => return Some(None),
     };
     // Only zero padding may follow.
-    (body[c.pos..].len() < 4 && body[c.pos..].iter().all(|&b| b == 0)).then_some(e)
+    (body[c.pos..].len() < 4 && body[c.pos..].iter().all(|&b| b == 0)).then_some(Some(e))
 }
 
 struct Cursor<'a> {

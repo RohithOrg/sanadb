@@ -101,6 +101,9 @@ impl GraphIndex {
         if &h[..8] != MAGIC {
             return Err(Error::Corrupt("index bad magic"));
         }
+        if h[13] > crate::wal::READER_LEVEL {
+            return Err(Error::NeedsNewerVersion { file_level: h[13], supported: crate::wal::READER_LEVEL });
+        }
         let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         let (fdim, fmetric) = (u32_at(8), Metric::from_u8(h[12]).ok_or(Error::Corrupt("index unknown metric"))?);
         if fdim != dim || fmetric != metric {
@@ -536,7 +539,7 @@ fn write_index(path: &Path, dim: usize, metric: Metric, ids: &[u64], vectors: &[
     let mut w = BufWriter::new(File::create(path)?);
     w.write_all(MAGIC)?;
     w.write_all(&(dim as u32).to_le_bytes())?;
-    w.write_all(&[metric as u8, 0, 0, 0])?;
+    w.write_all(&[metric as u8, crate::wal::READER_LEVEL, 0, 0])?;
     w.write_all(&(n as u32).to_le_bytes())?;
     w.write_all(&(r as u32).to_le_bytes())?;
     w.write_all(&entry.to_le_bytes())?;
