@@ -104,12 +104,14 @@ fn main() {
             let q: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
             let pq = a.get(5).is_none_or(|s| s != "pq:off");
             let beam: u32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(64);
+            let width: u32 = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(4);
             let gt_bytes = fs::read(dir.join(format!("gt.{n}.{q}.u32"))).expect("run `gt` first");
             let gt: Vec<u32> = gt_bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
             let qs = queries(dir, q);
             let t = Instant::now();
-            let db = Db::open(store_path(dir, n, pq), Options::new(DIM as u32).graph(GraphParams { use_pq: pq, ..GraphParams::default() }).search_beam(beam).max_search_beam(beam)).unwrap();
-            println!("open: {:.2?}  n={} pq={pq} beam={beam} queries={q}", t.elapsed(), db.len());
+            let opts = Options::new(DIM as u32).graph(GraphParams { use_pq: pq, ..GraphParams::default() }).search_beam(beam).max_search_beam(beam).io_width(width);
+            let db = Db::open(store_path(dir, n, pq), opts).unwrap();
+            println!("open: {:.2?}  n={} pq={pq} beam={beam} io_width={width} queries={q}", t.elapsed(), db.len());
             println!("{:>6} {:>9} {:>9} {:>9} {:>9} {:>9}", "pass", "recall@10", "mean", "p50", "p99", "total");
             for pass in ["cold", "warm"] {
                 let mut lat = Vec::with_capacity(q);

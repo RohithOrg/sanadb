@@ -107,6 +107,10 @@ pub struct Options {
     /// Run `checkpoint` automatically once the log holds this many entries
     /// more than there are live records. 0 disables.
     pub auto_checkpoint_garbage: usize,
+    /// Graph nodes expanded per walk step, with their disk blocks prefetched
+    /// together. 1 is the classic walk; 4–8 overlaps reads when the index is
+    /// not in the page cache, at the cost of a few extra expansions.
+    pub io_width: u32,
 }
 
 impl Options {
@@ -119,7 +123,12 @@ impl Options {
             search_beam: 64,
             max_search_beam: 4096,
             auto_checkpoint_garbage: 100_000,
+            io_width: 4,
         }
+    }
+    pub fn io_width(mut self, width: u32) -> Self {
+        self.io_width = width.max(1);
+        self
     }
     pub fn metric(mut self, m: Metric) -> Self {
         self.metric = m;
@@ -316,9 +325,9 @@ impl Db {
         let passes = |id: u64| i.meta.get(&id).is_some_and(&filter);
         let mut hits = i.delta.search(query, k, passes);
         if let Some(g) = &i.graph {
-            let (beam, max_beam) = (self.opts.search_beam as usize, self.opts.max_search_beam as usize);
+            let (beam, max_beam, width) = (self.opts.search_beam as usize, self.opts.max_search_beam as usize, self.opts.io_width as usize);
             hits.extend(
-                g.search(query, k, beam, max_beam, |slot| !i.tombstones.contains(&slot) && passes(g.id(slot)))
+                g.search(query, k, beam, max_beam, width, |slot| !i.tombstones.contains(&slot) && passes(g.id(slot)))
                     .into_iter()
                     .map(|(score, slot)| Hit { id: g.id(slot), score }),
             );

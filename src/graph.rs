@@ -56,6 +56,9 @@ trait Walkable: Sync {
     /// Append `slot`'s neighbours to `out`. A callback rather than a slice so
     /// the in-RAM graph can hand out lock-guarded adjacency.
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>);
+    /// Hint that these slots' blocks are about to be read, so a disk-backed
+    /// graph can issue the reads concurrently instead of faulting one at a time.
+    fn prefetch(&self, _slots: &[u32]) {}
 }
 
 pub(crate) struct GraphIndex {
@@ -145,7 +148,10 @@ impl GraphIndex {
     /// filter leaves fewer than `k` accepted nodes, the walk is retried with
     /// the beam doubled, up to `max_beam`, so filtered queries still fill `k`
     /// without the caller tuning anything.
-    pub fn search(&self, q: &[f32], k: usize, beam: usize, max_beam: usize, accept: impl Fn(u32) -> bool) -> Vec<(f32, u32)> {
+    /// `width` is how many candidates are expanded per step; their blocks are
+    /// prefetched together, which is what makes a cold (disk-bound) query
+    /// cheaper. 1 reproduces the classic one-at-a-time walk.
+    pub fn search(&self, q: &[f32], k: usize, beam: usize, max_beam: usize, width: usize, accept: impl Fn(u32) -> bool) -> Vec<(f32, u32)> {
         if self.ids.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -156,9 +162,9 @@ impl GraphIndex {
             let mut visited = match (&self.pq, &lut) {
                 (Some((cb, codes)), Some(lut)) => {
                     let m = cb.m;
-                    greedy(self, self.entry, beam, |s| pq::lut_distance(lut, &codes[s as usize * m..(s as usize + 1) * m]))
+                    greedy(self, self.entry, beam, width, |s| pq::lut_distance(lut, &codes[s as usize * m..(s as usize + 1) * m]))
                 }
-                _ => greedy(self, self.entry, beam, |s| distance(self.metric, q, self.vector(s))),
+                _ => greedy(self, self.entry, beam, width, |s| distance(self.metric, q, self.vector(s))),
             };
             let exhausted = visited.len() >= self.ids.len();
             visited.retain(|&(_, s)| accept(s));
@@ -184,6 +190,16 @@ impl Walkable for GraphIndex {
         let o = self.blocks_off + slot as usize * self.block + self.dim * 4;
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
         out.extend_from_slice(bytemuck::cast_slice(&self.mmap[o + 4..o + 4 + count.min(self.r) * 4]));
+    }
+    fn prefetch(&self, slots: &[u32]) {
+        if slots.len() < 2 {
+            return;
+        }
+        for &s in slots {
+            let o = self.blocks_off + s as usize * self.block;
+            // Advisory: the kernel starts the read; a failure only costs the hint.
+            let _ = self.mmap.advise_range(memmap2::Advice::WillNeed, o, self.block);
+        }
     }
 }
 
@@ -214,29 +230,44 @@ impl Walkable for MemGraph<'_> {
 
 /// Greedy best-first walk scored by `dist`. Returns every expanded node as
 /// `(distance, slot)`, closest first. The candidate list is capped at `beam`.
-fn greedy<G: Walkable>(g: &G, start: u32, beam: usize, dist: impl Fn(u32) -> f32) -> Vec<(f32, u32)> {
+///
+/// Up to `width` of the best unexpanded candidates are expanded per step,
+/// after one `prefetch` call for all of them. With `width == 1` this is the
+/// textbook walk; larger widths trade a few extra expansions for overlapping
+/// disk reads.
+fn greedy<G: Walkable>(g: &G, start: u32, beam: usize, width: usize, dist: impl Fn(u32) -> f32) -> Vec<(f32, u32)> {
     // (dist, slot, expanded), kept sorted ascending by dist.
     let mut cand: Vec<(f32, u32, bool)> = vec![(dist(start), start, false)];
     let mut seen: HashSet<u32> = HashSet::from([start]);
     let mut out = Vec::new();
     let mut nbrs = Vec::new();
-    while let Some(i) = cand.iter().position(|c| !c.2) {
-        cand[i].2 = true;
-        let (d, s, _) = cand[i];
-        out.push((d, s));
-        nbrs.clear();
-        g.neighbors_into(s, &mut nbrs);
-        for &nb in &nbrs {
-            if !seen.insert(nb) {
-                continue;
+    let mut picks: Vec<u32> = Vec::with_capacity(width.max(1));
+    loop {
+        picks.clear();
+        for c in cand.iter_mut().filter(|c| !c.2).take(width.max(1)) {
+            c.2 = true;
+            out.push((c.0, c.1));
+            picks.push(c.1);
+        }
+        if picks.is_empty() {
+            break;
+        }
+        g.prefetch(&picks);
+        for &s in &picks {
+            nbrs.clear();
+            g.neighbors_into(s, &mut nbrs);
+            for &nb in &nbrs {
+                if !seen.insert(nb) {
+                    continue;
+                }
+                let nd = dist(nb);
+                if cand.len() >= beam && nd >= cand[beam - 1].0 {
+                    continue;
+                }
+                let pos = cand.partition_point(|c| c.0 <= nd);
+                cand.insert(pos, (nd, nb, false));
+                cand.truncate(beam);
             }
-            let nd = dist(nb);
-            if cand.len() >= beam && nd >= cand[beam - 1].0 {
-                continue;
-            }
-            let pos = cand.partition_point(|c| c.0 <= nd);
-            cand.insert(pos, (nd, nb, false));
-            cand.truncate(beam);
         }
     }
     out.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -303,7 +334,7 @@ pub(crate) fn build_and_write(path: &Path, dim: usize, metric: Metric, ids: &[u6
         let g = &g;
         order.par_iter().for_each(|&p| {
             let pv = g.vector(p);
-            let mut cands = greedy(g, entry, l, |s| distance(metric, pv, g.vector(s)));
+            let mut cands = greedy(g, entry, l, 1, |s| distance(metric, pv, g.vector(s)));
             cands.extend(g.adj[p as usize].read().unwrap().iter().map(|&s| (distance(metric, pv, g.vector(s)), s)));
             let new = prune(g, metric, p, cands, r, params.alpha);
             *g.adj[p as usize].write().unwrap() = new.clone();

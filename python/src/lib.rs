@@ -65,7 +65,7 @@ impl PyDb {
     /// metric: "l2" (squared Euclidean) or "dot" (negative inner product;
     /// normalise your vectors for cosine).
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -74,6 +74,7 @@ impl PyDb {
         metric: &str,
         search_beam: u32,
         max_search_beam: u32,
+        io_width: u32,
         sync_every_write: bool,
         pq: bool,
         max_degree: u32,
@@ -89,6 +90,7 @@ impl PyDb {
             .metric(metric)
             .search_beam(search_beam)
             .max_search_beam(max_search_beam)
+            .io_width(io_width)
             .sync_every_write(sync_every_write)
             .graph(GraphParams { max_degree, build_beam, alpha, use_pq: pq });
         let db = py.allow_threads(|| sanadb_core::Db::open(path, opts)).map_err(err)?;

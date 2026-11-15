@@ -150,8 +150,24 @@ the expanded node's block (its adjacency) and scores neighbours from codes in
 RAM; without PQ it also reads each neighbour's block. That shows as 2.5x lower
 mean and 4.8x lower p99 cold latency with PQ. The medians are close, so for
 most queries the neighbour blocks were already pulled in by earlier hops;
-the gain is in the tail. Cold is still 30x slower than warm: the next step for
-disk-resident search is a block cache with read-ahead and parallel I/O.
+the gain is in the tail. Those rows expand one node at a time (`io_width = 1`).
+
+**Beam-width expansion.** `Options::io_width` expands several of the best
+unexpanded candidates per step and issues `madvise(WILLNEED)` for all their
+blocks first, so the kernel overlaps the reads. Same index, queries and
+protocol as above, PQ on:
+
+| io_width | cold mean / p50 / p99 | warm mean | recall@10 |
+|---|---|---|---|
+| 1 | 8.6 ms / 5.6 ms / 39 ms | 270 µs | 0.927 |
+| 4 (default) | 2.75 ms / 2.7 ms / 4.2 ms | 323 µs | 0.932 |
+| 8 | 2.26 ms / 2.2 ms / 3.4 ms | 366 µs | 0.937 |
+
+Width 4 cuts cold mean 3.1x and p99 9x for a 20% warm-CPU cost; width 8 buys
+a little more cold latency for another 13% warm. Cold is now about 8x warm,
+down from 32x. The remaining gap is the ~2 ms of sequential dependent read
+rounds a 64-beam walk needs; closing it means issuing reads for likely next
+hops before they are chosen, or holding hot blocks in an explicit cache.
 
 ## Roadmap
 
@@ -164,8 +180,8 @@ disk-resident search is a block cache with read-ahead and parallel I/O.
 6. **Done:** Thread-safe `Db`, non-blocking checkpoint, Python bindings, CI.
 7. **Done:** Cold-cache measurement on a 5M SIFT1B prefix (3.5 GB index,
    page cache purged). PQ cuts cold mean latency 2.5x and p99 4.8x.
-8. Cold-path I/O: issue the beam's block reads in parallel instead of one
-   page fault at a time, and cap the per-query tail.
+8. **Done:** Beam-width expansion with block prefetch. Cold mean 8.6 ms to
+   2.75 ms, p99 39 ms to 4.2 ms at the default width.
 9. Sharded graph build so building, not just searching, scales past RAM
    (5M took 731 s and ~7 GB; 10M would not fit a 16 GB machine).
 10. File lock against a second process opening the same store.
