@@ -1,0 +1,17 @@
+[package]
+name = "sanadb-python"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for sanadb"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "sanadb"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Renamed: the cdylib itself is called `sanadb` (the Python module name).
+sanadb_core = { package = "sanadb", path = ".." }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
+numpy = "0.24"

@@ -1,2 +1,6 @@
 /target
 /data
+/python/.venv
+/python/target
+*.so
+__pycache__/

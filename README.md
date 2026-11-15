@@ -3,9 +3,16 @@
 A disk-first embedded vector + metadata store in Rust. Single file, crash-safe,
 no server. Aimed at on-device and edge AI workloads that outgrow RAM.
 
-Status: milestone 2 (disk-resident graph index). Not production-ready.
+[![CI](https://github.com/RohithOrg/sanadb/actions/workflows/ci.yml/badge.svg)](https://github.com/RohithOrg/sanadb/actions/workflows/ci.yml)
+
+Status: pre-1.0. The on-disk formats may still change between versions, and
+no release has been cut. Crash safety, concurrent access and real-data recall
+are tested (see below); multi-process access, replication and encryption are
+not provided.
 
 ## Usage
+
+Rust:
 
 ```rust
 use sanadb::{Db, Options, Metric};
@@ -15,8 +22,25 @@ let mut db = Db::open("vectors.sana", Options::new(768).metric(Metric::Dot))?;
 db.insert(1, &embedding, HashMap::from([("doc".into(), "intro.md".into())]))?;
 let hits = db.search_filtered(&query, 10, |m| m["doc"].ends_with(".md"))?;
 db.sync()?;       // fsync: survive power loss
-db.checkpoint()?; // compact the file
+db.checkpoint()?; // build the graph index, compact the log
 ```
+
+Python (`pip install maturin && cd python && maturin develop --release`):
+
+```python
+import numpy as np, sanadb
+
+db = sanadb.Db("vectors.sana", dim=768, metric="dot")
+db.insert(1, embedding, {"doc": "intro.md"})
+db.insert_many(ids, np.asarray(vectors, dtype=np.float32), metas)
+hits = db.search(query, k=10, filter={"doc": "intro.md"})   # [(id, score), ...]
+hits = db.search(query, k=10, filter=lambda m: m["doc"].endswith(".md"))
+db.checkpoint()
+```
+
+`Db` is thread-safe. Reads run concurrently; a checkpoint builds the new
+index without blocking readers or writers, and the GIL is released during
+inserts, searches with dict filters, and checkpoints.
 
 ## Design
 
@@ -36,10 +60,16 @@ Two files: `<path>` is the write-ahead log, `<path>.idx` is the graph index.
   in-RAM flat index. Graph records that were deleted or overwritten are hidden
   by a tombstone set rebuilt from the log on open. A search walks the graph,
   scans the delta, and merges.
-- **Checkpoint.** Rebuilds the graph over every live record, swaps the index
-  file in by rename, then rewrites the log as metadata-only frames and swaps
-  that in. Index first, so the log never names a vector the index lacks. A
-  crash between the two renames leaves a consistent, slightly redundant state.
+- **Checkpoint.** Snapshots live vectors under a brief exclusive lock, builds
+  the graph with no lock held, then swaps the index file in by rename, rewrites
+  the log (metadata-only frames, plus full frames for records written during
+  the build) and swaps that in. Index first, so the log never names a vector
+  the index lacks. A crash between the two renames leaves a consistent,
+  slightly redundant state. Writes that land during the build stay in the
+  delta, identified by a per-record write sequence number.
+- **Concurrency.** `Db` is `Send + Sync`: a `RwLock` guards the in-memory
+  state, reads share it, writes take it exclusively, checkpoints serialise on
+  a separate mutex. One process at a time; there is no file lock yet.
 - **Flat index.** Contiguous `Vec<f32>`; distance loops use eight independent
   accumulators so the compiler emits packed FMA. Also the correctness baseline
   the graph is tested against (recall@10 ≥ 0.9 enforced, 0.996 measured).
@@ -109,17 +139,21 @@ saving is unmeasured until the index exceeds RAM.
    tombstones and atomic two-file checkpoint.
 3. **Done:** Parallel build; adaptive beam for selective filters.
 4. **Done:** Product-quantized codes in RAM for the walk, exact re-rank from disk.
-5. Real-dataset harness: SIFT1M (public, with ground truth) for recall and
-   latency, including a cold-cache run where the data exceeds RAM.
-6. Sharded graph build so building, not just searching, scales past RAM.
-7. MVCC snapshots for concurrent readers alongside a single writer.
-8. Benchmark against sqlite-vec, usearch and LanceDB on 10M x 768-dim vectors.
+5. **Done:** SIFT1M harness with published ground truth.
+6. **Done:** Thread-safe `Db`, non-blocking checkpoint, Python bindings, CI.
+7. Cold-cache measurement on a dataset larger than RAM (SIFT1B subset or
+   Cohere 10M). This is the thesis of the project and is still unproven.
+8. Sharded graph build so building, not just searching, scales past RAM.
+9. File lock against a second process opening the same store.
+10. ann-benchmarks and VectorDBBench adapters on top of the Python bindings.
 
 ## Development
 
 ```bash
-cargo test
-cargo bench
+cargo test --release
+cargo clippy --all-targets -- -D warnings
+cargo bench --bench search
+cd python && maturin develop --release && pytest tests
 ```
 
 See `RESEARCH.md` for the problem survey behind this direction.
