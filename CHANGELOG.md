@@ -5,67 +5,6 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
-## [Unreleased]
-
-### Added
-- Keyword and hybrid search. `Options::text_field(key)` names a metadata
-  key whose strings are indexed at checkpoint (lowercase alphanumeric
-  tokens, BM25 with k1 = 1.2, b = 0.75). `Db::search_text(query, k, filter)`
-  scores indexed records from the inverted index and records written since
-  the last checkpoint from their metadata, with one set of corpus
-  statistics; scores are negated BM25. `Db::search_hybrid(vector, text, k,
-  filter)` fuses the dense and keyword lists by reciprocal rank (`1 / (60 +
-  rank)`, each list fetched at `3k`). Python: `text_field=`, `search_text()`,
-  `search(query, text=...)`. The text section lives in the index file after
-  the id table, named by the footer's third slot; a 0.2.0 reader ignores it.
-  On BEIR SciFact (5,183 documents, 300 test queries,
-  `benchmarks/beir/scifact_bm25.py`), against the `rank_bm25` reference with
-  the same tokens:
-
-  | | nDCG@10 | Recall@100 | ms/query |
-  |---|---|---|---|
-  | sanadb `search_text` | 0.662 | 0.886 | 1.2 |
-  | rank_bm25 (Okapi) | 0.654 | 0.876 | 30.6 |
-
-  Published Anserini BM25 on SciFact is 0.665 nDCG@10; the small
-  differences are the idf variant.
-- `Filter::Contains(key, token)`: the key's string, tokenised like the text
-  index, contains the token. On the text field it runs on the inverted index
-  (membership by binary search over the term's postings, the postings as
-  scan candidates); on another `Str` column the value is decoded and
-  tokenised. Python: `{"tags": {"$contains": "t12"}}`. This is how tag sets
-  are filtered: on the big-ann-benchmarks YFCC filter track at 1M records
-  (`examples/yfcc.rs`) every selectivity bucket gets recall 1.0 (0.994 above
-  10,000 matches) where post-filtering got 0.17 to 0.83; table in README.
-- Learned sparse vectors. `Value::Sparse(Vec<(u32, f32)>)` is a metadata
-  value (Python: an `(indices, weights)` pair of arrays); pairs are sorted,
-  duplicates summed and zero weights dropped on insert, non-finite weights
-  are `Error::InvalidVector`. One key per store may hold them
-  (`Error::SecondSparseKey` otherwise); at checkpoint it is written to a
-  sparse section of the index file (forward lists for `get`, inverted
-  lists for search; log value kind 4, footer slot 4, see `docs/FORMAT.md`).
-  `Db::search_sparse(query, k, filter)` scores by dot product over the
-  inverted lists plus the tail; `Db::search_hybrid_sparse(vector, sparse,
-  k, filter)` fuses it with the dense result by reciprocal rank. Python:
-  `search_sparse()`, `search(query, sparse=...)`. No public-dataset quality
-  number yet: that needs a SPLADE encoding of a BEIR set, which is on the
-  list. MaxScore for long BM25 posting lists is not implemented; SciFact
-  queries take 1.2 ms term-at-a-time and no measured workload needed it.
-- `Db::stats()` (Python `Db.stats()`): operation counters since open:
-  searches by regime (graph walk, filtered walk, exact scan, delta only),
-  text searches, inserts, deletes, batches, checkpoints (total,
-  incremental, failed, last duration) and read-only refreshes (appended,
-  reloaded). Relaxed atomics; polling them costs nothing measurable.
-- Cargo feature `tracing`: `tracing` events on target `sanadb` for
-  checkpoints (incremental, duration, records), failed checkpoints, reader
-  reloads and orphan index files removed at open. Off by default; the crate
-  has no new mandatory dependency.
-- Failure injection in the test suite (`sanadb::fault`, hidden from docs):
-  a checkpoint whose index write fails part way, whose index fsync fails or
-  whose log rename fails, and a failed log append, each leave the store
-  serving everything acknowledged, with the old index current and no
-  partial files; the next checkpoint succeeds and a reopen agrees.
-
 ## [0.2.0] - 2026-11-16
 
 The store holds nothing in RAM that scales with the index, readers can
@@ -173,6 +112,63 @@ so this is the first release 0.1.4 cannot read; see Upgrading below.
   the published 0.1.1, 0.1.3 and 0.1.4 crates live in `tests/fixtures/`;
   each is opened, read back, written to, checkpointed into the current
   layout and reopened, by the writer and by a read-only `Db`.
+- Keyword and hybrid search. `Options::text_field(key)` names a metadata
+  key whose strings are indexed at checkpoint (lowercase alphanumeric
+  tokens, BM25 with k1 = 1.2, b = 0.75). `Db::search_text(query, k, filter)`
+  scores indexed records from the inverted index and records written since
+  the last checkpoint from their metadata, with one set of corpus
+  statistics; scores are negated BM25. `Db::search_hybrid(vector, text, k,
+  filter)` fuses the dense and keyword lists by reciprocal rank (`1 / (60 +
+  rank)`, each list fetched at `3k`). Python: `text_field=`, `search_text()`,
+  `search(query, text=...)`. The text section lives in the index file after
+  the id table, named by the footer's third slot; a 0.2.0 reader ignores it.
+  On BEIR SciFact (5,183 documents, 300 test queries,
+  `benchmarks/beir/scifact_bm25.py`), against the `rank_bm25` reference with
+  the same tokens:
+
+  | | nDCG@10 | Recall@100 | ms/query |
+  |---|---|---|---|
+  | sanadb `search_text` | 0.662 | 0.886 | 1.2 |
+  | rank_bm25 (Okapi) | 0.654 | 0.876 | 30.6 |
+
+  Published Anserini BM25 on SciFact is 0.665 nDCG@10; the small
+  differences are the idf variant.
+- `Filter::Contains(key, token)`: the key's string, tokenised like the text
+  index, contains the token. On the text field it runs on the inverted index
+  (membership by binary search over the term's postings, the postings as
+  scan candidates); on another `Str` column the value is decoded and
+  tokenised. Python: `{"tags": {"$contains": "t12"}}`. This is how tag sets
+  are filtered: on the big-ann-benchmarks YFCC filter track at 1M records
+  (`examples/yfcc.rs`) every selectivity bucket gets recall 1.0 (0.994 above
+  10,000 matches) where post-filtering got 0.17 to 0.83; table in README.
+- Learned sparse vectors. `Value::Sparse(Vec<(u32, f32)>)` is a metadata
+  value (Python: an `(indices, weights)` pair of arrays); pairs are sorted,
+  duplicates summed and zero weights dropped on insert, non-finite weights
+  are `Error::InvalidVector`. One key per store may hold them
+  (`Error::SecondSparseKey` otherwise); at checkpoint it is written to a
+  sparse section of the index file (forward lists for `get`, inverted
+  lists for search; log value kind 4, footer slot 4, see `docs/FORMAT.md`).
+  `Db::search_sparse(query, k, filter)` scores by dot product over the
+  inverted lists plus the tail; `Db::search_hybrid_sparse(vector, sparse,
+  k, filter)` fuses it with the dense result by reciprocal rank. Python:
+  `search_sparse()`, `search(query, sparse=...)`. No public-dataset quality
+  number yet: that needs a SPLADE encoding of a BEIR set, which is on the
+  list. MaxScore for long BM25 posting lists is not implemented; SciFact
+  queries take 1.2 ms term-at-a-time and no measured workload needed it.
+- `Db::stats()` (Python `Db.stats()`): operation counters since open:
+  searches by regime (graph walk, filtered walk, exact scan, delta only),
+  text searches, inserts, deletes, batches, checkpoints (total,
+  incremental, failed, last duration) and read-only refreshes (appended,
+  reloaded). Relaxed atomics; polling them costs nothing measurable.
+- Cargo feature `tracing`: `tracing` events on target `sanadb` for
+  checkpoints (incremental, duration, records), failed checkpoints, reader
+  reloads and orphan index files removed at open. Off by default; the crate
+  has no new mandatory dependency.
+- Failure injection in the test suite (`sanadb::fault`, hidden from docs):
+  a checkpoint whose index write fails part way, whose index fsync fails or
+  whose log rename fails, and a failed log append, each leave the store
+  serving everything acknowledged, with the old index current and no
+  partial files; the next checkpoint succeeds and a reopen agrees.
 
 ## [0.1.4] - 2026-11-16
 
