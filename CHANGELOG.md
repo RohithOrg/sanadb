@@ -7,12 +7,24 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Changed
+- Release workflow: the macOS arm64 wheel is cross-compiled on the Intel
+  macOS runner; GitHub's arm64 macOS runners cancelled the job for lack
+  of capacity twice during the 0.2.3 release.
+
 ### Added
 - Python: `auto_checkpoint_delta=` and `auto_checkpoint_garbage=` on `Db`,
   the same policy options the Rust `Options` had.
 - `examples/semantic_search.rs` (feature `embed-http`): semantic, filtered
   and hybrid search over text through an OpenAI-compatible embedding
   endpoint, with the same documents and output as the Python example.
+- `docs/failure-modes.md` and `python/examples/failure_modes.py`: the lock
+  held, a torn log, a file from a newer version, a damaged index and a
+  wrong dimension, each produced on a real store with the library's output.
+- `scripts/refresh-docs.py`: reruns every example program and splices its
+  output into the pages that quote it, regenerates the Python API page,
+  and retakes the studio screenshots with Playwright; `--check` fails if
+  a page is out of date. The screenshots were retaken with it.
 - Documentation split by language: `docs/python/` and `docs/rust/` each
   hold getting started, API, examples and recipes (RAG indexing,
   checkpoint policy, processes, backup, failure modes; moving from Chroma

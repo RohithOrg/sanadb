@@ -185,6 +185,14 @@ in both.
 
 ![dark chrome](img/studio-dark.png)
 
+## About these screenshots
+
+Every image on this page is produced by `scripts/refresh-docs.py
+--screenshots`, which starts the studio binary on the SIFT1M store used
+in the benchmarks with a stand-in embedding command and drives the page
+with Playwright; it is run before each release so the pictures match the
+binary.
+
 ## What it is not
 
 Not an admin console and not multi-store: one file, one process, no

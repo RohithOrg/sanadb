@@ -163,6 +163,7 @@ The detail behind each of these is in [docs/operations.md](docs/operations.md).
   filters, concurrency, keyword and sparse search.
 - [Operating a store](docs/operations.md): durability, processes, backup,
   compatibility, observability, knobs.
+- [Failure modes](docs/failure-modes.md): the lock, a torn log, a newer file, a damaged index, with the library's output for each.
 - [Benchmarks](docs/benchmarks.md): every table with method and caveats.
 - [File format](docs/FORMAT.md): the byte layout, frozen for 0.x.
 - [Studio](docs/studio.md): the local web UI.
@@ -180,6 +181,7 @@ cargo clippy --all-targets -- -D warnings
 cd python && maturin develop --release && pytest tests
 scripts/ci-local.sh      # the Linux CI steps in Docker, arm64 and x86-64
 scripts/soak.sh 120      # writer + checkpoints + readers in two processes
+python/.venv/bin/python scripts/refresh-docs.py   # rerun every example into the docs, regenerate the API page and studio screenshots
 ```
 
 The suite covers crash recovery, injected I/O failures, randomly damaged

@@ -48,6 +48,7 @@ db.write_batch(Batch::new().insert(6, &v6, m6).insert(7, &v7, m7).delete(5))?;  
 println!("{} records", db.len());
 ```
 
+<!-- output: tour.rs lines=1-1 -->
 ```text
 6 records
 ```
@@ -75,6 +76,7 @@ db.search_hybrid_sparse(&q, &[(30, 1.0)], 3, None)?;                            
 db.search_many(&queries, 3)?;                                                    // row-major n × dim, all cores
 ```
 
+<!-- output: tour.rs lines=2-9 -->
 ```text
 nearest                          4(-0.260)  2(-0.176)  7(-0.049)
 rust, 2022 or later, public      4(-0.260)
@@ -106,6 +108,7 @@ let (v, meta) = db.get(3).unwrap();
 println!("get(3): dim {}, lang {}, year {}", v.len(), meta["lang"], meta["year"]);
 ```
 
+<!-- output: tour.rs lines=10-10 -->
 ```text
 get(3): dim 384, lang rust, year 2023
 ```
@@ -121,6 +124,7 @@ db.checkpoint()?;
 db.search(&q, 3)?;
 ```
 
+<!-- output: tour.rs lines=11-11 -->
 ```text
 after checkpoint                 4(-0.260)  2(-0.176)  7(-0.049)
 ```
@@ -142,6 +146,7 @@ db.insert(8, &embed("Unsafe Rust and FFI", dim), meta8)?;
 println!("reader sees {} records", reader.len());
 ```
 
+<!-- output: tour.rs lines=12-12 -->
 ```text
 reader sees 7 records
 ```
@@ -164,6 +169,7 @@ if let Some(ix) = db.index_stats() {
 }
 ```
 
+<!-- output: tour.rs lines=13-15 -->
 ```text
 backup at /tmp/…/backup/docs.sana
 stats: 7 searches (0 exact scans, 0 filtered walks), 1 checkpoints, 6 inserts

@@ -155,6 +155,9 @@ later, where Chroma would store both.
 
 ## When things go wrong
 
+The full page, with each case produced on a real store, is
+[failure modes](../failure-modes.md); this is the short table.
+
 | what you see | what it means | what to do |
 |---|---|---|
 | `RuntimeError: store is open elsewhere (lock file held)` | another writer has the path open | open `read_only=True`, or close the other handle; a crashed process releases the lock when it dies |

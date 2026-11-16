@@ -35,6 +35,7 @@ nav:
   - Studio: studio.md
   - How it works: architecture.md
   - Operating a store: operations.md
+  - Failure modes: failure-modes.md
   - Benchmarks: benchmarks.md
   - File format: FORMAT.md
   - Status, limits and roadmap: roadmap.md

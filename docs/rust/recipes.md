@@ -174,6 +174,9 @@ orphan index files removed at open, so a `tracing-subscriber` filter of
 
 ## When things go wrong
 
+The full page, with each case produced on a real store, is
+[failure modes](../failure-modes.md); this is the short table.
+
 | what you see | what it means | what to do |
 |---|---|---|
 | `Error::Locked` | another writer has the path open | `open_read_only`, or close the other handle; a crashed process releases the lock when it dies |

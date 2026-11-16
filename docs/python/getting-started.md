@@ -43,6 +43,7 @@ db.delete(5)
 print(len(db), "records")
 ```
 
+<!-- output: tour.py lines=1-1 -->
 ```text
 6 records
 ```
@@ -69,6 +70,7 @@ db.search(q, k=3, sparse=([30], [1.0]))                                 # hybrid
 ids, scores = db.search_many(np.stack([q, embed("asyncio")]), k=2)      # all cores, (n, k) arrays
 ```
 
+<!-- output: tour.py lines=2-10 -->
 ```text
 nearest                          4(-0.260)  2(-0.176)  7(-0.049)
 rust, 2022+, public              4(-0.260)
@@ -102,6 +104,7 @@ vec, meta = db.get(3)
 print("get(3): dim", vec.shape[0], "lang", meta["lang"], "year", meta["year"])
 ```
 
+<!-- output: tour.py lines=11-11 -->
 ```text
 get(3): dim 384 lang rust year 2023
 ```
@@ -116,6 +119,7 @@ db.checkpoint()
 db.search(q, k=3)
 ```
 
+<!-- output: tour.py lines=12-12 -->
 ```text
 after checkpoint                 4(-0.260)  2(-0.176)  7(-0.049)
 ```
@@ -135,6 +139,7 @@ db.insert(8, embed("Unsafe Rust and FFI"), {"body": "Unsafe Rust and FFI", "lang
 print("reader sees", len(reader), "records")
 ```
 
+<!-- output: tour.py lines=13-13 -->
 ```text
 reader sees 7 records
 ```
@@ -154,6 +159,7 @@ print(f"stats: {s['searches']} searches, {s['checkpoints']} checkpoints, {s['ins
 print("index:", db.index_stats())
 ```
 
+<!-- output: tour.py lines=14-16 -->
 ```text
 backup at /tmp/…/backup/docs.sana
 stats: 9 searches, 1 checkpoints, 6 inserts

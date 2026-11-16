@@ -75,6 +75,7 @@ print("scores are negative cosine similarity: -1 identical, lower is closer")
 
 Output:
 
+<!-- output: semantic_search.py -->
 ```text
 8 documents embedded with all-MiniLM-L6-v2 into /tmp/…/docs.sana
 
@@ -269,6 +270,7 @@ print("index:", db.index_stats())
 
 Output:
 
+<!-- output: tour.py -->
 ```text
 6 records
 nearest                          4(-0.260)  2(-0.176)  7(-0.049)

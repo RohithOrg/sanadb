@@ -129,6 +129,7 @@ fn main() -> Result<(), sanadb::Error> {
 
 (with `use std::collections::HashMap;` at the top.) Output:
 
+<!-- output: semantic_search.rs -->
 ```text
 8 documents embedded with all-MiniLM-L6-v2 into /tmp/…/docs.sana
 
@@ -388,6 +389,7 @@ fn show(what: &str, hits: &[sanadb::Hit]) {
 
 Output:
 
+<!-- output: tour.rs -->
 ```text
 6 records
 nearest                          4(-0.260)  2(-0.176)  7(-0.049)

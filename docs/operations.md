@@ -26,6 +26,9 @@ that consistently while writes continue. The layout is in
 - Readers never see a partially written record or index: frames are
   CRC-checked and the index is mapped only after its rename.
 
+What each failure looks like when it happens, with the library's
+actual output, is on [failure modes](failure-modes.md).
+
 ## Concurrency and processes
 
 One writer per store, any number of readers, in any processes. A second
