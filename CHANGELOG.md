@@ -7,6 +7,12 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Changed
+- Release workflow: PyPI uploads use an API token (`PYPI_API_TOKEN`)
+  after trusted publishing refused the `sanadb` project from 0.2.3 on; the
+  workflow can be run by hand for an existing tag, skipping crates already
+  on crates.io, so a half-finished release can be completed.
+
 ### Added
 - `Db::neighbors(id)` (Python `Db.neighbors(id)`): the out-edges of a
   record's node in the graph index, for tooling that draws the graph.

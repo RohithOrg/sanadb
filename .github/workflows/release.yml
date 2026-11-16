@@ -1,15 +1,27 @@
 name: Release
 
 # Tag `vX.Y.Z` to publish the crate to crates.io and wheels + sdist to PyPI.
-# crates.io needs the CARGO_REGISTRY_TOKEN repository secret; PyPI uses
-# trusted publishing (no token), configured for the `pypi` environment.
+# Secrets: CARGO_REGISTRY_TOKEN (crates.io) and PYPI_API_TOKEN (PyPI, scoped
+# to both `sanadb` and `sanadb-studio`). Trusted publishing was used until
+# 0.2.2; from 0.2.3 PyPI refused the minted token for `sanadb`, so the
+# upload uses a token.
+#
+# "Run workflow" with an existing tag re-runs a release from this file as it
+# is on master, against the code at that tag: crates already on crates.io
+# are skipped, so a publish that failed half-way can be finished.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)publish, e.g. v0.2.4"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   check:
@@ -17,9 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Compare tag with Cargo.toml and pyproject.toml
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           crate=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           py=$(grep -m1 '^version' python/pyproject.toml | sed 's/.*"\(.*\)"/\1/')
           st=$(grep -m1 '^version' studio/pyproject.toml | sed 's/.*"\(.*\)"/\1/')
@@ -32,8 +46,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish -p sanadb
+      - name: Publish unless this version is already on crates.io
+        run: |
+          v="${TAG#v}"
+          if curl -sf -A "sanadb-release (github actions)" "https://crates.io/api/v1/crates/sanadb/$v" > /dev/null; then
+            echo "sanadb $v is already published"; exit 0
+          fi
+          cargo publish -p sanadb
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -43,9 +65,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish once the core crate is visible in the index
         run: |
+          v="${TAG#v}"
+          if curl -sf -A "sanadb-release (github actions)" "https://crates.io/api/v1/crates/sanadb-studio/$v" > /dev/null; then
+            echo "sanadb-studio $v is already published"; exit 0
+          fi
           for i in $(seq 1 12); do
             cargo publish -p sanadb-studio && exit 0
             echo "retry $i in 30 s"; sleep 30
@@ -69,12 +97,14 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release -p sanadb-studio
       - name: Package
         shell: bash
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           mkdir -p out
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp target/release/sanadb-studio.exe out/
@@ -107,6 +137,8 @@ jobs:
           - { os: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -140,6 +172,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: python
@@ -155,11 +189,8 @@ jobs:
     needs: [wheels, sdist]
     runs-on: ubuntu-latest
     environment: pypi
-    permissions:
-      id-token: write
     steps:
-      # Two projects, two uploads: a trusted-publisher token is minted per
-      # project, and 0.2.3 failed by uploading both packages' files at once.
+      # Two projects, two uploads, one token scoped to both.
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-[!s]*
@@ -179,10 +210,14 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
       - name: Publish sanadb-studio
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-studio
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
 
   github-release:
     name: GitHub release
@@ -192,6 +227,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@v4
         with:
           pattern: studio-*
@@ -199,13 +236,19 @@ jobs:
           merge-multiple: true
       - name: Extract this version's section from CHANGELOG.md
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           awk -v v="$v" '
             /^## \[/ { on = index($0, "[" v "]") > 0; if (on) next }
             on { print }
           ' CHANGELOG.md > notes.md
           test -s notes.md || echo "See CHANGELOG.md." > notes.md
           cat notes.md
-      - run: gh release create "$GITHUB_REF_NAME" --title "sanadb $GITHUB_REF_NAME" --notes-file notes.md bins/*
+      - name: Create the release, or add the binaries if it already exists
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" bins/* --clobber
+          else
+            gh release create "$TAG" --title "sanadb $TAG" --notes-file notes.md bins/*
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
