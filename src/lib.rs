@@ -32,7 +32,8 @@ use graph::GraphIndex;
 use index::Flat;
 use wal::{Entry, Header, Replayed, Wal};
 
-pub type Metadata = HashMap<String, String>;
+mod value;
+pub use value::{Kind, Metadata, Value};
 
 #[derive(Debug)]
 pub enum Error {
@@ -41,6 +42,8 @@ pub enum Error {
     HeaderMismatch { on_disk: (u32, Metric), requested: (u32, Metric) },
     DimMismatch { expected: u32, got: usize },
     MetaTooLarge,
+    /// A key already holds values of another type in this store.
+    TypeMismatch { key: String, expected: Kind, got: Kind },
     /// A vector contained NaN or infinity.
     InvalidVector,
     /// Another `Db` (in this or another process) has the store open.
@@ -72,6 +75,7 @@ impl std::fmt::Display for Error {
             }
             Error::DimMismatch { expected, got } => write!(f, "vector has {got} dims, store expects {expected}"),
             Error::MetaTooLarge => write!(f, "metadata key/value longer than 65535 bytes or more than 65535 pairs"),
+            Error::TypeMismatch { key, expected, got } => write!(f, "metadata key {key:?} holds {expected:?} values in this store, got {got:?}"),
             Error::InvalidVector => write!(f, "vector contains NaN or infinity, or is all zeros under the cosine metric"),
             Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
             Error::NeedsNewerVersion { file_level, supported } => {
@@ -246,6 +250,8 @@ struct Inner {
     /// Sequence number of the write that produced each delta record.
     delta_seq: HashMap<u64, u64>,
     meta: HashMap<u64, Metadata>,
+    /// Type fixed for each metadata key by the first value written under it.
+    types: HashMap<String, Kind>,
     /// Monotonic count of writes, used to tell which delta records a running
     /// checkpoint has already captured.
     write_seq: u64,
@@ -290,6 +296,7 @@ impl Db {
             delta: Flat::new(opts.metric),
             delta_seq: HashMap::new(),
             meta: HashMap::new(),
+            types: HashMap::new(),
             write_seq: 0,
             deletes_since_snapshot: None,
             log_entries: entries.len(),
@@ -299,6 +306,7 @@ impl Db {
                 Replayed::Insert { id, vector_off, meta } => inner.apply_insert(id, vector_off, meta),
                 Replayed::Delete { id } => inner.apply_delete(id),
                 Replayed::Meta { id, meta } => {
+                    inner.note_types(&meta);
                     inner.meta.insert(id, meta);
                 }
             }
@@ -348,12 +356,13 @@ impl Db {
         if vector.len() != self.header.dim as usize {
             return Err(Error::DimMismatch { expected: self.header.dim, got: vector.len() });
         }
-        if meta.len() > u16::MAX as usize || meta.iter().any(|(k, v)| k.len() > u16::MAX as usize || v.len() > u16::MAX as usize) {
+        if meta.len() > u16::MAX as usize || meta.iter().any(|(k, v)| k.len() > u16::MAX as usize || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)) {
             return Err(Error::MetaTooLarge);
         }
         let vector = prepare(self.header.metric, vector)?;
         let garbage = {
             let mut i = self.write()?;
+            i.check_types(&meta)?;
             let off = i.append(&Entry::Insert { id, vector: vector.to_vec(), meta: meta.clone() }, self.opts.sync_every_write)?;
             i.apply_insert(id, off, meta);
             i.garbage()
@@ -618,7 +627,29 @@ impl Db {
 }
 
 impl Inner {
+    /// `Error::TypeMismatch` if any value's type differs from the one its
+    /// key already has in this store.
+    fn check_types(&self, meta: &Metadata) -> Result<()> {
+        for (k, v) in meta {
+            if let Some(&t) = self.types.get(k)
+                && t != v.kind()
+            {
+                return Err(Error::TypeMismatch { key: k.clone(), expected: t, got: v.kind() });
+            }
+        }
+        Ok(())
+    }
+
+    /// Record each key's type; first writer wins (used on replay, where the
+    /// log is trusted).
+    fn note_types(&mut self, meta: &Metadata) {
+        for (k, v) in meta {
+            self.types.entry(k.clone()).or_insert(v.kind());
+        }
+    }
+
     fn apply_insert(&mut self, id: u64, vector_off: u64, meta: Metadata) {
+        self.note_types(&meta);
         self.write_seq += 1;
         if let Some(slot) = self.graph.as_ref().and_then(|g| g.slot(id)) {
             self.tombstones.insert(slot);

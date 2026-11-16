@@ -137,3 +137,17 @@ def test_search_many_matches_single(tmp_path):
         assert np.allclose([s for _, s in single], scores[row])
     ids, _ = db.search_many(qs, k=3, filter={"even": "yes"})
     assert (ids % 2 == 0).all()
+
+
+def test_metadata_is_typed(db):
+    db.insert(1, np.ones(8, dtype=np.float32), {"doc": "a.md", "year": 2024, "score": 0.5, "public": True})
+    _, m = db.get(1)
+    assert m == {"doc": "a.md", "year": 2024, "score": 0.5, "public": True}
+    assert type(m["year"]) is int and type(m["public"]) is bool and type(m["score"]) is float
+    with pytest.raises(TypeError):
+        db.insert(2, np.ones(8, dtype=np.float32), {"year": "2024"})
+    with pytest.raises(TypeError):
+        db.insert(3, np.ones(8, dtype=np.float32), {"tags": ["a", "b"]})
+    db.insert(4, np.zeros(8, dtype=np.float32), {"year": 1999})
+    assert [i for i, _ in db.search(np.zeros(8, dtype=np.float32), k=1, filter={"year": 1999})] == [4]
+    assert db.search(np.zeros(8, dtype=np.float32), k=1, filter={"year": "1999"}) == []

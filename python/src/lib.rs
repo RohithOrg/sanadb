@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
-use sanadb_core::{GraphParams, Metadata, Metric, Options};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use sanadb_core::{GraphParams, Metadata, Metric, Options, Value};
 
 fn err(e: sanadb_core::Error) -> PyErr {
     match e {
@@ -15,6 +15,7 @@ fn err(e: sanadb_core::Error) -> PyErr {
         sanadb_core::Error::DimMismatch { .. } | sanadb_core::Error::MetaTooLarge | sanadb_core::Error::HeaderMismatch { .. } | sanadb_core::Error::InvalidVector => {
             PyValueError::new_err(e.to_string())
         }
+        sanadb_core::Error::TypeMismatch { .. } => PyTypeError::new_err(e.to_string()),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -30,11 +31,26 @@ fn to_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     obj.extract::<Vec<f32>>()
 }
 
+/// `bool` is checked before `int` because Python's bool is an int subclass.
+fn to_value(v: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if v.is_instance_of::<PyBool>() {
+        Ok(Value::Bool(v.extract()?))
+    } else if v.is_instance_of::<PyInt>() {
+        Ok(Value::Int(v.extract()?))
+    } else if v.is_instance_of::<PyFloat>() {
+        Ok(Value::Float(v.extract()?))
+    } else if v.is_instance_of::<PyString>() {
+        Ok(Value::Str(v.extract()?))
+    } else {
+        Err(PyTypeError::new_err(format!("metadata values must be str, int, float or bool, got {}", v.get_type().name()?)))
+    }
+}
+
 fn to_meta(obj: Option<&Bound<'_, PyDict>>) -> PyResult<Metadata> {
     let mut m = Metadata::new();
     if let Some(d) = obj {
         for (k, v) in d.iter() {
-            m.insert(k.extract::<String>()?, v.str()?.to_string());
+            m.insert(k.extract::<String>()?, to_value(&v)?);
         }
     }
     Ok(m)
@@ -43,7 +59,12 @@ fn to_meta(obj: Option<&Bound<'_, PyDict>>) -> PyResult<Metadata> {
 fn meta_to_py<'py>(py: Python<'py>, m: &Metadata) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     for (k, v) in m {
-        d.set_item(k, v)?;
+        match v {
+            Value::Str(s) => d.set_item(k, s)?,
+            Value::Int(i) => d.set_item(k, *i)?,
+            Value::Float(x) => d.set_item(k, *x)?,
+            Value::Bool(b) => d.set_item(k, *b)?,
+        }
     }
     Ok(d)
 }

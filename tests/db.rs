@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 
-use sanadb::{Db, Metadata, Metric, Options};
+use sanadb::{Db, Metadata, Metric, Options, Value};
 
 fn meta(pairs: &[(&str, &str)]) -> Metadata {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    pairs.iter().map(|(k, v)| (k.to_string(), (*v).into())).collect()
 }
 
 fn vec_of(dim: usize, seed: u64) -> Vec<f32> {
@@ -180,9 +180,10 @@ fn graph_survives_reopen_upsert_delete_and_recheckpoint() {
     db.checkpoint().unwrap();
     drop(db);
 
-    // Log holds metadata only now: far smaller than the vectors it describes.
+    // Log holds metadata only now (about 32 bytes per record here), smaller
+    // than the 64-byte vectors it describes.
     let log_bytes = std::fs::metadata(&path).unwrap().len();
-    assert!(log_bytes < n * dim as u64 * 4 / 2, "log is {log_bytes} bytes");
+    assert!(log_bytes < n * dim as u64 * 4 * 3 / 5, "log is {log_bytes} bytes");
     assert!(path.with_file_name("v.sana.idx").exists());
 
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
@@ -746,7 +747,10 @@ fn corrupted_logs_never_panic() {
                 outcomes[0] += 1;
             }
             Err(sanadb::Error::Corrupt(_)) | Err(sanadb::Error::HeaderMismatch { .. }) | Err(sanadb::Error::NeedsNewerVersion { .. }) => outcomes[1] += 1,
-            Err(_) => outcomes[2] += 1,
+            Err(e) => {
+                eprintln!("unexpected error class: {e}");
+                outcomes[2] += 1;
+            }
         }
     }
     eprintln!("fuzz outcomes: ok={} corrupt={} other={}", outcomes[0], outcomes[1], outcomes[2]);
@@ -831,4 +835,97 @@ fn search_many_matches_single_searches() {
         assert!(filtered[row].iter().all(|h| h.id % 2 == 0));
     }
     assert!(matches!(db.search_many(&queries[..dim + 3], 10), Err(sanadb::Error::DimMismatch { .. })));
+}
+
+#[test]
+fn typed_values_round_trip_and_keys_keep_their_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("typed.sana");
+    let dim = 4usize;
+    let m: Metadata = HashMap::from([
+        ("doc".to_string(), Value::from("intro.md")),
+        ("year".to_string(), Value::from(2024i64)),
+        ("score".to_string(), Value::from(0.25f64)),
+        ("public".to_string(), Value::from(true)),
+    ]);
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    db.insert(1, &[1.0, 0.0, 0.0, 0.0], m.clone()).unwrap();
+    db.insert(2, &[0.0, 1.0, 0.0, 0.0], HashMap::from([("year".to_string(), Value::from(1999i64))])).unwrap();
+    assert_eq!(db.get(1).unwrap().1, m);
+    // A key's type is fixed by its first value.
+    let bad = db.insert(3, &[0.0, 0.0, 1.0, 0.0], HashMap::from([("year".to_string(), Value::from("2024"))]));
+    assert!(matches!(bad, Err(sanadb::Error::TypeMismatch { ref key, expected: sanadb::Kind::Int, got: sanadb::Kind::Str }) if key == "year"), "{bad:?}");
+    assert!(db.get(3).is_none(), "a rejected insert writes nothing");
+    // Typed filter through the closure API.
+    let hits = db.search_filtered(&[0.0, 0.9, 0.0, 0.0], 1, |m| m["year"].as_int() == Some(2024)).unwrap();
+    assert_eq!(hits[0].id, 1);
+    drop(db);
+    // Survives replay, checkpoint (values ride through the compacted log) and reopen.
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.get(1).unwrap().1, m);
+    db.checkpoint().unwrap();
+    drop(db);
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.get(1).unwrap().1, m);
+    assert_eq!(db.get(2).unwrap().1["year"], Value::Int(1999));
+    assert!(matches!(db.insert(4, &[0.0; 4], HashMap::from([("public".to_string(), Value::from(1i64))])), Err(sanadb::Error::TypeMismatch { .. })));
+}
+
+/// Write a reader-level-1 `SANADB02` log by hand: padded frames, bare string values.
+fn write_level1_log(path: &std::path::Path, dim: u32, records: &[V1Record], deletes: &[u64]) {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"SANADB02");
+    out.extend_from_slice(&dim.to_le_bytes());
+    out.extend_from_slice(&[0, 1, 0, 0]); // metric L2, reader level 1, pad
+    let mut frame = |mut body: Vec<u8>| {
+        while !body.len().is_multiple_of(4) {
+            body.push(0);
+        }
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        out.extend_from_slice(&body);
+    };
+    for (id, v, m) in records {
+        let mut b = vec![1u8, 0, 0, 0];
+        b.extend_from_slice(&id.to_le_bytes());
+        for x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+        b.extend_from_slice(&(m.len() as u16).to_le_bytes());
+        for (k, val) in m.iter() {
+            b.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&(val.len() as u16).to_le_bytes());
+            b.extend_from_slice(val.as_bytes());
+        }
+        frame(b);
+    }
+    for id in deletes {
+        let mut b = vec![2u8, 0, 0, 0];
+        b.extend_from_slice(&id.to_le_bytes());
+        frame(b);
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+#[test]
+fn opens_and_migrates_a_level_1_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l1.sana");
+    write_level1_log(&path, 4, &[(1, vec![1.0, 0.0, 0.0, 0.0], &[("k", "a"), ("n", "7")]), (2, vec![0.0, 1.0, 0.0, 0.0], &[]), (3, vec![0.0, 0.0, 1.0, 0.0], &[("k", "c")])], &[2]);
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(db.len(), 2);
+    // Old values come back as strings; nothing is guessed from their spelling.
+    assert_eq!(db.get(1).unwrap().1, meta(&[("k", "a"), ("n", "7")]));
+    assert_eq!(db.get(1).unwrap().1["n"], Value::Str("7".into()));
+    assert!(db.get(2).is_none());
+    assert_eq!(db.search(&[0.0, 0.0, 0.9, 0.0], 1).unwrap()[0].id, 3);
+    // The key keeps the string type it was migrated with.
+    assert!(matches!(db.insert(9, &[0.0; 4], HashMap::from([("n".to_string(), Value::from(7i64))])), Err(sanadb::Error::TypeMismatch { .. })));
+    drop(db);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..8], b"SANADB02");
+    assert_eq!(bytes[13], 2, "header now at reader level 2");
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(db.len(), 2);
 }

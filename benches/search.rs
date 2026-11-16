@@ -27,7 +27,7 @@ fn bench(c: &mut Criterion) {
         let db = Db::open(dir.path().join(format!("s{n}.sana")), Options::new(dim)).unwrap();
         for i in 0..n {
             let v: Vec<f32> = (0..dim).map(|_| rng.r#gen()).collect();
-            let meta = HashMap::from([("bucket".to_string(), (i % 10).to_string())]);
+            let meta = HashMap::from([("bucket".to_string(), (i % 10).to_string().into())]);
             db.insert(i as u64, &v, meta).unwrap();
         }
         let q: Vec<f32> = (0..dim).map(|_| rng.r#gen()).collect();

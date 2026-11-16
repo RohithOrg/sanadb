@@ -46,6 +46,8 @@ use crate::{Error, Metric, Result};
 const MAGIC: &[u8; 8] = b"SANAIDX2";
 const HEADER_LEN: usize = 8 + 4 + 1 + 3 + 4 + 4 + 4 + 4 + 4;
 const ALIGN: usize = 64;
+/// Reader level of the index file (header byte 13), independent of the log's.
+const IDX_READER_LEVEL: u8 = 1;
 const NONE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy)]
@@ -116,8 +118,8 @@ impl GraphIndex {
         if &h[..8] != MAGIC {
             return Err(Error::Corrupt("index bad magic"));
         }
-        if h[13] > crate::wal::READER_LEVEL {
-            return Err(Error::NeedsNewerVersion { file_level: h[13], supported: crate::wal::READER_LEVEL });
+        if h[13] > IDX_READER_LEVEL {
+            return Err(Error::NeedsNewerVersion { file_level: h[13], supported: IDX_READER_LEVEL });
         }
         let u32_at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
         let (fdim, fmetric) = (u32_at(8), Metric::from_u8(h[12]).ok_or(Error::Corrupt("index unknown metric"))?);
@@ -810,7 +812,7 @@ fn write_index(
     let mut w = BufWriter::new(File::create(path)?);
     w.write_all(MAGIC)?;
     w.write_all(&(dim as u32).to_le_bytes())?;
-    w.write_all(&[metric as u8, crate::wal::READER_LEVEL, 0, 0])?;
+    w.write_all(&[metric as u8, IDX_READER_LEVEL, 0, 0])?;
     w.write_all(&(n as u32).to_le_bytes())?;
     w.write_all(&(r as u32).to_le_bytes())?;
     w.write_all(&entry.to_le_bytes())?;
