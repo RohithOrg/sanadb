@@ -2219,7 +2219,8 @@ fn backup_is_a_consistent_point_in_time_copy() {
     }
     db.checkpoint().unwrap();
     for i in 3000..3100u64 {
-        db.insert(i, &vec_of(dim, i), meta(&[("k", "tail")])).unwrap();
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "tail")]))
+            .unwrap();
     }
     db.delete(1).unwrap();
     // Back up while the writer keeps going afterwards.
@@ -2234,9 +2235,14 @@ fn backup_is_a_consistent_point_in_time_copy() {
     assert!(b.get(1).is_none() && b.get(2).is_some() && b.get(9999).is_none());
     assert_eq!(b.get(3050).unwrap().1["k"], "tail");
     assert_eq!(b.search(&vec_of(dim, 77), 1).unwrap()[0].id, 77);
-    b.insert(5, &vec_of(dim, 5), meta(&[("k", "copy")])).unwrap();
+    b.insert(5, &vec_of(dim, 5), meta(&[("k", "copy")]))
+        .unwrap();
     b.checkpoint().unwrap();
-    assert_eq!(db.get(5).unwrap().1["k"], "a", "the original is untouched by writes to the copy");
+    assert_eq!(
+        db.get(5).unwrap().1["k"],
+        "a",
+        "the original is untouched by writes to the copy"
+    );
     assert_eq!(db.len(), 3099);
     // A read-only handle can back up too.
     let r = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
@@ -2245,6 +2251,150 @@ fn backup_is_a_consistent_point_in_time_copy() {
     assert_eq!(b2.len(), db.len());
     assert!(b2.get(9999).is_some() && b2.get(2).is_none());
     // Only the referenced index file travels with the copy.
-    let files: Vec<String> = std::fs::read_dir(dir.path().join("backup")).unwrap().flatten().map(|e| e.file_name().to_str().unwrap().to_string()).collect();
-    assert!(files.iter().filter(|f| f.contains(".idx.")).count() <= 2, "{files:?}");
+    let files: Vec<String> = std::fs::read_dir(dir.path().join("backup"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        files.iter().filter(|f| f.contains(".idx.")).count() <= 2,
+        "{files:?}"
+    );
+}
+
+#[test]
+fn keyword_and_hybrid_search_over_a_text_field() {
+    use sanadb::Filter;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("text.sana");
+    let dim = 4usize;
+    let opts = || Options::new(dim as u32).text_field("body");
+    let db = Db::open(&path, opts()).unwrap();
+    let docs: [(&str, &str); 6] = [
+        (
+            "rust",
+            "Rust ownership and borrowing keep memory safe without a garbage collector",
+        ),
+        (
+            "rust",
+            "Tokio select cancels the other branches when one future completes",
+        ),
+        (
+            "py",
+            "Python asyncio gather runs coroutines concurrently on one thread",
+        ),
+        (
+            "py",
+            "Garbage collection in CPython uses reference counting plus a cycle collector",
+        ),
+        (
+            "db",
+            "SQLite keeps one writer and many readers with a write ahead log",
+        ),
+        (
+            "db",
+            "A write ahead log makes a crash safe database: replay the log on open",
+        ),
+    ];
+    for (i, (lang, body)) in docs.iter().enumerate() {
+        let mut m = Metadata::new();
+        m.insert("lang".into(), Value::from(*lang));
+        m.insert("body".into(), Value::from(*body));
+        db.insert(i as u64, &vec_of(dim, i as u64), m).unwrap();
+    }
+    // Before any checkpoint: everything is tail, tokenised on the fly.
+    let top = |db: &Db, q: &str| {
+        db.search_text(q, 3, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        top(&db, "garbage collector")[0],
+        0,
+        "rare + rare terms: {:?}",
+        top(&db, "garbage collector")
+    );
+    assert_eq!(
+        top(&db, "write ahead log")[..2]
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [4u64, 5].into_iter().collect()
+    );
+    assert_eq!(top(&db, "tokio select"), [1]);
+    assert!(db.search_text("zzz qqq", 3, None).unwrap().is_empty());
+    assert!(db.search_text("", 3, None).unwrap().is_empty());
+    // Case and punctuation do not matter.
+    assert_eq!(top(&db, "TOKIO, Select!"), [1]);
+    // Scores are negated BM25: best first, strictly ordered.
+    let hits = db.search_text("log", 5, None).unwrap();
+    assert!(hits.len() == 2 && hits[0].score <= hits[1].score && hits[0].score < 0.0);
+    // Filters apply.
+    assert_eq!(top(&db, "garbage"), [0, 3]);
+    assert_eq!(
+        db.search_text("garbage", 3, Some(&Filter::eq("lang", "py")))
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>(),
+        [3]
+    );
+
+    // Checkpoint: same answers from the inverted index.
+    db.checkpoint().unwrap();
+    assert_eq!(top(&db, "garbage collector")[0], 0);
+    assert_eq!(top(&db, "tokio select"), [1]);
+    assert_eq!(top(&db, "garbage"), [0, 3]);
+    // Mixed: one indexed document, one new in the tail, one deleted.
+    let mut m = Metadata::new();
+    m.insert("lang".into(), Value::from("db"));
+    m.insert(
+        "body".into(),
+        Value::from("the log is replayed; a log is append only"),
+    );
+    db.insert(6, &vec_of(dim, 6), m).unwrap();
+    db.delete(4).unwrap();
+    let hits = top(&db, "log");
+    assert!(
+        hits.contains(&6) && hits.contains(&5) && !hits.contains(&4),
+        "{hits:?}"
+    );
+    // Hybrid: a vector near document 2 and the words of document 1 should put both on top.
+    let hybrid: Vec<u64> = db
+        .search_hybrid(&vec_of(dim, 2), "tokio select", 2, None)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(hybrid.contains(&2) && hybrid.contains(&1), "{hybrid:?}");
+    let hybrid_py: Vec<u64> = db
+        .search_hybrid(
+            &vec_of(dim, 2),
+            "tokio select",
+            2,
+            Some(&Filter::eq("lang", "py")),
+        )
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(hybrid_py.iter().all(|&i| i == 2 || i == 3), "{hybrid_py:?}");
+    // A reader and a reopened writer agree.
+    let r = Db::open_read_only(&path, opts()).unwrap();
+    assert_eq!(top(&r, "tokio select"), [1]);
+    assert!(top(&r, "log").contains(&6));
+    drop(db);
+    let db = Db::open(&path, opts()).unwrap();
+    assert_eq!(top(&db, "garbage collector")[0], 0);
+    db.checkpoint().unwrap();
+    let hits = top(&db, "log");
+    assert!(
+        hits.contains(&6) && hits.contains(&5) && !hits.contains(&4),
+        "{hits:?}"
+    );
+    // Without a text field the call is an error, not a silent empty result.
+    let plain = Db::open(dir.path().join("plain.sana"), Options::new(dim as u32)).unwrap();
+    assert!(plain.search_text("x", 3, None).is_err());
 }

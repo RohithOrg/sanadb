@@ -227,3 +227,19 @@ def test_backup_opens_as_a_store(tmp_path):
     b = sanadb.Db(copy, dim=4, read_only=True)
     assert len(b) == 4 and b.get(1)[1] == {"k": "a"}
     assert len(db) == 3
+
+
+def test_text_and_hybrid_search(tmp_path):
+    db = sanadb.Db(str(tmp_path / "t.sana"), dim=4, text_field="body")
+    db.insert(1, np.array([1, 0, 0, 0], dtype=np.float32), {"body": "rust borrow checker", "lang": "rust"})
+    db.insert(2, np.array([0, 1, 0, 0], dtype=np.float32), {"body": "python asyncio event loop", "lang": "py"})
+    db.insert(3, np.array([0, 0, 1, 0], dtype=np.float32), {"body": "the borrow checker rejects aliasing", "lang": "rust"})
+    assert [i for i, _ in db.search_text("borrow checker")] == [1, 3] or [i for i, _ in db.search_text("borrow checker")] == [3, 1]
+    assert [i for i, _ in db.search_text("asyncio", filter={"lang": "py"})] == [2]
+    db.checkpoint()
+    assert set(i for i, _ in db.search_text("borrow")) == {1, 3}
+    # Reciprocal rank fusion favours records present in both lists: 1 and 3
+    # are near the query and match the words; 2 is nearest but has no words.
+    hybrid = [i for i, _ in db.search(np.array([0, 1, 0, 0], dtype=np.float32), k=2, text="borrow checker")]
+    assert set(hybrid) == {1, 3}
+    assert [i for i, _ in db.search(np.array([0, 1, 0, 0], dtype=np.float32), k=1, text="asyncio")] == [2]

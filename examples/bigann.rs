@@ -24,7 +24,11 @@ use sanadb::{Db, GraphParams, Options, Storage};
 
 /// `SANADB_I8=1` stores the index with 8-bit codes (and names the store `.i8`).
 fn storage() -> Storage {
-    if std::env::var_os("SANADB_I8").is_some() { Storage::I8 } else { Storage::F32 }
+    if std::env::var_os("SANADB_I8").is_some() {
+        Storage::I8
+    } else {
+        Storage::F32
+    }
 }
 
 const DIM: usize = 128;

@@ -24,16 +24,28 @@ fn main() {
     let dir = tempfile::tempdir().unwrap();
 
     // Single inserts: one frame, one flush, one lock per record.
-    let db = Db::open(dir.path().join("single.sana"), Options::new(dim as u32).auto_checkpoint_delta(0)).unwrap();
+    let db = Db::open(
+        dir.path().join("single.sana"),
+        Options::new(dim as u32).auto_checkpoint_delta(0),
+    )
+    .unwrap();
     let t = Instant::now();
     for i in 0..n {
-        db.insert(i as u64, &vecs[i * dim..(i + 1) * dim], meta(i)).unwrap();
+        db.insert(i as u64, &vecs[i * dim..(i + 1) * dim], meta(i))
+            .unwrap();
     }
     let single = t.elapsed();
-    println!("insert one by one: {n} records in {single:.2?} = {:.0} /s", n as f64 / single.as_secs_f64());
+    println!(
+        "insert one by one: {n} records in {single:.2?} = {:.0} /s",
+        n as f64 / single.as_secs_f64()
+    );
 
     // One batch per 10,000 records.
-    let dbb = Db::open(dir.path().join("batch.sana"), Options::new(dim as u32).auto_checkpoint_delta(0)).unwrap();
+    let dbb = Db::open(
+        dir.path().join("batch.sana"),
+        Options::new(dim as u32).auto_checkpoint_delta(0),
+    )
+    .unwrap();
     let t = Instant::now();
     for start in (0..n).step_by(10_000) {
         let mut b = Batch::new();
@@ -43,7 +55,10 @@ fn main() {
         dbb.write_batch(b).unwrap();
     }
     let batched = t.elapsed();
-    println!("insert in batches of 10,000: {batched:.2?} = {:.0} /s", n as f64 / batched.as_secs_f64());
+    println!(
+        "insert in batches of 10,000: {batched:.2?} = {:.0} /s",
+        n as f64 / batched.as_secs_f64()
+    );
 
     let t = Instant::now();
     db.checkpoint().unwrap();
@@ -55,28 +70,45 @@ fn main() {
         db.search(q, 10).unwrap();
     }
     let one = t.elapsed();
-    println!("search, one query at a time: {:.0} µs/query", one.as_secs_f64() * 1e6 / 1000.0);
+    println!(
+        "search, one query at a time: {:.0} µs/query",
+        one.as_secs_f64() * 1e6 / 1000.0
+    );
     let t = Instant::now();
     db.search_many(&queries, 10).unwrap();
     let many = t.elapsed();
-    println!("search_many, 1000 queries on all cores: {:.2?} = {:.0} queries/s", many, 1000.0 / many.as_secs_f64());
+    println!(
+        "search_many, 1000 queries on all cores: {:.2?} = {:.0} queries/s",
+        many,
+        1000.0 / many.as_secs_f64()
+    );
 
     // Reader beside the writer: each read checks the log first.
-    let reader = Db::open_read_only(dir.path().join("single.sana"), Options::new(dim as u32)).unwrap();
+    let reader =
+        Db::open_read_only(dir.path().join("single.sana"), Options::new(dim as u32)).unwrap();
     let t = Instant::now();
     for q in queries.chunks(dim) {
         reader.search(q, 10).unwrap();
     }
     let rd = t.elapsed();
-    println!("read-only handle, search: {:.0} µs/query (refresh check included)", rd.as_secs_f64() * 1e6 / 1000.0);
+    println!(
+        "read-only handle, search: {:.0} µs/query (refresh check included)",
+        rd.as_secs_f64() * 1e6 / 1000.0
+    );
     let t = Instant::now();
     for i in 0..10_000u64 {
         reader.get(i);
     }
-    println!("read-only handle, get: {:.2} µs each", t.elapsed().as_secs_f64() * 1e6 / 10_000.0);
+    println!(
+        "read-only handle, get: {:.2} µs each",
+        t.elapsed().as_secs_f64() * 1e6 / 10_000.0
+    );
     let t = Instant::now();
     for i in 0..10_000u64 {
         db.get(i);
     }
-    println!("writer handle, get: {:.2} µs each", t.elapsed().as_secs_f64() * 1e6 / 10_000.0);
+    println!(
+        "writer handle, get: {:.2} µs each",
+        t.elapsed().as_secs_f64() * 1e6 / 10_000.0
+    );
 }

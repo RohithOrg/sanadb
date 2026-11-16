@@ -19,6 +19,7 @@ mod index;
 mod kmeans;
 mod pq;
 mod quant;
+mod text;
 mod wal;
 
 pub use filter::Filter;
@@ -209,6 +210,9 @@ pub struct Options {
     /// record, when the index's posting lists put the match count at or
     /// below this. Above it the graph is walked with the filter steering it.
     pub exact_filter_scan: u32,
+    /// Metadata key whose string value is indexed for keyword search
+    /// (`search_text`, `search_hybrid`). `None` builds no text index.
+    pub text_field: Option<String>,
     /// Run `checkpoint` automatically once the log holds this many entries
     /// more than there are live records. 0 disables.
     pub auto_checkpoint_garbage: usize,
@@ -234,6 +238,7 @@ impl Options {
             search_beam: 64,
             max_search_beam: 4096,
             exact_filter_scan: 16_384,
+            text_field: None,
             auto_checkpoint_garbage: 100_000,
             auto_checkpoint_delta: 250_000,
             io_width: 4,
@@ -254,6 +259,13 @@ impl Options {
     }
     pub fn exact_filter_scan(mut self, records: u32) -> Self {
         self.exact_filter_scan = records;
+        self
+    }
+    /// Index this metadata key's string values for `search_text` and
+    /// `search_hybrid`. Takes effect at the next checkpoint; records written
+    /// since the last one are scored from their metadata directly.
+    pub fn text_field(mut self, key: impl Into<String>) -> Self {
+        self.text_field = Some(key.into());
         self
     }
     pub fn metric(mut self, m: Metric) -> Self {
@@ -584,24 +596,39 @@ impl Db {
         let _no_checkpoint = self.checkpoint_lock.lock();
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        let name = self.path.file_name().ok_or(Error::Corrupt("store path has no file name"))?;
+        let name = self
+            .path
+            .file_name()
+            .ok_or(Error::Corrupt("store path has no file name"))?;
         let dest = dir.join(name);
         let index = {
             let i = self.inner.read();
-            i.graph.as_ref().map(|_| (index_path_for(&self.path, i.snapshot), index_path_for(&dest, i.snapshot)))
+            i.graph.as_ref().map(|_| {
+                (
+                    index_path_for(&self.path, i.snapshot),
+                    index_path_for(&dest, i.snapshot),
+                )
+            })
         };
         if let Some((src, dst)) = &index {
             io_ctx(std::fs::copy(src, dst).map(|_| ()), "copy index", src)?;
             // Windows needs a writable handle to flush; a read handle is refused.
             io_ctx(
-                std::fs::OpenOptions::new().write(true).open(dst).and_then(|f| f.sync_all()),
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(dst)
+                    .and_then(|f| f.sync_all()),
                 "sync index copy",
                 dst,
             )?;
         }
         {
             let mut i = self.inner.write();
-            let mut out = std::io::BufWriter::new(io_ctx(std::fs::File::create(&dest), "create log copy", &dest)?);
+            let mut out = std::io::BufWriter::new(io_ctx(
+                std::fs::File::create(&dest),
+                "create log copy",
+                &dest,
+            )?);
             i.wal.copy_prefix(&mut out)?;
             use std::io::Write as _;
             out.flush()?;
@@ -835,6 +862,137 @@ impl Db {
     }
 
     /// `search_many` restricted to records matching `filter`.
+    /// Keyword search with BM25 over the text field named by
+    /// `Options::text_field`. Scores are negated BM25 (lower is better, as
+    /// every `Hit`), so they sort with the rest of the API. Indexed records
+    /// are scored from the inverted index; records written since the last
+    /// checkpoint are tokenised on the fly. `filter` restricts the result.
+    pub fn search_text(&self, query: &str, k: usize, filter: Option<&Filter>) -> Result<Vec<Hit>> {
+        let field = self
+            .opts
+            .text_field
+            .as_deref()
+            .ok_or(Error::Corrupt("search_text needs Options::text_field"))?;
+        let terms = text::tokenize(query);
+        if terms.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        self.refresh()?;
+        let i = self.read()?;
+        let graph = i.graph.as_ref();
+        let ix = graph.and_then(|g| g.text());
+        // Corpus statistics: index plus tail. Tail records are tokenised here;
+        // they are few by construction.
+        let mut tail: Vec<(u64, HashMap<String, u16>, u32)> = Vec::new();
+        for (id, _) in i.delta.iter() {
+            if let Some(t) = i
+                .meta
+                .get(&id)
+                .and_then(|m| m.get(field))
+                .and_then(|v| v.as_str())
+            {
+                let toks = text::tokenize(t);
+                if !toks.is_empty() {
+                    let len = toks.len() as u32;
+                    let tf: HashMap<String, u16> = text::term_freqs(&toks)
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect();
+                    tail.push((id, tf, len));
+                }
+            }
+        }
+        let (mut n_docs, mut total_len) = ix.map_or((0u64, 0u64), |x| (x.n_docs, x.total_len));
+        n_docs += tail.len() as u64;
+        total_len += tail.iter().map(|(_, _, l)| *l as u64).sum::<u64>();
+        if n_docs == 0 {
+            return Ok(Vec::new());
+        }
+        let avg = total_len as f32 / n_docs as f32;
+        let dead = !i.tombstones.is_empty();
+        let passes = |id: u64| filter.is_none_or(|f| i.metadata_of(id).is_some_and(|m| f.eval(&m)));
+        // Term at a time; the per-term postings are short for all but stop
+        // words, and the query has a handful of terms.
+        let mut scores: HashMap<u32, f32> = HashMap::new();
+        let mut tail_scores: HashMap<u64, f32> = HashMap::new();
+        let mut seen_terms: HashSet<&str> = HashSet::new();
+        for term in &terms {
+            if !seen_terms.insert(term.as_str()) {
+                continue;
+            }
+            let df_tail = tail
+                .iter()
+                .filter(|(_, tf, _)| tf.contains_key(term))
+                .count();
+            let df = ix.map_or(0, |x| x.df(graph.unwrap().bytes(), term)) + df_tail;
+            if df == 0 {
+                continue;
+            }
+            if let (Some(g), Some(x)) = (graph, ix) {
+                for (slot, tf) in x.postings(g.bytes(), term) {
+                    if dead && i.tombstones.contains(&slot) {
+                        continue;
+                    }
+                    let len = x.len_of(g.bytes(), slot) as f32;
+                    *scores.entry(slot).or_insert(0.0) +=
+                        text::bm25(tf as f32, df as f32, n_docs as f32, len, avg);
+                }
+            }
+            for (id, tf, len) in &tail {
+                if let Some(&t) = tf.get(term) {
+                    *tail_scores.entry(*id).or_insert(0.0) +=
+                        text::bm25(t as f32, df as f32, n_docs as f32, *len as f32, avg);
+                }
+            }
+        }
+        let mut hits: Vec<Hit> = scores
+            .into_iter()
+            .map(|(slot, s)| Hit {
+                id: graph.unwrap().id(slot),
+                score: -s,
+            })
+            .chain(tail_scores.into_iter().map(|(id, s)| Hit { id, score: -s }))
+            .filter(|h| passes(h.id))
+            .collect();
+        hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Dense and keyword search fused by reciprocal rank: each list is
+    /// fetched with `3k` results and a record scores `sum(1 / (60 + rank))`
+    /// over the lists it appears in. `Hit::score` is the negated fused score.
+    /// Reciprocal rank fusion needs no calibration between a distance and a
+    /// BM25 score, which is why it is the default in every published
+    /// comparison of hybrid retrieval on small corpora.
+    pub fn search_hybrid(
+        &self,
+        query: &[f32],
+        text: &str,
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<Hit>> {
+        let wide = k.saturating_mul(3).max(k);
+        let dense = match filter {
+            Some(f) => self.search_where(query, wide, f)?,
+            None => self.search(query, wide)?,
+        };
+        let sparse = self.search_text(text, wide, filter)?;
+        let mut fused: HashMap<u64, f32> = HashMap::new();
+        for list in [&dense, &sparse] {
+            for (rank, h) in list.iter().enumerate() {
+                *fused.entry(h.id).or_insert(0.0) += 1.0 / (60.0 + rank as f32 + 1.0);
+            }
+        }
+        let mut hits: Vec<Hit> = fused
+            .into_iter()
+            .map(|(id, s)| Hit { id, score: -s })
+            .collect();
+        hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
+        hits.truncate(k);
+        Ok(hits)
+    }
+
     pub fn search_many_where(
         &self,
         queries: &[f32],
@@ -1072,6 +1230,7 @@ impl Db {
                     vectors,
                     self.opts.graph,
                     &meta_of,
+                    self.opts.text_field.as_deref(),
                 ),
                 None => graph::build_and_write(
                     &idx_new,
@@ -1081,6 +1240,7 @@ impl Db {
                     vectors,
                     self.opts.graph,
                     &meta_of,
+                    self.opts.text_field.as_deref(),
                 ),
             }
         })();

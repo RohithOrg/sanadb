@@ -44,6 +44,7 @@ use std::sync::Arc;
 use crate::attrs::{self, Attrs, Pred};
 use crate::index::distance;
 use crate::pq::{self, Codebook};
+use crate::text::{self, TextIndex};
 use crate::{Error, Filter, Metadata, Metric, Result};
 
 /// Metadata lookup by record id, for writing attribute columns.
@@ -165,6 +166,8 @@ pub(crate) struct GraphIndex {
     pq: Option<(Codebook, Vec<u8>)>,
     /// Attribute columns, when the file has them (written since 0.1.4).
     attrs: Option<Attrs>,
+    /// Inverted index over the text field, when the store has one.
+    text: Option<TextIndex>,
 }
 
 impl GraphIndex {
@@ -242,17 +245,17 @@ impl GraphIndex {
         // attribute table; anything else is a 0.1.3 file with neither.
         let fixed_end = pq_off + pq_len;
         let tail = &mmap[fixed_end..];
-        let (attrs_off, idtab) = if tail.len() >= FOOTER_LEN
+        let (attrs_off, idtab, text_off) = if tail.len() >= FOOTER_LEN
             && &mmap[mmap.len() - 8..] == FOOTER_MAGIC
         {
             let f = mmap.len() - FOOTER_LEN;
             let at =
                 |o: usize| u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize;
-            let (a, t) = (at(0), at(8));
+            let (a, t, x) = (at(0), at(8), at(16));
             if t < fixed_end || t + n * 12 > f {
                 return Err(Error::Corrupt("index id table inconsistent"));
             }
-            (Some(a), Some(t))
+            (Some(a), Some(t), (x != 0).then_some(x))
         } else if tail.len() >= attrs::LEGACY_TRAILER_LEN
             && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC
         {
@@ -260,10 +263,14 @@ impl GraphIndex {
             (
                 Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize),
                 None,
+                None,
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
+        let text = text_off
+            .map(|x| TextIndex::parse(&mmap, fixed_end, x, n))
+            .transpose()?;
         let attrs = attrs_off
             .map(|a| Attrs::parse(&mmap, fixed_end, a, n))
             .transpose()?;
@@ -295,6 +302,7 @@ impl GraphIndex {
             slot_of,
             pq,
             attrs,
+            text,
         }))
     }
 
@@ -479,6 +487,14 @@ impl GraphIndex {
     /// A slot's metadata decoded from the columns; `None` without columns.
     pub fn metadata(&self, slot: u32) -> Option<Metadata> {
         self.attrs.as_ref().map(|a| a.record(&self.mmap, slot))
+    }
+
+    /// The text index, if the store has a text field and has checkpointed.
+    pub fn text(&self) -> Option<&TextIndex> {
+        self.text.as_ref()
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.mmap
     }
 
     /// Every metadata key the columns hold, with its type.
@@ -1002,6 +1018,7 @@ impl ShardFile {
 /// Build a Vamana graph over `vectors` (row-major, `n * dim`, typically a
 /// memory-mapped file) and write the index to `path`. `ids[i]` is the external
 /// id of row `i`. Temp files are created next to `path` and removed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_and_write(
     path: &Path,
     dim: usize,
@@ -1010,6 +1027,7 @@ pub(crate) fn build_and_write(
     vectors: &[f32],
     params: GraphParams,
     meta_of: &MetaFn<'_>,
+    text_field: Option<&str>,
 ) -> Result<()> {
     let n = ids.len();
     assert_eq!(vectors.len(), n * dim);
@@ -1042,6 +1060,7 @@ pub(crate) fn build_and_write(
             &|s| adj[s as usize].clone(),
             meta_of,
             params.storage,
+            text_field,
         );
     }
 
@@ -1085,6 +1104,7 @@ pub(crate) fn build_and_write(
         &merged,
         meta_of,
         params.storage,
+        text_field,
     );
     drop(files);
     for p in tmp_paths {
@@ -1100,6 +1120,7 @@ pub(crate) fn build_and_write(
 /// the additions while working; the written file keeps only live nodes, in
 /// that order. The existing PQ codebook is reused: old codes are copied, new
 /// vectors are encoded against it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn update_and_write(
     path: &Path,
     existing: &GraphIndex,
@@ -1108,6 +1129,7 @@ pub(crate) fn update_and_write(
     new_vectors: &[f32],
     params: GraphParams,
     meta_of: &MetaFn<'_>,
+    text_field: Option<&str>,
 ) -> Result<()> {
     let dim = existing.dim;
     let metric = existing.metric;
@@ -1291,6 +1313,7 @@ pub(crate) fn update_and_write(
         &edges,
         meta_of,
         params.storage,
+        text_field,
     );
     if let Some((m, tmp)) = expanded {
         drop(m);
@@ -1314,6 +1337,7 @@ fn write_index(
     edges: &(dyn Fn(u32) -> Vec<u32> + Sync),
     meta_of: &MetaFn<'_>,
     storage: Storage,
+    text_field: Option<&str>,
 ) -> Result<()> {
     let n = ids.len();
     let m = pq.map_or(0, |(cb, _)| cb.m);
@@ -1381,7 +1405,20 @@ fn write_index(
     w.write_all(bytemuck::cast_slice(&order))?;
     let after = idtab + n as u64 * 12;
     w.write_all(&vec![0u8; (after.next_multiple_of(8) - after) as usize])?;
-    for v in [attrs_table, idtab, 0u64] {
+    // Text section, when the store indexes a text field.
+    let mut text_table = 0u64;
+    if let Some(field) = text_field {
+        let start = after.next_multiple_of(8);
+        let text_of = |s: u32| {
+            meta_of(ids[s as usize])
+                .and_then(|m| m.get(field).and_then(|v| v.as_str().map(str::to_string)))
+        };
+        let (len, table) = text::write(&mut w, start, n, &text_of)?;
+        text_table = table;
+        let end = start + len;
+        w.write_all(&vec![0u8; (end.next_multiple_of(8) - end) as usize])?;
+    }
+    for v in [attrs_table, idtab, text_table] {
         w.write_all(&v.to_le_bytes())?;
     }
     w.write_all(FOOTER_MAGIC)?;

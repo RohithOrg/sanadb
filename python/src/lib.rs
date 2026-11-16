@@ -179,6 +179,9 @@ impl PyDb {
     /// stored as given) or "cosine" (negative cosine similarity; vectors are
     /// normalised on insert and query).
     ///
+    /// text_field="body" indexes that metadata key's strings for search_text()
+    /// and the hybrid form of search().
+    ///
     /// storage="int8" stores indexed vectors with 8-bit scalar quantisation
     /// (a quarter of the bytes per hop; exact re-ranking and get() use the
     /// dequantised vector). The log keeps f32 until the next checkpoint.
@@ -187,7 +190,7 @@ impl PyDb {
     /// no lock is taken, reads follow the writer's appends and checkpoints,
     /// and writes raise PermissionError.
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32"))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -204,6 +207,7 @@ impl PyDb {
         alpha: f32,
         read_only: bool,
         storage: &str,
+        text_field: Option<String>,
     ) -> PyResult<Self> {
         let metric = match metric {
             "l2" => Metric::L2,
@@ -224,7 +228,7 @@ impl PyDb {
                 )));
             }
         };
-        let opts = Options::new(dim)
+        let mut opts = Options::new(dim)
             .metric(metric)
             .search_beam(search_beam)
             .max_search_beam(max_search_beam)
@@ -238,6 +242,9 @@ impl PyDb {
                 storage,
                 ..GraphParams::default()
             });
+        if let Some(f) = text_field {
+            opts = opts.text_field(f);
+        }
         let db = py
             .allow_threads(|| {
                 if read_only {
@@ -363,15 +370,35 @@ impl PyDb {
     ///
     /// `filter` is a dict of metadata pairs that must all match exactly, or a
     /// callable `meta -> bool`. Dict filters run with the GIL released.
-    #[pyo3(signature = (query, k = 10, filter = None))]
+    #[pyo3(signature = (query, k = 10, filter = None, text = None))]
     fn search(
         &self,
         py: Python<'_>,
         query: &Bound<'_, PyAny>,
         k: usize,
         filter: Option<&Bound<'_, PyAny>>,
+        text: Option<String>,
     ) -> PyResult<Vec<(u64, f32)>> {
         let q = to_vec(query)?;
+        if let Some(text) = text {
+            // Hybrid: dense plus keyword, fused by reciprocal rank.
+            let f = match filter {
+                None => None,
+                Some(f) if f.is_instance_of::<PyDict>() => {
+                    Some(to_filter(f.downcast::<PyDict>()?)?)
+                }
+                Some(_) => {
+                    return Err(PyValueError::new_err(
+                        "hybrid search takes a dict filter, not a callable",
+                    ));
+                }
+            };
+            let db = self.inner.clone();
+            let hits = py
+                .allow_threads(move || db.search_hybrid(&q, &text, k, f.as_ref()))
+                .map_err(err)?;
+            return Ok(hits.into_iter().map(|h| (h.id, h.score)).collect());
+        }
         let filter = match filter {
             None => None,
             Some(f) if f.is_instance_of::<PyDict>() => {
@@ -445,10 +472,29 @@ impl PyDb {
         ))
     }
 
+    /// Keyword search (BM25) over the text_field. Scores are negated BM25.
+    #[pyo3(signature = (text, k = 10, filter = None))]
+    fn search_text(
+        &self,
+        py: Python<'_>,
+        text: String,
+        k: usize,
+        filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<(u64, f32)>> {
+        let f = filter.map(to_filter).transpose()?;
+        let db = self.inner.clone();
+        let hits = py
+            .allow_threads(move || db.search_text(&text, k, f.as_ref()))
+            .map_err(err)?;
+        Ok(hits.into_iter().map(|h| (h.id, h.score)).collect())
+    }
+
     /// Copy the store into `dir` in a consistent state; returns the copy's path.
     fn backup(&self, py: Python<'_>, dir: String) -> PyResult<String> {
         let db = self.inner.clone();
-        py.allow_threads(move || db.backup(dir)).map_err(err).map(|p| p.to_string_lossy().into_owned())
+        py.allow_threads(move || db.backup(dir))
+            .map_err(err)
+            .map(|p| p.to_string_lossy().into_owned())
     }
 
     /// Read-only stores: bring the view up to date with the writer now. Every
