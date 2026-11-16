@@ -411,8 +411,13 @@ the exact scan takes 3.8 ms and the graph 140 µs.
    Candidates: a filter-aware edge budget at build (ACORN-γ), or a smaller
    result heap for filtered walks. Measure on the big-ann-benchmarks filter
    track (YFCC-10M).
-4. Close the R=32 gap on cosine data; a VectorDBBench client; more
-   ann-benchmarks datasets.
+4. GloVe at R=32: after the 0.1.4 walk rewrite R=32 is faster than hnswlib
+   at every recall it reaches, but within the measured beams (up to 512) it
+   tops out at 0.90 where R=48 reaches 0.94 and hnswlib 0.96. The next
+   measurement extends the beam range to 1,024 to separate the degree
+   ceiling from the configuration. More ann-benchmarks datasets. A
+   VectorDBBench client is in `benchmarks/vectordbbench/`; the harness has
+   not been run against it yet.
 5. Format freeze and 1.0. Readers in other processes and metadata off the
    heap are done ([design note](docs/design/snapshot-and-tail.md)); what
    remains before freezing is a year of other people's workloads.
