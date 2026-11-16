@@ -223,12 +223,12 @@ mod x86 {
             let mut acc = [_mm256_setzero_ps(); 4];
             let mut i = 0;
             while i + 32 <= n {
-                for k in 0..4 {
+                for (k, a) in acc.iter_mut().enumerate() {
                     let d = _mm256_sub_ps(
                         _mm256_loadu_ps(pa.add(i + k * 8)),
                         _mm256_loadu_ps(pb.add(i + k * 8)),
                     );
-                    acc[k] = _mm256_fmadd_ps(d, d, acc[k]);
+                    *a = _mm256_fmadd_ps(d, d, *a);
                 }
                 i += 32;
             }
@@ -259,11 +259,11 @@ mod x86 {
             let mut acc = [_mm256_setzero_ps(); 4];
             let mut i = 0;
             while i + 32 <= n {
-                for k in 0..4 {
-                    acc[k] = _mm256_fmadd_ps(
+                for (k, a) in acc.iter_mut().enumerate() {
+                    *a = _mm256_fmadd_ps(
                         _mm256_loadu_ps(pa.add(i + k * 8)),
                         _mm256_loadu_ps(pb.add(i + k * 8)),
-                        acc[k],
+                        *a,
                     );
                 }
                 i += 32;
@@ -289,16 +289,13 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn hsum(v: __m256) -> f32 {
-        // Safety: callers checked for AVX2 and FMA; loads are bounded by `n`.
-        unsafe {
-            let lo = _mm256_castps256_ps128(v);
-            let hi = _mm256_extractf128_ps(v, 1);
-            let s = _mm_add_ps(lo, hi);
-            let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-            let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-            _mm_cvtss_f32(s)
-        }
+    fn hsum(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let s = _mm_add_ps(lo, hi);
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+        _mm_cvtss_f32(s)
     }
 }
 

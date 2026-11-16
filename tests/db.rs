@@ -2061,7 +2061,8 @@ fn random_operations_agree_with_a_model() {
         rng
     };
     let mut db = Db::open(&path, Options::new(dim as u32).exact_filter_scan(100_000)).unwrap();
-    let reader = Db::open_read_only(&path, Options::new(dim as u32).exact_filter_scan(100_000)).unwrap();
+    let reader =
+        Db::open_read_only(&path, Options::new(dim as u32).exact_filter_scan(100_000)).unwrap();
     let mk_meta = |i: u64| -> Metadata {
         let mut m = Metadata::new();
         m.insert("g".into(), Value::from((i % 7) as i64));
@@ -2074,12 +2075,18 @@ fn random_operations_agree_with_a_model() {
     let check = |db: &Db, model: &HashMap<u64, (Vec<f32>, Metadata)>, step: usize, who: &str| {
         assert_eq!(db.len(), model.len(), "{who} step {step}: len");
         for (&id, (v, m)) in model.iter().take(40) {
-            let (gv, gm) = db.get(id).unwrap_or_else(|| panic!("{who} step {step}: {id} missing"));
+            let (gv, gm) = db
+                .get(id)
+                .unwrap_or_else(|| panic!("{who} step {step}: {id} missing"));
             assert_eq!(&gv, v, "{who} step {step}: vector of {id}");
             assert_eq!(&gm, m, "{who} step {step}: metadata of {id}");
         }
         for id in [1u64, 7, 99, 100_000, 5_000_000] {
-            assert_eq!(db.get(id).is_some(), model.contains_key(&id), "{who} step {step}: presence of {id}");
+            assert_eq!(
+                db.get(id).is_some(),
+                model.contains_key(&id),
+                "{who} step {step}: presence of {id}"
+            );
         }
         // Exact filtered search over a group: the result set must equal the
         // model's k nearest within that group (scan regime, cap raised).
@@ -2094,12 +2101,24 @@ fn random_operations_agree_with_a_model() {
             d.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             d.into_iter().take(5).map(|e| e.1).collect()
         };
-        let got: Vec<u64> = db.search_where(&q, 5, &Filter::eq("g", g)).unwrap().iter().map(|h| h.id).collect();
+        let got: Vec<u64> = db
+            .search_where(&q, 5, &Filter::eq("g", g))
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect();
         if db.index_stats().is_some() {
-            assert_eq!(got, want, "{who} step {step}: exact filtered search for g={g}");
+            assert_eq!(
+                got, want,
+                "{who} step {step}: exact filtered search for g={g}"
+            );
         }
         for h in db.search(&q, 10).unwrap() {
-            assert!(model.contains_key(&h.id), "{who} step {step}: search returned deleted {}", h.id);
+            assert!(
+                model.contains_key(&h.id),
+                "{who} step {step}: search returned deleted {}",
+                h.id
+            );
         }
     };
     let mut next_id = 0u64;
@@ -2165,7 +2184,15 @@ fn random_operations_agree_with_a_model() {
             _ => {
                 // A batch that must fail leaves everything untouched.
                 let id = next_id + 10;
-                let r = db.write_batch(Batch::new().insert(id, &vec_of(dim, id), mk_meta(id)).insert(id + 1, &[1.0; 6], HashMap::from([("g".to_string(), Value::from("bad type"))])));
+                let r = db.write_batch(
+                    Batch::new()
+                        .insert(id, &vec_of(dim, id), mk_meta(id))
+                        .insert(
+                            id + 1,
+                            &[1.0; 6],
+                            HashMap::from([("g".to_string(), Value::from("bad type"))]),
+                        ),
+                );
                 assert!(matches!(r, Err(sanadb::Error::TypeMismatch { .. })));
                 assert!(db.get(id).is_none());
             }
@@ -2173,6 +2200,10 @@ fn random_operations_agree_with_a_model() {
         check(&db, &model, step, "writer");
         check(&reader, &model, step, "reader");
     }
-    eprintln!("model test: {} live records after 120 steps, {} ids allocated", model.len(), next_id);
+    eprintln!(
+        "model test: {} live records after 120 steps, {} ids allocated",
+        model.len(),
+        next_id
+    );
     assert!(model.len() > 200);
 }
