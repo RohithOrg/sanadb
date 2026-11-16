@@ -1,10 +1,14 @@
 name: Release
 
 # Tag `vX.Y.Z` to publish the crate to crates.io and wheels + sdist to PyPI.
-# Secrets: CARGO_REGISTRY_TOKEN (crates.io) and PYPI_API_TOKEN (PyPI, scoped
-# to both `sanadb` and `sanadb-studio`). Trusted publishing was used until
-# 0.2.2; from 0.2.3 PyPI refused the minted token for `sanadb`, so the
-# upload uses a token.
+# Secrets: CARGO_REGISTRY_TOKEN (crates.io). PyPI uses trusted publishing
+# (OIDC, no token), which also attaches build provenance to every file:
+# both projects, `sanadb` and `sanadb-studio`, carry the identical
+# publisher (this repository, `release.yml`, environment `pypi`). The
+# environment must match on both: 0.2.3 to 0.2.5 failed or went up without
+# provenance because one project's publisher said "any environment", which
+# PyPI treats as a different publisher and then scopes the token to the
+# other project only.
 #
 # A tag push releases everything. "Run workflow" takes an existing tag and
 # four switches, so one part can be released or re-released on its own:
@@ -218,8 +222,11 @@ jobs:
     if: github.event_name == 'push' || inputs.python
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write
     steps:
-      # Two projects, two uploads, one token scoped to both.
+      # Two projects, two uploads: one per project keeps each upload's
+      # provenance attached to the right project.
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-[!s]*
@@ -239,13 +246,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
       - name: Publish sanadb-studio
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-studio
-          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
 
   github-release:

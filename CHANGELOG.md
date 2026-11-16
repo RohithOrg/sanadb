@@ -7,6 +7,12 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Changed
+- Release workflow: back to PyPI trusted publishing, so releases carry
+  build provenance again (0.2.4 and 0.2.5 went up by token and have
+  none). The cause of the 0.2.3 failure was the two projects' publishers
+  differing in the environment field; both now say `pypi`.
+
 ## [0.2.5] - 2026-11-16
 
 Studio grows a 3D map and graph exploration; the release workflow can
