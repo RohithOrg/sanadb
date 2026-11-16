@@ -13,7 +13,11 @@ theme:
 markdown_extensions: [tables, fenced_code, toc]
 nav:
   - Overview: index.md
+  - How it works: architecture.md
+  - Operating a store: operations.md
+  - Benchmarks: benchmarks.md
   - File format: FORMAT.md
+  - Status, limits and roadmap: roadmap.md
   - Design notes:
       - Snapshot and tail: design/snapshot-and-tail.md
       - Typed metadata and filtered search: design/typed-metadata-and-filtered-search.md
