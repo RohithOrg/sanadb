@@ -482,6 +482,11 @@ fn write_header(file: &mut File, h: Header) -> io::Result<()> {
     file.write_all(&buf)
 }
 
+/// The header of a log file without opening the store: dimension and metric.
+pub(crate) fn peek(path: &Path) -> Result<Header> {
+    read_header(&mut File::open(path)?)
+}
+
 fn read_header(file: &mut File) -> Result<Header> {
     let mut buf = [0u8; HEADER_LEN as usize];
     file.read_exact(&mut buf)

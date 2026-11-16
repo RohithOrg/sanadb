@@ -21,6 +21,7 @@ markdown_extensions:
 nav:
   - Overview: index.md
   - Getting started: getting-started.md
+  - Studio: studio.md
   - How it works: architecture.md
   - Operating a store: operations.md
   - Benchmarks: benchmarks.md

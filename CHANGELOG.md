@@ -5,6 +5,20 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
+## [Unreleased]
+
+### Added
+- `sanadb-studio` (workspace crate `studio/`, not published to crates.io
+  yet): a local web page for one store with a PCA map of a sample, every
+  search mode, the graph walk drawn on the map, record inspection,
+  metadata editing and deletion, and live counters. See `docs/studio.md`.
+- `Db::peek(path)` reads a store's dimension and metric from the file;
+  `Db::ids()` lists live ids; `Db::keys()` lists metadata keys with their
+  types; `Db::search_traced(query, k)` returns the hits and the nodes the
+  graph walk expanded, in order. The index reader also accepts the
+  32-byte footer that 0.2.0 development builds wrote, so stores built with
+  them still open.
+
 ## [0.2.0] - 2026-11-16
 
 The store holds nothing in RAM that scales with the index, readers can

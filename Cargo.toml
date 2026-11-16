@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "python"]
+members = [".", "python", "studio"]
 
 [package]
 name = "sanadb"
@@ -12,7 +12,7 @@ repository = "https://github.com/RohithOrg/sanadb"
 readme = "README.md"
 keywords = ["vector", "database", "embedded", "ann", "search"]
 categories = ["database-implementations", "data-structures"]
-exclude = ["/python", "/data", "/.github"]
+exclude = ["/python", "/studio", "/data", "/.github"]
 
 [dependencies]
 crc32fast = "1"

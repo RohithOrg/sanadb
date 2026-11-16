@@ -249,35 +249,49 @@ impl GraphIndex {
         // attribute table; anything else is a 0.1.3 file with neither.
         let fixed_end = pq_off + pq_len;
         let tail = &mmap[fixed_end..];
-        let (attrs_off, idtab, text_off, sparse_off) = if tail.len() >= FOOTER_LEN
-            && &mmap[mmap.len() - 8..] == FOOTER_MAGIC
-        {
-            let f = mmap.len() - FOOTER_LEN;
-            let at =
-                |o: usize| u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize;
-            let (a, t, x, sp) = (at(0), at(8), at(16), at(24));
-            if t < fixed_end || t + n * 12 > f {
-                return Err(Error::Corrupt("index id table inconsistent"));
-            }
-            (
-                Some(a),
-                Some(t),
-                (x != 0).then_some(x),
-                (sp != 0).then_some(sp),
-            )
-        } else if tail.len() >= attrs::LEGACY_TRAILER_LEN
-            && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC
-        {
-            let o = mmap.len() - attrs::LEGACY_TRAILER_LEN;
-            (
-                Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize),
-                None,
-                None,
-                None,
-            )
-        } else {
-            (None, None, None, None)
-        };
+        let (attrs_off, idtab, text_off, sparse_off) =
+            if tail.len() >= FOOTER_LEN && &mmap[mmap.len() - 8..] == FOOTER_MAGIC {
+                // Four slots before the magic. Development builds of 0.2.0 wrote
+                // three (no sparse slot, 32 bytes); a footer that fails the
+                // geometry checks as four slots is read as three, so stores
+                // built with those builds still open.
+                let slots = |len: usize| -> Option<(usize, usize, usize, usize)> {
+                    let f = mmap.len() - len;
+                    let at = |o: usize| {
+                        u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize
+                    };
+                    let (a, t, x) = (at(0), at(8), at(16));
+                    let sp = if len == FOOTER_LEN { at(24) } else { 0 };
+                    let ok = a >= fixed_end
+                        && a < f
+                        && t >= fixed_end
+                        && t + n * 12 <= f
+                        && (x == 0 || (x >= fixed_end && x < f))
+                        && (sp == 0 || (sp >= fixed_end && sp < f));
+                    ok.then_some((a, t, x, sp))
+                };
+                let Some((a, t, x, sp)) = slots(FOOTER_LEN).or_else(|| slots(32)) else {
+                    return Err(Error::Corrupt("index id table inconsistent"));
+                };
+                (
+                    Some(a),
+                    Some(t),
+                    (x != 0).then_some(x),
+                    (sp != 0).then_some(sp),
+                )
+            } else if tail.len() >= attrs::LEGACY_TRAILER_LEN
+                && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC
+            {
+                let o = mmap.len() - attrs::LEGACY_TRAILER_LEN;
+                (
+                    Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize),
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                (None, None, None, None)
+            };
         let sparse = sparse_off
             .map(|x| SparseIndex::parse(&mmap, fixed_end, x, n))
             .transpose()?;
@@ -466,7 +480,41 @@ impl GraphIndex {
     }
 }
 
+/// `(hits, expanded)` of `GraphIndex::search_traced`, both `(distance, slot)`.
+pub(crate) type Traced = (Vec<(f32, u32)>, Vec<(f32, u32)>);
+
 impl GraphIndex {
+    /// One unfiltered walk with its expansion order: `(hits, expanded)`,
+    /// hits re-ranked exactly like `search`, `expanded` the slots in the
+    /// order the walk expanded them with the walk's (approximate) distance.
+    pub fn search_traced(&self, q: &[f32], k: usize, beam: usize, width: usize) -> Traced {
+        if self.n == 0 || k == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let beam = beam.max(k);
+        let lut = self.pq.as_ref().map(|(cb, _)| cb.lut(q, self.metric));
+        let expanded = match (&self.pq, &lut) {
+            (Some((cb, codes)), Some(lut)) => {
+                let m = cb.m;
+                greedy_ordered(self, self.entry, beam, width, |s| {
+                    pq::lut_distance(lut, &codes[s as usize * m..(s as usize + 1) * m])
+                })
+            }
+            _ => greedy_ordered(self, self.entry, beam, width, |s| {
+                distance(self.metric, q, &self.vector(s))
+            }),
+        };
+        let mut hits = expanded.clone();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        hits.truncate(beam);
+        for c in hits.iter_mut() {
+            c.0 = distance(self.metric, q, &self.vector(c.1));
+        }
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        hits.truncate(k);
+        (hits, expanded)
+    }
+
     /// Exact k-NN over an explicit slot list: the path for filters that
     /// leave few enough candidates that reading each one beats a walk.
     pub fn scan(&self, q: &[f32], k: usize, slots: impl Iterator<Item = u32>) -> Vec<(f32, u32)> {
@@ -705,8 +753,45 @@ fn greedy<G: Walkable>(
         if pass.is_none_or(|p| p(start)) {
             top.push(c);
         }
-        greedy_in(g, beam, width, &dist, pass, cand, top, seen, nbrs, picks)
+        let mut out = greedy_in(g, beam, width, &dist, pass, cand, top, seen, nbrs, picks);
+        out.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        out
     })
+}
+
+/// `greedy` without the final sort: the nodes in the order the walk
+/// expanded them, with the distance the walk used (PQ-approximate when the
+/// index has codes). For tooling that shows a walk, not for queries.
+fn greedy_ordered<G: Walkable>(
+    g: &G,
+    start: u32,
+    beam: usize,
+    width: usize,
+    dist: impl Fn(u32) -> f32,
+) -> Vec<(f32, u32)> {
+    let mut cand = BinaryHeap::new();
+    let mut top = BinaryHeap::new();
+    let mut seen = Visited::default();
+    seen.reset(g.len());
+    let c = Cand {
+        d: dist(start),
+        s: start,
+    };
+    seen.insert(start);
+    cand.push(Reverse(c));
+    top.push(c);
+    greedy_in(
+        g,
+        beam,
+        width,
+        &dist,
+        None,
+        &mut cand,
+        &mut top,
+        &mut seen,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
 }
 
 /// `(distance, slot)` with a total order, so it can sit in a heap.
@@ -845,7 +930,6 @@ fn greedy_in<G: Walkable>(
             }
         }
     }
-    out.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     out
 }
 

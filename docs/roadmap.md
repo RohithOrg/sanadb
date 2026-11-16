@@ -63,8 +63,11 @@ In rough order.
    scans will.
 6. **1.0.** Same format, the promise extended to a major version; what
    remains is a year of other people's workloads.
-7. **sanadb studio.** A local web UI to open a store, map it in 2D,
-   cluster, search, watch the beam walk, and edit metadata.
+7. **sanadb studio**, the rest. The first version ([studio.md](studio.md))
+   opens a store, maps it, searches it every way, shows the walk and edits
+   records. Next: sparse-vector queries from the page, cluster labels
+   from metadata, a view of the log and index files, and shipping it as a
+   release binary.
 
 ## Not planned
 

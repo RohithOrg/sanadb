@@ -103,6 +103,14 @@ in [docs/benchmarks.md](docs/benchmarks.md).
 - **Keyword, BEIR SciFact:** nDCG@10 0.662 against rank_bm25's 0.654 and
   Anserini's published 0.665.
 
+## Studio
+
+`sanadb-studio data/vectors.sana` serves a local page that maps the store,
+searches it every way the library can, draws the graph walk of a search
+on the map, and edits records. See [docs/studio.md](docs/studio.md).
+
+![sanadb studio](docs/img/studio.png)
+
 ## Should you use it
 
 Not yet for anything that cannot afford a bug: this is a 0.x release that
@@ -140,6 +148,7 @@ The detail behind each of these is in [docs/operations.md](docs/operations.md).
   compatibility, observability, knobs.
 - [Benchmarks](docs/benchmarks.md): every table with method and caveats.
 - [File format](docs/FORMAT.md): the byte layout, frozen for 0.x.
+- [Studio](docs/studio.md): the local web UI.
 - [Status, limits and roadmap](docs/roadmap.md).
 - Design notes: [snapshot and tail](docs/design/snapshot-and-tail.md),
   [typed metadata and filtered search](docs/design/typed-metadata-and-filtered-search.md),

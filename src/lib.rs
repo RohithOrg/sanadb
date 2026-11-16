@@ -794,6 +794,92 @@ impl Db {
         self.inner.read().delta.len()
     }
 
+    /// The dimension and metric a store was created with, read from the
+    /// file's header without opening the store. Tools use it to open a
+    /// store they were only given the path of.
+    pub fn peek(path: impl AsRef<Path>) -> Result<(u32, Metric)> {
+        let h = wal::peek(path.as_ref())?;
+        Ok((h.dim, h.metric))
+    }
+
+    /// Every live record id, ascending. Allocates one `u64` per record.
+    pub fn ids(&self) -> Vec<u64> {
+        let _ = self.refresh();
+        let i = self.inner.read();
+        let mut ids: Vec<u64> = i.delta.iter().map(|(id, _)| id).collect();
+        if let Some(g) = &i.graph {
+            ids.extend(
+                (0..g.len() as u32)
+                    .filter(|s| !i.tombstones.contains(s))
+                    .map(|s| g.id(s))
+                    .filter(|id| i.delta.offset(*id).is_none()),
+            );
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Every metadata key written to the store with its type.
+    pub fn keys(&self) -> Vec<(String, Kind)> {
+        let _ = self.refresh();
+        let i = self.inner.read();
+        let mut keys: Vec<(String, Kind)> = i.types.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        keys
+    }
+
+    /// `search` with the graph walk's trace: `(hits, walk)`, where `walk`
+    /// lists the indexed records in the order the walk expanded them with
+    /// the distance the walk used (PQ-approximate when the index has codes).
+    /// Unfiltered, one pass at `search_beam`. The delta is scanned as usual
+    /// but does not appear in the walk. For tooling that shows a search.
+    pub fn search_traced(&self, query: &[f32], k: usize) -> Result<(Vec<Hit>, Vec<Hit>)> {
+        if query.len() != self.header.dim as usize {
+            return Err(Error::DimMismatch {
+                expected: self.header.dim,
+                got: query.len(),
+            });
+        }
+        let query = &*prepare(self.header.metric, query)?;
+        self.refresh()?;
+        let i = self.read()?;
+        bump(&self.counters.searches);
+        let mut hits = i
+            .delta
+            .search(query, k, |_| true, &|off| i.wal.vector_at(off));
+        let mut walk = Vec::new();
+        if let Some(g) = &i.graph {
+            bump(&self.counters.graph_walks);
+            let (gh, expanded) = g.search_traced(
+                query,
+                k,
+                self.opts.search_beam as usize,
+                self.opts.io_width as usize,
+            );
+            let dead = !i.tombstones.is_empty();
+            hits.extend(
+                gh.into_iter()
+                    .filter(|(_, s)| !dead || !i.tombstones.contains(s))
+                    .map(|(score, slot)| Hit {
+                        id: g.id(slot),
+                        score,
+                    }),
+            );
+            hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
+            hits.truncate(k);
+            walk = expanded
+                .into_iter()
+                .map(|(score, slot)| Hit {
+                    id: g.id(slot),
+                    score,
+                })
+                .collect();
+        }
+        present(self.header.metric, &mut hits);
+        present(self.header.metric, &mut walk);
+        Ok((hits, walk))
+    }
+
     /// Operation counters since open; see [`Stats`].
     pub fn stats(&self) -> Stats {
         self.counters.snapshot()

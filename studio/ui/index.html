@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sanadb studio</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#F2F4F7; --panel:#FFFFFF; --ink:#101828; --muted:#667085; --line:#E4E7EC;
+  --accent:#2E4BE8; --accent-soft:#DCE2FB; --walk:#D97706; --walk-soft:#FBE7C6;
+  --ok:#2F7D4F; --bad:#B42318;
+  --sans:"Source Sans 3",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 var(--sans)}
+button,input,textarea,select{font:inherit;color:inherit}
+a{color:var(--accent)}
+.app{display:grid;grid-template-rows:auto 1fr auto;grid-template-columns:300px 1fr 380px;height:100%;gap:1px;background:var(--line)}
+header{grid-column:1/-1;display:flex;align-items:baseline;gap:18px;padding:10px 18px;background:var(--panel)}
+header .brand{font-weight:600;letter-spacing:.01em}
+header .brand span{color:var(--muted);font-weight:400}
+header .brand .ver{font-family:var(--mono);font-size:12px}
+header .path{font-family:var(--mono);font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+header .facts{display:flex;gap:16px;font-size:14px;color:var(--muted);white-space:nowrap}
+header .facts b{color:var(--ink);font-weight:600}
+header .ro{color:var(--bad)}
+aside,main,section.right{background:var(--panel);min-height:0;overflow:auto}
+aside{padding:14px 16px;display:flex;flex-direction:column;gap:16px}
+h2{font-size:13px;font-weight:600;color:var(--muted);margin:0 0 6px;letter-spacing:.02em}
+label{display:block;font-size:13px;color:var(--ink);font-weight:600;margin:10px 0 4px}
+label .hint{display:block;font-weight:400;color:var(--muted);font-size:12.5px;margin-top:1px}
+input[type=text],input[type=number],textarea{width:100%;border:1px solid var(--line);border-radius:4px;padding:6px 8px;background:#FAFBFC}
+textarea{font-family:var(--mono);font-size:12.5px;min-height:56px;resize:vertical}
+input:focus,textarea:focus,button:focus-visible{outline:2px solid var(--accent-soft);outline-offset:0;border-color:var(--accent)}
+.row{display:flex;gap:8px;align-items:center}
+.row > *{flex:1}
+button{border:1px solid var(--line);background:#FAFBFC;border-radius:4px;padding:6px 10px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:#2440C9}
+button:hover{background:#F0F2F5}
+button.primary:disabled{opacity:.5;cursor:default}
+.check{display:flex;align-items:center;gap:6px;color:var(--ink);font-size:14px;margin-top:8px}
+.check input{margin:0}
+main{position:relative;background:#FBFBFC}
+canvas{display:block;width:100%;height:100%;cursor:crosshair}
+.legend{position:absolute;left:14px;bottom:12px;font-size:13px;color:var(--muted);display:flex;gap:14px;align-items:center;background:rgba(255,255,255,.85);padding:6px 10px;border-radius:4px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:-1px;margin-right:5px}
+.maptitle{position:absolute;left:14px;top:12px;font-size:13px;color:var(--muted);background:rgba(255,255,255,.85);padding:4px 8px;border-radius:4px}
+.maptitle b{color:var(--ink);font-weight:600}
+.walkctl{position:absolute;right:14px;top:12px;display:flex;gap:6px;align-items:center;background:rgba(255,255,255,.9);padding:6px 8px;border-radius:4px;font-size:13px;color:var(--muted)}
+.walkctl .step{font-family:var(--mono);color:var(--walk);min-width:7em;text-align:right}
+.walkctl[hidden]{display:none}
+button:disabled{opacity:.45;cursor:default}
+.tip{position:absolute;pointer-events:none;background:var(--ink);color:#fff;font:12.5px var(--mono);padding:3px 7px;border-radius:3px;transform:translate(10px,-50%);white-space:nowrap;display:none}
+section.right{display:flex;flex-direction:column}
+.results{padding:12px 16px;border-bottom:1px solid var(--line);max-height:46%;overflow:auto}
+.results .meta-line{font-size:13px;color:var(--muted)}
+.hit{display:grid;grid-template-columns:7ch 1fr auto;gap:10px;padding:6px 6px;border-radius:4px;cursor:pointer;align-items:baseline}
+.hit .id{text-align:right}
+button.danger{color:var(--bad);border-color:#F2C4C0;background:#fff}
+button.danger:hover{background:#FDF2F1}
+.inspector .actions{display:flex;gap:8px;margin-top:8px}
+.inspector .actions .primary{flex:1}
+.hit:hover{background:#F6F7F9}
+.hit.sel{background:var(--accent-soft)}
+.hit .id{font-family:var(--mono);font-size:13px}
+.hit .score{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.hit .meta{font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inspector{padding:12px 16px;flex:1;overflow:auto}
+.inspector .id{font-family:var(--mono);font-size:16px}
+.inspector .vec{font-family:var(--mono);font-size:12px;color:var(--muted);word-break:break-all;margin:6px 0 10px}
+.spark{display:block;width:100%;height:36px;margin:4px 0 8px}
+.msg{font-size:13px;color:var(--muted);margin-top:6px}
+.msg.err{color:var(--bad)}
+.msg.ok{color:var(--ok)}
+.list{font-size:13.5px}
+.list .r{display:grid;grid-template-columns:7ch 1fr;gap:10px;padding:4px 6px;border-radius:4px;cursor:pointer}
+.list .r:hover{background:#F6F7F9}
+.list .r .id{font-family:var(--mono);font-size:12.5px;text-align:right;color:var(--ink)}
+.list .r .m{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pager{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--muted);margin-top:6px}
+.pager button{padding:2px 8px}
+footer{grid-column:1/-1;display:flex;gap:22px;padding:7px 18px;background:var(--panel);font-size:13px;color:var(--muted);flex-wrap:wrap}
+footer b{color:var(--ink);font-weight:600;font-family:var(--mono);font-size:12.5px}
+.kinds{font-size:13px;color:var(--muted);line-height:1.6}
+.kinds code{font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+@media (max-width:1100px){.app{grid-template-columns:260px 1fr 320px}}
+@media (max-width:860px){.app{grid-template-columns:1fr;grid-template-rows:auto auto 60vh auto auto}header{flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">sanadb <span>studio</span> <span class="ver" id="ver"></span></div>
+    <div class="path" id="path"></div>
+    <div class="facts" id="facts"></div>
+    <button id="ckpt" title="Build the graph index over everything written so far">Checkpoint</button>
+  </header>
+
+  <aside>
+    <div>
+      <h2>Query</h2>
+      <label for="qid">From record id</label>
+      <input type="text" id="qid" placeholder="e.g. 4211" inputmode="numeric">
+      <label for="qtext">Keyword text <span class="hint">BM25 on the text field; with an id, hybrid</span></label>
+      <input type="text" id="qtext" placeholder="words to match">
+      <label for="qfilter">Filter <span class="hint">JSON, the Python operators</span></label>
+      <textarea id="qfilter" placeholder='{"lang": "rust", "year": {"$gte": 2020}}'></textarea>
+      <div class="row" style="margin-top:8px">
+        <div><label for="qk" style="margin-top:0">k</label><input type="number" id="qk" value="10" min="1" max="1000"></div>
+        <div style="flex:2"><label style="margin-top:0">&nbsp;</label><button class="primary" id="go" style="width:100%">Search</button></div>
+      </div>
+      <label class="check"><input type="checkbox" id="qwalk" checked> show the graph walk on the map</label>
+      <div class="msg" id="qmsg"></div>
+    </div>
+    <div>
+      <h2>Metadata keys</h2>
+      <div class="kinds" id="keys"></div>
+    </div>
+    <div style="flex:1;min-height:0;display:flex;flex-direction:column">
+      <h2>Records</h2>
+      <div class="list" id="list"></div>
+      <div class="pager"><button id="prev">‹</button><span id="pageinfo"></span><button id="next">›</button></div>
+    </div>
+  </aside>
+
+  <main>
+    <canvas id="map"></canvas>
+    <div class="maptitle" id="maptitle">loading map…</div>
+    <div class="walkctl" id="walkctl" hidden>
+      <span>walk</span><button id="replay">replay</button><span class="step" id="walkstep"></span>
+    </div>
+    <div class="legend">
+      <span><i style="background:var(--accent)"></i>result</span>
+      <span><i style="background:var(--walk)"></i>expanded by the walk</span>
+      <span><i style="background:#fff;border:2px solid var(--accent);width:8px;height:8px"></i>query</span>
+      <span>scroll to zoom, drag to pan, click a point to inspect</span>
+    </div>
+    <div class="tip" id="tip"></div>
+  </main>
+
+  <section class="right">
+    <div class="results">
+      <h2 id="rtitle">Results</h2>
+      <div class="meta-line" id="rline">Search to see the nearest records here.</div>
+      <div id="hits"></div>
+    </div>
+    <div class="inspector" id="inspector">
+      <h2>Record</h2>
+      <div class="meta-line">Click a result, a record, or a point on the map.</div>
+    </div>
+  </section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+};
+const fmt = (n) => n.toLocaleString();
+const fscore = (s) => Math.abs(s) >= 1000 ? fmt(Math.round(s)) : Math.abs(s) >= 10 ? s.toFixed(1) : s.toFixed(4);
+const CLUSTER = ["#8FA3BF","#A3B18A","#C9A27E","#B6A0C8","#89B4B0","#C98C8C","#9FB6CC","#B8B29A","#A9A5C4","#9CB89A","#C4A6A6","#9BB5A7"];
+let info = null, mapData = null, view = {x:0, y:0, z:1}, selected = null;
+let result = {hits:[], walk:[], q:null};
+let anim = {t:0, total:0, running:false};
+let page = 0; const PAGE = 40;
+
+/* ---------- store info ---------- */
+async function loadInfo() {
+  info = await api("/api/info");
+  $("path").textContent = info.path;
+  $("ver").textContent = info.version || "";
+  const ix = info.index;
+  $("facts").innerHTML =
+    `<span><b>${fmt(info.len)}</b> records</span>` +
+    `<span>dim <b>${info.dim}</b></span><span><b>${info.metric}</b></span>` +
+    (ix ? `<span>index <b>${fmt(ix.nodes)}</b> nodes, ${ix.storage}${ix.pq_subspaces ? ", PQ " + ix.pq_subspaces : ""}${ix.tombstones ? ", " + fmt(ix.tombstones) + " tombstones" : ""}</span>`
+        : `<span>no index yet</span>`) +
+    `<span><b>${fmt(info.delta_len)}</b> in the tail</span>` +
+    (info.read_only ? `<span class="ro">read-only</span>` : "");
+  $("ckpt").disabled = info.read_only;
+  $("keys").innerHTML = info.keys.length
+    ? info.keys.map(k => `<div><code>${k.name}</code> ${k.kind}</div>`).join("")
+    : "<div>none yet</div>";
+  const s = info.stats;
+  $("foot").innerHTML =
+    `<span>searches <b>${fmt(s.searches)}</b></span>` +
+    `<span>graph walks <b>${fmt(s.graph_walks)}</b></span>` +
+    `<span>filtered walks <b>${fmt(s.filtered_walks)}</b></span>` +
+    `<span>exact scans <b>${fmt(s.exact_scans)}</b></span>` +
+    `<span>text <b>${fmt(s.text_searches)}</b></span>` +
+    `<span>inserts <b>${fmt(s.inserts)}</b></span>` +
+    `<span>deletes <b>${fmt(s.deletes)}</b></span>` +
+    `<span>checkpoints <b>${fmt(s.checkpoints)}</b>${s.last_checkpoint_ms ? " (last " + fmt(s.last_checkpoint_ms) + " ms)" : ""}</span>`;
+}
+
+/* ---------- records list ---------- */
+function metaShort(m) {
+  if (!m) return "";
+  return Object.entries(m).map(([k, v]) => `${k}=${typeof v === "object" ? "sparse[" + v.indices.length + "]" : v}`).join("  ");
+}
+async function loadList() {
+  const j = await api(`/api/ids?offset=${page * PAGE}&limit=${PAGE}`);
+  $("list").innerHTML = j.records.map(r => `<div class="r" data-id="${r.id}"><span class="id">${r.id}</span><span class="m">${metaShort(r.meta)}</span></div>`).join("");
+  $("pageinfo").textContent = `${fmt(j.offset + 1)}–${fmt(Math.min(j.offset + PAGE, j.total))} of ${fmt(j.total)}`;
+  $("prev").disabled = page === 0; $("next").disabled = (page + 1) * PAGE >= j.total;
+  for (const el of $("list").querySelectorAll(".r")) el.onclick = () => inspect(+el.dataset.id);
+}
+$("prev").onclick = () => { page = Math.max(0, page - 1); loadList(); };
+$("next").onclick = () => { page += 1; loadList(); };
+
+/* ---------- inspector ---------- */
+async function inspect(id) {
+  selected = id;
+  draw();
+  let r;
+  try { r = await api(`/api/record?id=${id}`); } catch (e) { $("inspector").innerHTML = `<h2>Record</h2><div class="msg err">${e.message}</div>`; return; }
+  const v = r.vector;
+  const allInt = v.every(x => Number.isInteger(x));
+  const head = v.slice(0, 12).map(x => allInt ? String(x) : x.toFixed(3)).join(" ");
+  $("inspector").innerHTML = `
+    <h2>Record</h2>
+    <div class="row"><span class="id">${id}</span><button id="from">Search from this record</button></div>
+    <svg class="spark" id="spark" viewBox="0 0 ${v.length} 100" preserveAspectRatio="none"></svg>
+    <div class="vec">${head}${v.length > 12 ? " … " + v.length + " dims" : ""}</div>
+    <label for="metaedit">Metadata${info.read_only ? " (read-only store)" : ""}</label>
+    <textarea id="metaedit" style="min-height:120px" ${info.read_only ? "readonly" : ""}>${JSON.stringify(r.meta, null, 2)}</textarea>
+    ${info.read_only ? "" : `<div class="actions"><button class="primary" id="save">Save metadata</button><button class="danger" id="del">Delete record</button></div>`}
+    <div class="msg" id="imsg"></div>`;
+  const lo = Math.min(...v), hi = Math.max(...v), span = (hi - lo) || 1;
+  $("spark").innerHTML = `<polyline fill="none" stroke="#2E4BE8" stroke-width="1" vector-effect="non-scaling-stroke" points="${v.map((x, i) => `${i},${100 - (x - lo) / span * 100}`).join(" ")}"/>`;
+  $("from").onclick = () => { $("qid").value = id; $("qtext").value = ""; search(); };
+  if ($("save")) $("save").onclick = async () => {
+    let meta;
+    try { meta = JSON.parse($("metaedit").value); } catch (e) { $("imsg").className = "msg err"; $("imsg").textContent = "not valid JSON: " + e.message; return; }
+    try {
+      await api(`/api/record?id=${id}`, {method: "POST", body: JSON.stringify({meta})});
+      $("imsg").className = "msg ok"; $("imsg").textContent = "saved: written to the log, in the index at the next checkpoint";
+      $("metaedit").value = JSON.stringify(meta, null, 2);
+      loadInfo(); loadList();
+    } catch (e) { $("imsg").className = "msg err"; $("imsg").textContent = e.message; }
+  };
+  if ($("del")) $("del").onclick = async () => {
+    if (!confirm(`Delete record ${id}? It leaves the log now and the index at the next checkpoint.`)) return;
+    try {
+      await api(`/api/record?id=${id}`, {method: "DELETE"});
+      $("inspector").innerHTML = `<h2>Record</h2><div class="msg ok">record ${id} deleted</div>`;
+      selected = null; result.hits = result.hits.filter(h => h.id !== id); draw();
+      loadInfo(); loadList();
+    } catch (e) { $("imsg").className = "msg err"; $("imsg").textContent = e.message; }
+  };
+}
+
+/* ---------- search ---------- */
+async function search() {
+  const body = {k: +$("qk").value || 10, walk: $("qwalk").checked};
+  const id = $("qid").value.trim(); if (id) body.id = +id;
+  const text = $("qtext").value.trim(); if (text) body.text = text;
+  const f = $("qfilter").value.trim();
+  if (f) { try { body.filter = JSON.parse(f); } catch (e) { $("qmsg").className = "msg err"; $("qmsg").textContent = "filter is not valid JSON: " + e.message; return; } }
+  if (!id && !text) { $("qmsg").className = "msg err"; $("qmsg").textContent = "give a record id, text, or both"; return; }
+  $("go").disabled = true; $("qmsg").className = "msg"; $("qmsg").textContent = "searching…";
+  try {
+    const j = await api("/api/search", {method: "POST", body: JSON.stringify(body)});
+    result = {hits: j.hits, walk: j.walk, q: j.query_xy};
+    $("qmsg").textContent = "";
+    $("rtitle").textContent = `Results · ${j.mode}`;
+    $("rline").textContent = `${j.hits.length} of k=${body.k} in ${j.micros >= 1000 ? (j.micros / 1000).toFixed(2) + " ms" : j.micros + " µs"}` + (j.walk.length ? ` · the walk expanded ${j.walk.length} nodes` : "");
+    $("hits").innerHTML = j.hits.map((h, i) => `<div class="hit" data-id="${h.id}"><span class="id">${h.id}</span><span class="meta">${metaShort(h.meta)}</span><span class="score">${fscore(h.score)}</span></div>`).join("");
+    for (const el of $("hits").querySelectorAll(".hit")) el.onclick = () => { for (const o of $("hits").children) o.classList.remove("sel"); el.classList.add("sel"); inspect(+el.dataset.id); };
+    if (j.walk.length) { $("walkctl").hidden = false; startAnim(); } else { $("walkctl").hidden = true; draw(); }
+    loadInfo();
+  } catch (e) { $("qmsg").className = "msg err"; $("qmsg").textContent = e.message; }
+  $("go").disabled = false;
+}
+$("go").onclick = search;
+for (const id of ["qid", "qtext"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") search(); });
+$("ckpt").onclick = async () => {
+  $("ckpt").disabled = true; $("ckpt").textContent = "building…";
+  try { const j = await api("/api/checkpoint", {method: "POST"}); $("ckpt").textContent = `Checkpoint (${fmt(j.ms)} ms)`; mapData = null; await loadInfo(); await loadMap(); }
+  catch (e) { $("ckpt").textContent = "Checkpoint"; alert(e.message); }
+  $("ckpt").disabled = false;
+};
+
+/* ---------- map ---------- */
+const canvas = $("map"), ctx = canvas.getContext("2d");
+function resize() {
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+  draw();
+}
+window.addEventListener("resize", resize);
+async function loadMap() {
+  $("maptitle").textContent = "loading map…";
+  try {
+    mapData = await api("/api/map?n=4000&clusters=8");
+    $("maptitle").innerHTML = `<b>${fmt(mapData.sampled)}</b> of ${fmt(mapData.total)} records, PCA to 2-D, ${mapData.clusters} k-means colours`;
+  } catch (e) { $("maptitle").textContent = e.message; mapData = null; }
+  draw();
+}
+function toScreen(x, y) {
+  const w = canvas.width, h = canvas.height, s = Math.min(w, h) * 0.42 * view.z;
+  return [w / 2 + (x + view.x) * s, h / 2 - (y + view.y) * s];
+}
+function draw() {
+  const w = canvas.width, h = canvas.height, dpr = window.devicePixelRatio || 1;
+  ctx.clearRect(0, 0, w, h);
+  if (!mapData) return;
+  const r = 2.2 * dpr;
+  for (const [id, x, y, c] of mapData.points) {
+    const [sx, sy] = toScreen(x, y);
+    ctx.fillStyle = CLUSTER[c % CLUSTER.length];
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // walk: trail in expansion order up to the animation step
+  const n = anim.running ? anim.t : result.walk.length;
+  if (result.walk.length) {
+    ctx.strokeStyle = "#D97706"; ctx.lineWidth = 1 * dpr; ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) { const p = result.walk[i]; if (p.x === undefined) continue; const [sx, sy] = toScreen(p.x, p.y); i === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy); }
+    ctx.stroke(); ctx.globalAlpha = 1;
+    for (let i = 0; i < n; i++) { const p = result.walk[i]; if (p.x === undefined) continue; const [sx, sy] = toScreen(p.x, p.y); ctx.fillStyle = "#D97706"; ctx.beginPath(); ctx.arc(sx, sy, (i === n - 1 ? 4.5 : 3) * dpr, 0, Math.PI * 2); ctx.fill(); }
+  }
+  if (!anim.running) for (const hh of result.hits) {
+    if (hh.x === undefined) continue;
+    const [sx, sy] = toScreen(hh.x, hh.y);
+    ctx.fillStyle = "#2E4BE8"; ctx.beginPath(); ctx.arc(sx, sy, 4 * dpr, 0, Math.PI * 2); ctx.fill();
+  }
+  if (result.q) {
+    const [sx, sy] = toScreen(result.q[0], result.q[1]);
+    ctx.strokeStyle = "#2E4BE8"; ctx.lineWidth = 2.5 * dpr; ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(sx, sy, 6 * dpr, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+  if (selected !== null) {
+    const p = mapData.points.find(p => p[0] === selected) || result.hits.find(h => h.id === selected) || result.walk.find(h => h.id === selected);
+    if (p) { const [x, y] = Array.isArray(p) ? [p[1], p[2]] : [p.x, p.y]; if (x !== undefined) { const [sx, sy] = toScreen(x, y); ctx.strokeStyle = "#101828"; ctx.lineWidth = 1.5 * dpr; ctx.beginPath(); ctx.arc(sx, sy, 8 * dpr, 0, Math.PI * 2); ctx.stroke(); } }
+  }
+}
+function startAnim() {
+  anim = {t: 0, total: result.walk.length, running: true};
+  const perFrame = Math.max(1, Math.ceil(anim.total / 120));
+  function tick() {
+    anim.t = Math.min(anim.total, anim.t + perFrame);
+    $("walkstep").textContent = `${anim.t} / ${anim.total}`;
+    draw();
+    if (anim.t < anim.total) requestAnimationFrame(tick); else { anim.running = false; draw(); }
+  }
+  requestAnimationFrame(tick);
+}
+$("replay").onclick = startAnim;
+// zoom, pan, hover, click
+canvas.addEventListener("wheel", e => { e.preventDefault(); view.z *= Math.exp(-e.deltaY * 0.0015); view.z = Math.min(40, Math.max(0.3, view.z)); draw(); }, {passive: false});
+let drag = null;
+canvas.addEventListener("mousedown", e => { drag = {x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false}; });
+window.addEventListener("mousemove", e => {
+  const dpr = window.devicePixelRatio || 1;
+  if (drag) {
+    const s = Math.min(canvas.width, canvas.height) * 0.42 * view.z / dpr;
+    view.x = drag.vx + (e.clientX - drag.x) / s; view.y = drag.vy - (e.clientY - drag.y) / s;
+    if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 3) drag.moved = true;
+    draw(); return;
+  }
+  const near = nearest(e); const tip = $("tip");
+  if (near) { tip.style.display = "block"; const r = canvas.getBoundingClientRect(); tip.style.left = (e.clientX - r.left) + "px"; tip.style.top = (e.clientY - r.top) + "px"; tip.textContent = `id ${near.id}` + (near.score !== undefined ? ` · ${fscore(near.score)}` : ""); }
+  else tip.style.display = "none";
+});
+window.addEventListener("mouseup", e => { if (drag && !drag.moved) { const near = nearest(e); if (near) inspect(near.id); } drag = null; });
+function nearest(e) {
+  if (!mapData) return null;
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const mx = (e.clientX - r.left) * dpr, my = (e.clientY - r.top) * dpr;
+  let best = null, bd = (9 * dpr) ** 2;
+  const consider = (id, x, y, score) => { if (x === undefined) return; const [sx, sy] = toScreen(x, y); const d = (sx - mx) ** 2 + (sy - my) ** 2; if (d < bd) { bd = d; best = {id, score}; } };
+  for (const h of result.hits) consider(h.id, h.x, h.y, h.score);
+  for (const h of result.walk) consider(h.id, h.x, h.y, h.score);
+  for (const [id, x, y] of mapData.points) consider(id, x, y);
+  return best;
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  await loadInfo();
+  resize();
+  loadList();
+  await loadMap();
+  setInterval(loadInfo, 3000);
+})();
+</script>
+</body>
+</html>

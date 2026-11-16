@@ -4,3 +4,8 @@
 /python/target
 *.so
 __pycache__/
+
+# studio screenshots and playwright output
+/.playwright-mcp/
+/studio-shot-*.png
+/.claude/launch.json
