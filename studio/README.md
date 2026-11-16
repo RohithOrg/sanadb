@@ -8,7 +8,7 @@ leaves the machine.
 ```bash
 cargo install sanadb-studio
 sanadb-studio data/vectors.sana
-# sanadb studio 0.2.1: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
+# sanadb studio 0.2.2: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
 ```
 
 `sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only]`.

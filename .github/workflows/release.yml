@@ -145,8 +145,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
       - run: ls -la dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:

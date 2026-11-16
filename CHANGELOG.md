@@ -5,9 +5,33 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
+## [0.2.2] - 2026-11-16
+
+Store properties, and the studio polish that followed 0.2.1. No format
+level change: the new frame kind is skipped by older readers.
+
+### Added
+- Store properties: `Db::set_property(key, value)`, `property(key)`,
+  `properties()` (Python the same) keep strings with the file, written as
+  log frame kind 7, which older readers skip; visible to readers at once,
+  rewritten into the compacted log at every checkpoint. Studio records
+  `embedding_model` and `embedding_dim` the first time an attached model
+  writes a record, shows the recorded model when none is attached, and
+  warns when the attached model differs from the recorded one.
+- Studio: the walk's head travels along each segment at a pace
+  proportional to the jump, with a continuous scrubber; an "Instant"
+  speed draws the whole walk at once and is remembered; a record's vector
+  can be replaced from the page, from new text (re-embedded) or pasted
+  numbers, under the same id.
+
+### Fixed
+- Release workflow: the PyPI step took the studio binaries along with the
+  wheels and failed; 0.2.1 therefore never reached PyPI. It downloads only
+  wheels and the sdist now.
+
 ## [0.2.1] - 2026-11-16
 
-sanadb studio, bring-your-own embedding model in Rust, Python and studio, and the small public API they needed. No format change.
+sanadb studio, bring-your-own embedding model in Rust, Python and studio, and the small public API they needed. No format change. Published to crates.io; the PyPI upload failed (see 0.2.2).
 
 ### Added
 - `sanadb-studio` (`cargo install sanadb-studio`, or a prebuilt binary
@@ -23,13 +47,6 @@ sanadb studio, bring-your-own embedding model in Rust, Python and studio, and th
   graph walk expanded, in order. The index reader also accepts the
   32-byte footer that 0.2.0 development builds wrote, so stores built with
   them still open.
-- Store properties: `Db::set_property(key, value)`, `property(key)`,
-  `properties()` (Python the same) keep strings with the file, written as
-  a new log frame kind that older readers skip, visible to readers at
-  once, rewritten into the compacted log at every checkpoint. Studio
-  records `embedding_model` and `embedding_dim` when a model is attached,
-  shows the recorded model when none is, and warns when the attached
-  model differs from the recorded one.
 - Bring your own embedding model. Rust: the `Embedder` trait (implemented
   by any closure `Fn(&[&str]) -> Result<Vec<Vec<f32>>>`), `Db::add_text`
   and `Db::search_text_embedded`, and `OpenAiEmbedder` for any
