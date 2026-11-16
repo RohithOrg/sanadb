@@ -48,6 +48,14 @@ See `docs/design/snapshot-and-tail.md`.
   reader still maps it (Windows refuses the delete) the next writer open
   collects it. `Db::index_path()` returns the current file. Stores whose
   index is still the unnumbered `<path>.idx` open as before.
+- Tests: the index file is now fuzzed like the log (400 random bit flips
+  and truncations per run; every open is `Ok` or a corruption error, and an
+  accepted index answers reads without panicking). Found and fixed: a
+  neighbour slot past the end, an id-table slot past the end, and dictionary
+  or posting offsets past the file all read out of bounds. Stores written by
+  the published 0.1.1, 0.1.3 and 0.1.4 crates live in `tests/fixtures/`;
+  each is opened, read back, written to, checkpointed into the current
+  layout and reopened, by the writer and by a read-only `Db`.
 
 ## [0.1.4] - 2026-11-16
 

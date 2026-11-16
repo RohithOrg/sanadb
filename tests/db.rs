@@ -1608,3 +1608,126 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
     eprintln!("writer: {round} rounds, {} records; reader: {rounds} rounds", w.len());
     assert!(rounds > 10);
 }
+
+/// Flip bits in the index file at random; every open must be `Ok` or a
+/// corruption error, never a panic, and a store that opens must answer reads
+/// without panicking. Reads of a damaged-but-accepted index may return wrong
+/// neighbours; they may not read out of bounds.
+#[test]
+fn corrupted_indexes_never_panic() {
+    use sanadb::Filter;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ifuzz.sana");
+    let dim = 4usize;
+    {
+        let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+        for i in 0..1200u64 {
+            let mut m = Metadata::new();
+            m.insert("k".into(), Value::from(["a", "b", "c"][(i % 3) as usize]));
+            m.insert("n".into(), Value::from(i as i64));
+            m.insert("f".into(), Value::from(i as f64 * 0.5));
+            m.insert("b".into(), Value::from(i % 2 == 0));
+            db.insert(i, &vec_of(dim, i), m).unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+    let idx_path = {
+        let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+        db.index_path().unwrap()
+    };
+    let clean_log = std::fs::read(&path).unwrap();
+    let clean_idx = std::fs::read(&idx_path).unwrap();
+    let mut rng = 0xC0FFEEu64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut outcomes = [0usize; 3];
+    for iter in 0..400 {
+        let mut bytes = clean_idx.clone();
+        // Mostly the header, tables and footer: the parts that steer reads.
+        let hot = [(0usize, 64usize), (bytes.len() - 4096, bytes.len())];
+        for _ in 0..1 + next() % 4 {
+            let (lo, hi) = if next() % 4 == 0 { (0, bytes.len()) } else { hot[(next() % 2) as usize] };
+            let pos = lo + (next() % (hi - lo) as u64) as usize;
+            bytes[pos] ^= 1 << (next() % 8);
+        }
+        if next().is_multiple_of(7) {
+            let cut = (next() % bytes.len() as u64) as usize;
+            bytes.truncate(cut.max(64));
+        }
+        std::fs::write(&idx_path, &bytes).unwrap();
+        std::fs::write(&path, &clean_log).unwrap();
+        match Db::open(&path, Options::new(dim as u32)) {
+            Ok(db) => {
+                for id in (0..1200u64).step_by(97) {
+                    let _ = db.get(id);
+                }
+                let _ = db.search(&vec_of(dim, 3), 5);
+                let _ = db.search_where(&vec_of(dim, 3), 5, &Filter::eq("k", "b"));
+                let _ = db.search_where(&vec_of(dim, 3), 5, &Filter::and([Filter::gt("n", 100i64), Filter::lt("f", 400.0f64), Filter::eq("b", true)]));
+                let _ = db.search_filtered(&vec_of(dim, 3), 5, |m| m.contains_key("k"));
+                let _ = db.len();
+                outcomes[0] += 1;
+            }
+            Err(sanadb::Error::Corrupt(_)) | Err(sanadb::Error::NeedsNewerVersion { .. }) | Err(sanadb::Error::HeaderMismatch { .. }) => outcomes[1] += 1,
+            Err(e) => {
+                eprintln!("iteration {iter}: unexpected error class: {e}");
+                outcomes[2] += 1;
+            }
+        }
+    }
+    eprintln!("index fuzz outcomes: ok={} corrupt={} other={}", outcomes[0], outcomes[1], outcomes[2]);
+    assert_eq!(outcomes[2], 0);
+}
+
+/// Stores written by the published 0.1.1, 0.1.3 and 0.1.4 crates
+/// (`tests/fixtures/`, 68 records of dim 4 with two string keys, one delete
+/// and one overwrite before the checkpoint, ten inserts and a delete after).
+/// Each must open, read back exactly, accept new writes, checkpoint into the
+/// current layout and reopen.
+#[test]
+fn opens_stores_written_by_every_published_version() {
+    let vec_of4 = |i: u64| -> Vec<f32> { (0..4u64).map(|d| ((i * 7 + d * 13) % 101) as f32 / 101.0).collect() };
+    for version in ["0.1.1", "0.1.3", "0.1.4"] {
+        let dir = tempfile::tempdir().unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(format!("v{version}"));
+        for name in ["fixture.sana", "fixture.sana.idx"] {
+            std::fs::copy(src.join(name), dir.path().join(name)).unwrap();
+        }
+        let path = dir.path().join("fixture.sana");
+        let check = |db: &Db, stage: &str, len: usize| {
+            assert_eq!(db.len(), len, "{version} {stage}: len");
+            assert!(db.get(5).is_none() && db.get(7).is_none(), "{version} {stage}: deletes");
+            let (v, m) = db.get(1).unwrap();
+            assert_eq!(v, vec_of4(1), "{version} {stage}: vector");
+            assert_eq!(m["k"], "v1", "{version} {stage}: metadata");
+            // 0.1.4 wrote typed ints; the older two wrote strings, kept as strings.
+            if version == "0.1.4" {
+                assert_eq!(m["i"], Value::Int(1), "{version} {stage}");
+            } else {
+                assert_eq!(m["i"], "1", "{version} {stage}");
+            }
+            assert_eq!(db.get(6).unwrap().1["k"], "over", "{version} {stage}: overwrite");
+            assert_eq!(db.get(65).unwrap().1["k"], "tail", "{version} {stage}: log tail");
+            assert_eq!(db.search(&vec_of4(40), 1).unwrap()[0].id, 40, "{version} {stage}: search");
+            let hits = db.search_filtered(&vec_of4(40), 3, |m| m["k"] == "v2").unwrap();
+            assert!(!hits.is_empty() && hits.iter().all(|h| db.get(h.id).unwrap().1["k"] == "v2"), "{version} {stage}: filter");
+        };
+        let db = Db::open(&path, Options::new(4)).unwrap_or_else(|e| panic!("{version}: open: {e}"));
+        check(&db, "opened", 68);
+        // Write with the current version, then move everything into the new layout.
+        db.insert(100, &vec_of4(100), HashMap::from([("k".to_string(), Value::from("new"))])).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.get(100).unwrap().1["k"], "new");
+        assert!(db.index_path().unwrap().to_str().unwrap().contains(".idx."), "{version}: new-style index name");
+        drop(db);
+        let db = Db::open(&path, Options::new(4)).unwrap();
+        check(&db, "after checkpoint and reopen", 69);
+        assert_eq!(db.get(100).unwrap().1["k"], "new");
+        let r = Db::open_read_only(&path, Options::new(4)).unwrap();
+        assert_eq!(r.get(100).unwrap().1["k"], "new");
+    }
+}

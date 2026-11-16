@@ -260,7 +260,8 @@ impl GraphIndex {
                 Ordering::Greater => hi = mid,
                 Ordering::Equal => {
                     let o = t + n * 8 + mid * 4;
-                    return Some(u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()));
+                    let slot = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap());
+                    return ((slot as usize) < n).then_some(slot);
                 }
             }
         }
@@ -697,7 +698,9 @@ fn greedy_in<G: Walkable>(
             nbrs.clear();
             g.neighbors_into(s, nbrs);
             for &nb in nbrs.iter() {
-                if !seen.insert(nb) {
+                // A damaged index may name a slot past the end; skip it
+                // rather than read out of bounds.
+                if nb as usize >= g.len() || !seen.insert(nb) {
                     continue;
                 }
                 let nd = dist(nb);

@@ -407,20 +407,24 @@ impl Attrs {
     }
 
     /// The `Str` dictionary entry for a code.
+    /// Dictionary entry for a code. Every read is bounds-checked against the
+    /// dictionary region: a damaged file yields "" rather than a panic.
     fn dict_str<'b>(&self, b: &'b [u8], a: usize, code: u32) -> &'b str {
-        let (d, _) = self.attrs[a].dict.unwrap();
-        let count = u32::from_le_bytes(b[d..d + 4].try_into().unwrap()) as usize;
-        let offs = d + 8;
-        let heap = offs + (count + 1) * 8;
-        let lo =
-            u64::from_le_bytes(b[offs + code as usize * 8..][..8].try_into().unwrap()) as usize;
-        let hi = u64::from_le_bytes(b[offs + (code as usize + 1) * 8..][..8].try_into().unwrap())
-            as usize;
-        std::str::from_utf8(&b[heap + lo..heap + hi]).unwrap_or("")
+        let Some((d, len)) = self.attrs[a].dict else { return "" };
+        let region = &b[d..(d + len).min(b.len())];
+        let Some(count) = u32_at(region, 0) else { return "" };
+        let offs = 8;
+        let heap = offs + (count as usize + 1) * 8;
+        let (Some(lo), Some(hi)) = (u64_at(region, offs + code as usize * 8), u64_at(region, offs + (code as usize + 1) * 8)) else { return "" };
+        let (lo, hi) = (lo as usize, hi as usize);
+        if lo > hi {
+            return "";
+        }
+        region.get(heap + lo..heap + hi).and_then(|s| std::str::from_utf8(s).ok()).unwrap_or("")
     }
     fn dict_int(&self, b: &[u8], a: usize, i: u32) -> i64 {
-        let (d, _) = self.attrs[a].dict.unwrap();
-        i64::from_le_bytes(b[d + 8 + i as usize * 8..][..8].try_into().unwrap())
+        let Some((d, len)) = self.attrs[a].dict else { return 0 };
+        u64_at(&b[d..(d + len).min(b.len())], 8 + i as usize * 8).map_or(0, |v| v as i64)
     }
     /// Binary search a dictionary: `Ok(code)` or `Err(insertion point)`.
     fn dict_search(&self, b: &[u8], a: usize, v: &Value) -> std::result::Result<u32, u32> {
@@ -446,11 +450,18 @@ impl Attrs {
             return &[];
         };
         let nd = self.attrs[a].n_distinct as usize;
-        let lo = u64::from_le_bytes(b[p + c as usize * 8..][..8].try_into().unwrap()) as usize;
-        let hi =
-            u64::from_le_bytes(b[p + (c as usize + 1) * 8..][..8].try_into().unwrap()) as usize;
+        if c as usize >= nd {
+            return &[];
+        }
+        let (Some(lo), Some(hi)) = (u64_at(b, p + c as usize * 8), u64_at(b, p + (c as usize + 1) * 8)) else { return &[] };
+        let (lo, hi) = (lo as usize, hi as usize);
         let slots = p + (nd + 1) * 8;
-        bytemuck::cast_slice(&b[slots + lo * 4..slots + hi * 4])
+        // Offsets must be ordered, inside the file and 4-aligned; the slots
+        // they name are checked by the caller against `n`.
+        match (lo <= hi).then(|| b.get(slots + lo * 4..slots + hi * 4)).flatten() {
+            Some(bytes) if bytes.len().is_multiple_of(4) && (bytes.as_ptr() as usize).is_multiple_of(4) => bytemuck::cast_slice(bytes),
+            _ => &[],
+        }
     }
 
     // ------------------------------------------------------------ predicates
@@ -690,7 +701,8 @@ impl Attrs {
     /// ascending.
     pub(crate) fn candidates(&self, b: &[u8], p: &Pred) -> Option<Vec<u32>> {
         let seed = self.seed(b, p)?;
-        Some(seed.into_iter().filter(|&s| self.pass(b, p, s)).collect())
+        let n = self.n as u32;
+        Some(seed.into_iter().filter(|&s| s < n && self.pass(b, p, s)).collect())
     }
 
     /// Smallest posting-backed superset of the slots passing `p`.
