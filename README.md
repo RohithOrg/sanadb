@@ -428,5 +428,8 @@ cargo bench --bench search
 cd python && maturin develop --release && pytest tests
 ```
 
-Releases are cut by tagging `vX.Y.Z`; the workflow publishes the crate and
-the wheels. Licensed under MIT or Apache-2.0, at your option.
+`scripts/ci-local.sh` runs the Linux CI steps (clippy with `-D warnings`,
+tests, example build) in Docker on x86-64 and arm64 before a push; the
+x86-64 run is emulated on Apple Silicon and is the only local way to compile
+the AVX2 paths. Releases are cut by tagging `vX.Y.Z`; the workflow publishes
+the crate and the wheels. Licensed under MIT or Apache-2.0, at your option.

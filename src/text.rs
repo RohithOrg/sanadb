@@ -64,7 +64,7 @@ pub(crate) fn write(
     let mut by_term: HashMap<String, Vec<(u32, u16)>> = HashMap::new();
     let mut n_docs = 0u64;
     let mut total_len = 0u64;
-    for s in 0..n {
+    for (s, len_slot) in lengths.iter_mut().enumerate() {
         let Some(text) = text_of(s as u32) else {
             continue;
         };
@@ -74,7 +74,7 @@ pub(crate) fn write(
         }
         n_docs += 1;
         total_len += tokens.len() as u64;
-        lengths[s] = tokens.len().min(u32::MAX as usize) as u32;
+        *len_slot = tokens.len().min(u32::MAX as usize) as u32;
         for (term, tf) in term_freqs(&tokens) {
             by_term
                 .entry(term.to_string())
