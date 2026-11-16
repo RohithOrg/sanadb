@@ -1731,3 +1731,66 @@ fn opens_stores_written_by_every_published_version() {
         assert_eq!(r.get(100).unwrap().1["k"], "new");
     }
 }
+
+#[test]
+fn write_batch_is_all_or_nothing() {
+    use sanadb::Batch;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("batch.sana");
+    let dim = 4usize;
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..10u64 {
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "old")])).unwrap();
+    }
+    // A bad vector anywhere leaves the store untouched.
+    let bad = Batch::new().insert(100, &vec_of(dim, 100), HashMap::new()).insert(101, &[f32::NAN; 4], HashMap::new());
+    assert!(matches!(db.write_batch(bad), Err(sanadb::Error::InvalidVector)));
+    assert!(db.get(100).is_none());
+    // A type conflict within the batch too.
+    let bad = Batch::new()
+        .insert(100, &vec_of(dim, 100), HashMap::from([("n".to_string(), Value::from(1i64))]))
+        .insert(101, &vec_of(dim, 101), HashMap::from([("n".to_string(), Value::from("1"))]));
+    assert!(matches!(db.write_batch(bad), Err(sanadb::Error::TypeMismatch { .. })));
+    assert!(db.get(100).is_none() && db.len() == 10);
+    // A good batch: inserts, an overwrite and deletes, visible together.
+    let r = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(r.len(), 10);
+    let good = Batch::new()
+        .insert(100, &vec_of(dim, 100), meta(&[("k", "new")]))
+        .insert(3, &vec_of(dim, 3), meta(&[("k", "over")]))
+        .delete(4)
+        .delete(999)
+        .insert(101, &vec_of(dim, 101), meta(&[("k", "new")]));
+    db.write_batch(good).unwrap();
+    assert_eq!(db.len(), 11);
+    assert_eq!(db.get(3).unwrap().1["k"], "over");
+    assert!(db.get(4).is_none());
+    assert_eq!(r.len(), 11, "reader sees the whole batch at once");
+    assert_eq!(r.get(101).unwrap().1["k"], "new");
+    drop(db);
+    // Crash mid-batch: cut the log just before the Commit frame (12 bytes:
+    // 8-byte frame header, 4-byte body) and reopen. The batch must vanish
+    // entirely, the earlier state must be intact, and new writes must work.
+    let bytes = std::fs::read(&path).unwrap();
+    let before = bytes.len();
+    std::fs::write(&path, &bytes[..before - 12]).unwrap();
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), 10, "torn batch must not be applied");
+    assert_eq!(db.get(3).unwrap().1["k"], "old");
+    assert!(db.get(4).is_some() && db.get(100).is_none() && db.get(101).is_none());
+    db.insert(200, &vec_of(dim, 200), HashMap::new()).unwrap();
+    drop(db);
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), 11);
+    assert!(db.get(200).is_some() && db.get(100).is_none(), "the cut-off batch stays gone after more writes");
+    assert_eq!(r.len(), 11);
+    assert!(r.get(200).is_some() && r.get(100).is_none());
+    // Batches survive checkpoint and are part of the compacted log's tail.
+    db.write_batch(Batch::new().insert(300, &vec_of(dim, 300), HashMap::new()).delete(0)).unwrap();
+    db.checkpoint().unwrap();
+    db.write_batch(Batch::new().insert(301, &vec_of(dim, 301), HashMap::new())).unwrap();
+    drop(db);
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), 12);
+    assert!(db.get(0).is_none() && db.get(300).is_some() && db.get(301).is_some());
+}

@@ -203,3 +203,15 @@ def test_read_only_follows_writer(tmp_path):
     assert [i for i, _ in r.search(np.zeros(4, dtype=np.float32), k=1)] == [2]
     with pytest.raises(PermissionError):
         r.insert(3, np.ones(4, dtype=np.float32))
+
+
+def test_insert_many_is_atomic_and_delete_many(tmp_path):
+    db = sanadb.Db(str(tmp_path / "b.sana"), dim=4)
+    vecs = np.ones((3, 4), dtype=np.float32)
+    with pytest.raises(TypeError):
+        db.insert_many([1, 2, 3], vecs, [{"n": 1}, {"n": "x"}, None])
+    assert db.get(1) is None
+    db.insert_many([1, 2, 3], vecs, [{"n": 1}, {"n": 2}, None])
+    assert len(db) == 3
+    db.delete_many([1, 3, 99])
+    assert len(db) == 1 and db.get(2) is not None

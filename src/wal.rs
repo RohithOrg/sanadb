@@ -50,6 +50,11 @@ const KIND_META: u8 = 3;
 /// with (`<path>.idx.<id as 16 hex digits>`). A log without one pairs with
 /// the unnumbered `<path>.idx` or with no index.
 const KIND_SNAPSHOT: u8 = 4;
+/// Brackets of an atomic batch: frames between `Begin` and `Commit` take
+/// effect together or not at all. A `Begin` without its `Commit` at the end
+/// of the log is a crashed batch and is dropped (the writer truncates it).
+const KIND_BEGIN: u8 = 5;
+const KIND_COMMIT: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
@@ -75,6 +80,8 @@ pub(crate) enum Entry {
     Snapshot {
         id: u64,
     },
+    Begin,
+    Commit,
 }
 
 /// What replay yields. Insert carries the vector's byte offset in the file
@@ -89,6 +96,11 @@ pub(crate) enum Replayed {
     Snapshot {
         id: u64,
     },
+    /// `at` is the frame's file offset, so a dangling batch can be cut off.
+    Begin {
+        at: u64,
+    },
+    Commit,
     Delete {
         id: u64,
     },
@@ -219,7 +231,15 @@ impl Wal {
                     requested: (wanted.dim, wanted.metric),
                 });
             }
-            read_entries(&mut file, header.dim)?
+            let (mut entries, mut len) = read_entries(&mut file, header.dim)?;
+            // A batch whose Commit never made it is a crash mid-batch: drop
+            // its frames and write the next ones over them.
+            if let Some(cut) = dangling_batch(&entries) {
+                let begin = entries.iter().position(|e| matches!(e, Replayed::Begin { at } if *at == cut)).unwrap();
+                entries.truncate(begin);
+                len = cut;
+            }
+            (entries, len)
         } else {
             write_header(&mut file, wanted)?;
             file.sync_all()?;
@@ -419,6 +439,8 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
             Replayed::Delete { id } => Entry::Delete { id },
             Replayed::Meta { id, meta } => Entry::Meta { id, meta },
             Replayed::Snapshot { id } => Entry::Snapshot { id },
+            Replayed::Begin { .. } => Entry::Begin,
+            Replayed::Commit => Entry::Commit,
         });
     }
     let tmp = path.with_extension("migrate.tmp");
@@ -458,6 +480,19 @@ fn read_header(file: &mut File) -> Result<Header> {
     let dim = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let metric = Metric::from_u8(buf[12]).ok_or(Error::Corrupt("unknown metric"))?;
     Ok(Header { dim, metric })
+}
+
+/// Offset of the last `Begin` that has no `Commit` after it, if any.
+fn dangling_batch(entries: &[Replayed]) -> Option<u64> {
+    let mut open: Option<u64> = None;
+    for e in entries {
+        match e {
+            Replayed::Begin { at } => open = Some(*at),
+            Replayed::Commit => open = None,
+            _ => {}
+        }
+    }
+    open
 }
 
 /// Parse the frames in `bytes` starting at `from`, stopping at the first
@@ -559,6 +594,8 @@ fn encode(entry: &Entry, out: &mut Vec<u8>) {
             out.extend_from_slice(&[KIND_SNAPSHOT, 0, 0, 0]);
             out.extend_from_slice(&id.to_le_bytes());
         }
+        Entry::Begin => out.extend_from_slice(&[KIND_BEGIN, 0, 0, 0]),
+        Entry::Commit => out.extend_from_slice(&[KIND_COMMIT, 0, 0, 0]),
     }
     while !out.len().is_multiple_of(4) {
         out.push(0);
@@ -617,6 +654,8 @@ fn decode_known(body: &[u8], dim: u32, body_off: u64, tagged: bool) -> Option<Op
         }
         KIND_DELETE => Replayed::Delete { id: c.u64()? },
         KIND_SNAPSHOT => Replayed::Snapshot { id: c.u64()? },
+        KIND_BEGIN => Replayed::Begin { at: body_off - 8 },
+        KIND_COMMIT => Replayed::Commit,
         KIND_META => {
             let id = c.u64()?;
             Replayed::Meta {

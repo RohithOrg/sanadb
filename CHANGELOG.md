@@ -48,6 +48,12 @@ See `docs/design/snapshot-and-tail.md`.
   reader still maps it (Windows refuses the delete) the next writer open
   collects it. `Db::index_path()` returns the current file. Stores whose
   index is still the unnumbered `<path>.idx` open as before.
+- `Db::write_batch(Batch)`: inserts and deletes applied atomically. The log
+  brackets them in `Begin`/`Commit` frames (kinds 5 and 6); replay applies a
+  batch only on its `Commit`, a writer opening a log that ends mid-batch cuts
+  the batch off, and a reader never sees part of one. Everything is validated
+  before anything is written, including type consistency within the batch.
+  Python `insert_many` is now one batch, and `delete_many(ids)` is new.
 - Tests: the index file is now fuzzed like the log (400 random bit flips
   and truncations per run; every open is `Ok` or a corruption error, and an
   accepted index answers reads without panicking). Found and fixed: a

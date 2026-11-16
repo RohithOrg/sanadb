@@ -286,6 +286,42 @@ pub struct IndexStats {
     pub tombstones: usize,
 }
 
+/// Inserts and deletes to apply together with `Db::write_batch`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Batch {
+    ops: Vec<BatchOp>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BatchOp {
+    Insert { id: u64, vector: Vec<f32>, meta: Metadata },
+    Delete { id: u64 },
+}
+
+impl Batch {
+    pub fn new() -> Batch {
+        Batch::default()
+    }
+    pub fn insert(mut self, id: u64, vector: &[f32], meta: Metadata) -> Batch {
+        self.ops.push(BatchOp::Insert {
+            id,
+            vector: vector.to_vec(),
+            meta,
+        });
+        self
+    }
+    pub fn delete(mut self, id: u64) -> Batch {
+        self.ops.push(BatchOp::Delete { id });
+        self
+    }
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
 /// How a search restricts its results.
 #[derive(Clone, Copy)]
 enum Spec<'a> {
@@ -328,6 +364,9 @@ struct Inner {
     deletes_since_snapshot: Option<HashSet<u64>>,
     /// Log entries since the last checkpoint. Drives automatic compaction.
     log_entries: usize,
+    /// Frames of a batch whose `Commit` has not been seen yet (a reader
+    /// mid-refresh, or a writer replaying); applied together on `Commit`.
+    pending: Option<Vec<Replayed>>,
     /// Id of the index file this log pairs with (`<path>.idx.<id>`); `None`
     /// for the unnumbered `<path>.idx` of stores last checkpointed before
     /// 0.2.0, or for a store that has no index yet.
@@ -440,6 +479,7 @@ impl Db {
             write_seq: 0,
             deletes_since_snapshot: None,
             log_entries: entries.len(),
+            pending: None,
             snapshot,
         };
         if let Some(g) = &inner.graph {
@@ -601,6 +641,86 @@ impl Db {
         };
         self.maybe_auto_checkpoint(garbage)?;
         Ok(true)
+    }
+
+    /// Apply a batch of inserts and deletes atomically: after a crash either
+    /// all of them are in the store or none is, and a reader never sees a
+    /// prefix. Everything is validated before anything is written, so a bad
+    /// vector or a type conflict anywhere in the batch leaves the store
+    /// unchanged. The whole batch is written under one lock; a batch of a
+    /// million records holds writers and readers off for its duration.
+    pub fn write_batch(&self, batch: Batch) -> Result<()> {
+        if batch.ops.is_empty() {
+            return Ok(());
+        }
+        // Validate shape and values first; types need the lock.
+        let mut prepared = Vec::with_capacity(batch.ops.len());
+        for op in &batch.ops {
+            match op {
+                BatchOp::Insert { id, vector, meta } => {
+                    if vector.len() != self.header.dim as usize {
+                        return Err(Error::DimMismatch {
+                            expected: self.header.dim,
+                            got: vector.len(),
+                        });
+                    }
+                    if meta.len() > u16::MAX as usize
+                        || meta.iter().any(|(k, v)| {
+                            k.len() > u16::MAX as usize
+                                || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)
+                        })
+                    {
+                        return Err(Error::MetaTooLarge);
+                    }
+                    let v = prepare(self.header.metric, vector)?.into_owned();
+                    prepared.push(Entry::Insert {
+                        id: *id,
+                        vector: v,
+                        meta: meta.clone(),
+                    });
+                }
+                BatchOp::Delete { id } => prepared.push(Entry::Delete { id: *id }),
+            }
+        }
+        let garbage = {
+            let mut i = self.write()?;
+            // Types: against the store, and consistent within the batch.
+            let mut batch_types: HashMap<&str, Kind> = HashMap::new();
+            for e in &prepared {
+                if let Entry::Insert { meta, .. } = e {
+                    i.check_types(meta)?;
+                    for (k, v) in meta {
+                        match batch_types.get(k.as_str()) {
+                            Some(&t) if t != v.kind() => {
+                                return Err(Error::TypeMismatch {
+                                    key: k.clone(),
+                                    expected: t,
+                                    got: v.kind(),
+                                });
+                            }
+                            Some(_) => {}
+                            None => {
+                                batch_types.insert(k, v.kind());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut frames = Vec::with_capacity(prepared.len() + 2);
+            frames.push(Entry::Begin);
+            frames.extend(prepared);
+            frames.push(Entry::Commit);
+            let offs = i.append_many(&frames, self.opts.sync_every_write)?;
+            for (e, off) in frames.into_iter().zip(offs) {
+                match e {
+                    Entry::Insert { id, meta, .. } => i.apply_insert(id, off, meta),
+                    Entry::Delete { id } => i.apply_delete(id),
+                    _ => {}
+                }
+            }
+            i.garbage()
+        };
+        self.maybe_auto_checkpoint(garbage)
     }
 
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Metadata)> {
@@ -1030,6 +1150,21 @@ impl Inner {
     /// Apply one replayed log frame.
     fn replay(&mut self, e: Replayed) {
         match e {
+            Replayed::Begin { .. } => self.pending = Some(Vec::new()),
+            Replayed::Commit => {
+                for e in self.pending.take().unwrap_or_default() {
+                    self.replay_one(e);
+                }
+            }
+            e if self.pending.is_some() => self.pending.as_mut().unwrap().push(e),
+            e => self.replay_one(e),
+        }
+    }
+
+    /// Apply a frame outside any batch.
+    fn replay_one(&mut self, e: Replayed) {
+        match e {
+            Replayed::Begin { .. } | Replayed::Commit => {}
             Replayed::Insert {
                 id,
                 vector_off,
@@ -1119,6 +1254,22 @@ impl Inner {
     }
 
     /// Returns the vector offset for inserts (meaningless for other kinds).
+    /// Append several frames with one flush (or fsync) at the end. Returns
+    /// each frame's vector offset (meaningful for inserts).
+    fn append_many(&mut self, entries: &[Entry], sync: bool) -> Result<Vec<u64>> {
+        let mut offs = Vec::with_capacity(entries.len());
+        for e in entries {
+            offs.push(self.wal.append(e)?);
+        }
+        if sync {
+            self.wal.sync()?;
+        } else {
+            self.wal.flush()?;
+        }
+        self.log_entries += entries.len();
+        Ok(offs)
+    }
+
     fn append(&mut self, e: &Entry, sync: bool) -> Result<u64> {
         let off = self.wal.append(e)?;
         if sync {

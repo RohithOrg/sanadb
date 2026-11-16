@@ -7,7 +7,7 @@ use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use sanadb_core::{Filter as Expr, GraphParams, Metadata, Metric, Options, Value};
+use sanadb_core::{Batch, Filter as Expr, GraphParams, Metadata, Metric, Options, Value};
 
 fn err(e: sanadb_core::Error) -> PyErr {
     match e {
@@ -298,11 +298,14 @@ impl PyDb {
         let dim = shape[1];
         let flat: Vec<f32> = vectors.as_array().iter().copied().collect();
         let db = self.inner.clone();
+        // One atomic batch: all rows land or none does, and a reader never
+        // sees part of them.
         py.allow_threads(move || {
+            let mut b = Batch::new();
             for (i, (id, m)) in ids.into_iter().zip(metas).enumerate() {
-                db.insert(id, &flat[i * dim..(i + 1) * dim], m)?;
+                b = b.insert(id, &flat[i * dim..(i + 1) * dim], m);
             }
-            Ok(())
+            db.write_batch(b)
         })
         .map_err(err)
     }
@@ -310,6 +313,12 @@ impl PyDb {
     fn delete(&self, py: Python<'_>, id: u64) -> PyResult<bool> {
         let db = self.inner.clone();
         py.allow_threads(move || db.delete(id)).map_err(err)
+    }
+
+    /// Delete several records atomically. Ids that do not exist are ignored.
+    fn delete_many(&self, py: Python<'_>, ids: Vec<u64>) -> PyResult<()> {
+        let db = self.inner.clone();
+        py.allow_threads(move || db.write_batch(ids.into_iter().fold(Batch::new(), |b, id| b.delete(id)))).map_err(err)
     }
 
     /// `(vector, meta)` or `None`.
