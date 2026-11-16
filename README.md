@@ -106,6 +106,10 @@ ids, scores = db.search_many(queries, k=10)   # (n, k) arrays, all cores
 db.checkpoint()
 ```
 
+`Options::text_field("body")` indexes a metadata key's text for keyword
+search: `search_text` is BM25 over an inverted index in the index file
+(SciFact nDCG@10 0.662, matching the reference implementations), and
+`search_hybrid` fuses it with the vector result by reciprocal rank.
 `Options::storage(Storage::I8)` keeps indexed vectors as 8-bit codes (half
 the index file on SIFT1M, under a point of recall); `Db::write_batch`
 applies inserts and deletes atomically; `Db::open_read_only` opens a store
@@ -396,9 +400,9 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. Hybrid search: BM25 over a text field and learned sparse vectors, fused
-   with the graph result. [Design note](docs/design/hybrid-search.md),
-   measured on BEIR against Pyserini before it ships.
+1. Hybrid search, the rest of the [design note](docs/design/hybrid-search.md):
+   MaxScore skipping for long posting lists, weighted fusion, learned sparse
+   vectors. BM25 and reciprocal rank fusion are in.
 2. x86 kernels: AVX2 for build, exact scan and re-ranking, where the
    default target has no FMA. Query latency is memory-bound and will not
    move; builds and scans will. The int8 path gets a fused kernel.

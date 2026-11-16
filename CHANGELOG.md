@@ -7,6 +7,29 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Added
+- Keyword and hybrid search. `Options::text_field(key)` names a metadata
+  key whose strings are indexed at checkpoint (lowercase alphanumeric
+  tokens, BM25 with k1 = 1.2, b = 0.75). `Db::search_text(query, k, filter)`
+  scores indexed records from the inverted index and records written since
+  the last checkpoint from their metadata, with one set of corpus
+  statistics; scores are negated BM25. `Db::search_hybrid(vector, text, k,
+  filter)` fuses the dense and keyword lists by reciprocal rank (`1 / (60 +
+  rank)`, each list fetched at `3k`). Python: `text_field=`, `search_text()`,
+  `search(query, text=...)`. The text section lives in the index file after
+  the id table, named by the footer's third slot; a 0.2.0 reader ignores it.
+  On BEIR SciFact (5,183 documents, 300 test queries,
+  `benchmarks/beir/scifact_bm25.py`), against the `rank_bm25` reference with
+  the same tokens:
+
+  | | nDCG@10 | Recall@100 | ms/query |
+  |---|---|---|---|
+  | sanadb `search_text` | 0.662 | 0.886 | 1.2 |
+  | rank_bm25 (Okapi) | 0.654 | 0.876 | 30.6 |
+
+  Published Anserini BM25 on SciFact is 0.665 nDCG@10; the small
+  differences are the idf variant.
+
 ## [0.2.0] - 2026-11-16
 
 The store holds nothing in RAM that scales with the index, readers can

@@ -1,8 +1,11 @@
 # Hybrid search: BM25 and sparse vectors beside the graph
 
-Status: design for 0.3.0. Nothing here is implemented. It is written now
-because every RAG user asks for it, and because the attribute columns and
-the snapshot-and-tail reader model decide how it has to be built.
+Status: steps 1 to 3 of "Order of work" are implemented (tokeniser without
+the segmentation dependency, inverted index section, `search_text` with
+term-at-a-time BM25, `search_hybrid` with reciprocal rank fusion, Python
+bindings). Not yet: MaxScore skipping, block-max metadata, weighted fusion,
+sparse vectors. SciFact nDCG@10 0.662 against rank_bm25's 0.654 and
+Anserini's published 0.665.
 
 ## What users want
 
