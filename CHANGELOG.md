@@ -48,6 +48,14 @@ See `docs/design/snapshot-and-tail.md`.
   reader still maps it (Windows refuses the delete) the next writer open
   collects it. `Db::index_path()` returns the current file. Stores whose
   index is still the unnumbered `<path>.idx` open as before.
+- On x86-64, squared L2 and dot product use AVX2/FMA kernels when the CPU
+  has them (detected once at runtime; the default x86-64 target is SSE2
+  without FMA). A test checks them against the scalar reference on every
+  length on the Linux CI runner. aarch64 keeps the autovectorised loop,
+  which already compiles to NEON FMA. Query latency is memory-bound and is
+  not expected to move; builds, exact scans and re-ranking are.
+- Filtered walk at 10% selectivity measured across beams (README): beam 32
+  gives recall 0.975 at 0.59 ms against 0.995 at 1.1 ms for beam 64.
 - `Storage::I8` (`Options::storage`, Python `storage="int8"`): indexed vectors
   kept as 8-bit codes with a per-record min and scale, `dim + 8` bytes
   instead of `dim * 4`, so each hop of a cold query reads a quarter of the

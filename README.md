@@ -309,7 +309,17 @@ answers at 0.1% and almost none at 0.01%, after 10 ms of widened walks; the
 posting lists make those the cheapest queries in the table. The scan beats
 the walk up to about 20,000 matches warm, which is where the default
 `exact_filter_scan` sits; at 10% the scan would take 13 ms and the walk
-wins. The 10% walk is 7x an unfiltered query; closing that is on the list.
+wins. The 10% walk is 7x an unfiltered query at beam 64 because it needs 64
+passing nodes before it can stop; the beam is the knob, measured at 10%:
+
+| beam | recall@10 | mean |
+|---|---|---|
+| 32 | 0.975 | 0.59 ms |
+| 48 | 0.991 | 0.71 ms |
+| 64 | 0.995 | 1.1 ms |
+| 96 | 0.998 | 1.2 ms |
+
+The post-filter closure path never passes 0.80 at any beam on this filter.
 
 ### Cold cache, 5M vectors from SIFT1B
 
