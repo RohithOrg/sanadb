@@ -172,57 +172,80 @@ third of the CPU when the index is warm. The PQ-off row was measured with
 1,000 queries per beam rather than 10,000, so its cache was colder; treat it
 as an upper bound.
 
-### ann-benchmarks, glove-100-angular (cosine), against hnswlib
-
-Same harness, 1,183,514 GloVe word vectors, dim 100, angular ground truth,
-their 10,000 queries. The adapter maps `angular` to `Metric::Cosine`. This
-dataset is hard for every graph index; hnswlib reaches 0.98 only at ef = 800.
-Queries per second at the nearest measured recall:
-
-| recall@10 | hnswlib M=16 | hnswlib M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
-|---|---|---|---|---|---|
-| ~0.73 | 5,174 (0.728) | | 4,561 (0.706) | 3,843 (0.732) | 4,562 (0.750) |
-| ~0.81 | 2,979 (0.811) | | 2,695 (0.795) | 2,273 (0.810) | 3,775 (0.790) |
-| ~0.86 | | 2,266 (0.853) | 1,517 (0.858) | 1,314 (0.866) | 2,248 (0.860) |
-| ~0.89 | 1,401 (0.889) | 1,610 (0.887) | 1,066 (0.885) | 927 (0.891) | 1,608 (0.890) |
-| ~0.93 | 787 (0.933) | 1,047 (0.923) | | | 882 (0.929) |
-| ~0.95 | 553 (0.952) | 577 (0.960) | | | 697 (0.942) |
-| build | 319 s | 434 s | 378 s | 322 s | 658 s |
-
-At R=48 sanadb matches hnswlib's curve up to recall 0.93; at R=32 it trails
-by 20 to 30%, and PQ costs about 0.02 recall per beam on these 100-dim
-vectors (25 subspaces of 4). Builds above 1M vectors are sharded, which is
-why the R=48 build is slow. This table exists because the first run of it
-found a real defect: before 0.1.3 cosine recall at beam 64 was 0.24, since
-RobustPrune's alpha test misbehaves on negative distances and cosine used
-negative dot product internally. See CHANGELOG.
-
-### ann-benchmarks, sift-128-euclidean, against hnswlib
+### ann-benchmarks, against hnswlib, faiss HNSW and usearch
 
 Run by the [ann-benchmarks](https://github.com/erikbern/ann-benchmarks) harness
-in local mode with the adapter in `benchmarks/ann-benchmarks/`, so the
-queries, ground truth, timing and recall computation are theirs. hnswlib is
-the in-RAM HNSW implementation that sits at the top of their published
-plots; here at M=16 and M=24, efConstruction 500, as in their config.
-Same laptop, single query thread, k=10, warm. Queries per second at the
-nearest measured recall, higher is better:
+in local mode with the adapters in `benchmarks/ann-benchmarks/`, so the
+queries, ground truth, timing and recall computation are theirs. The three
+in-RAM HNSW libraries use the harness's own configs at M=16 and M=24,
+efConstruction 500 (faiss trimmed to those two groups; usearch has no
+upstream adapter, ours is in the same folder and forces f32 vectors so all
+four hold the same data). Same laptop, single query thread, k=10, warm,
+best of 2 runs. Queries per second at the nearest measured recall, higher is
+better; a blank cell means that configuration has no point within 0.01 of
+the row's recall. Raw CSVs: `benchmarks/ann-benchmarks/results/`.
 
-| recall@10 | hnswlib M=16 | hnswlib M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
-|---|---|---|---|---|---|
-| ~0.93 | 5,938 (0.931) | | | 5,457 (0.934) | 4,579 (0.939) |
-| ~0.96 | | 4,797 (0.958) | 3,947 (0.964) | 4,229 (0.957) | 3,482 (0.971) |
-| ~0.98 | 3,452 (0.977) | | 2,800 (0.980) | 2,400 (0.983) | 3,003 (0.984) |
-| ~0.99 | 2,520 (0.990) | 2,808 (0.989) | 2,322 (0.987) | 2,041 (0.989) | 2,229 (0.993) |
-| ~0.996 | 1,639 (0.997) | 2,011 (0.996) | 1,348 (0.995) | 1,154 (0.996) | 1,774 (0.996) |
-| ~0.999 | 922 (0.9996) | 1,323 (0.999) | 743 (0.9985) | | 1,029 (0.999) |
-| build | 209 s | 266 s | 119 s | 112 s | 222 s |
+#### sift-128-euclidean
 
-sanadb lands within 10 to 25% of hnswlib's throughput at the same recall
-across the curve, with a faster build, while holding 32 bytes per vector in
-RAM instead of the whole index. The harness's "index size" column is omitted:
-it measures process memory growth during build, which is near zero for a
-memory-mapped index and says nothing useful here. Raw CSV:
-`benchmarks/ann-benchmarks/results/sift-128-euclidean.csv`.
+1,000,000 SIFT vectors, dim 128, L2, their 10,000 queries.
+
+| recall@10 | hnswlib M=16 | hnswlib M=24 | faiss HNSW M=16 | faiss HNSW M=24 | usearch M=16 | usearch M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
+|---|---|---|---|---|---|---|---|---|---|
+| ~0.93 | 5,938 (0.931) |  | 11,559 (0.939) |  | 5,119 (0.930) |  |  | 5,457 (0.934) | 4,579 (0.939) |
+| ~0.96 |  | 4,797 (0.958) |  | 9,844 (0.958) |  | 3,991 (0.956) | 3,947 (0.964) | 4,229 (0.957) |  |
+| ~0.98 | 3,452 (0.977) | 2,808 (0.989) | 6,498 (0.982) | 5,467 (0.990) | 2,936 (0.977) | 2,298 (0.988) | 2,800 (0.980) | 2,400 (0.983) | 3,003 (0.984) |
+| ~0.99 | 2,520 (0.990) | 2,808 (0.989) | 4,332 (0.992) | 5,467 (0.990) | 2,102 (0.989) | 2,298 (0.988) | 1,696 (0.993) | 2,041 (0.989) | 2,229 (0.993) |
+| ~0.996 | 1,639 (0.997) | 2,011 (0.996) | 2,796 (0.998) | 3,849 (0.996) | 1,357 (0.997) | 1,642 (0.995) | 1,348 (0.995) | 1,154 (0.996) | 1,774 (0.996) |
+| ~0.999 | 922 (1.000) | 1,323 (0.999) | 1,425 (1.000) | 2,424 (0.999) | 749 (0.999) | 1,073 (0.999) | 743 (0.998) | 635 (0.998) | 1,029 (0.999) |
+| build | 209 s | 266 s | 132 s | 764 s* | 252 s | 311 s | 119 s | 112 s | 222 s |
+
+#### glove-100-angular
+
+1,183,514 GloVe word vectors, dim 100, angular ground truth, their 10,000
+queries. The sanadb adapter maps `angular` to `Metric::Cosine`. This dataset
+is hard for every graph index; hnswlib reaches 0.98 only at ef = 800.
+
+| recall@10 | hnswlib M=16 | hnswlib M=24 | faiss HNSW M=16 | faiss HNSW M=24 | usearch M=16 | usearch M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
+|---|---|---|---|---|---|---|---|---|---|
+| ~0.73 | 5,174 (0.728) |  | 9,619 (0.732) |  | 3,697 (0.729) |  |  | 3,843 (0.732) |  |
+| ~0.81 | 2,979 (0.811) |  | 5,505 (0.816) |  | 2,237 (0.811) |  |  | 2,273 (0.810) |  |
+| ~0.86 |  | 2,266 (0.853) | 3,873 (0.852) | 4,084 (0.859) |  | 1,667 (0.853) | 1,517 (0.858) | 1,314 (0.866) | 2,248 (0.860) |
+| ~0.89 | 1,401 (0.889) | 1,610 (0.887) | 2,435 (0.889) | 2,854 (0.893) | 1,024 (0.887) | 1,187 (0.887) | 1,066 (0.885) | 927 (0.891) | 1,608 (0.890) |
+| ~0.93 | 787 (0.933) | 1,047 (0.922) | 1,241 (0.930) | 1,807 (0.928) | 553 (0.932) | 764 (0.923) |  |  | 882 (0.929) |
+| ~0.95 | 553 (0.952) | 577 (0.960) | 810 (0.948) |  | 380 (0.951) | 410 (0.959) |  |  | 697 (0.942) |
+| build | 319 s | 434 s | 967 s* | 257 s | 388 s | 555 s | 378 s | 322 s | 658 s |
+
+What the tables say:
+
+- faiss HNSW is the fastest of the four here, about 2x hnswlib at equal
+  recall on both datasets. The most likely reason is SIMD: faiss ships NEON
+  kernels for Apple Silicon, while hnswlib's and sanadb's distance loops are
+  SSE/AVX intrinsics with a scalar fallback (hnswlib) and plain Rust left to
+  the autovectoriser (sanadb). On an x86 server the gap between faiss and
+  hnswlib is small in ann-benchmarks' published plots; expect these ratios
+  to shift there. sanadb has no hand-written SIMD yet; that is the next
+  performance item.
+- sanadb lands within 10 to 25% of hnswlib and usearch at equal recall on
+  SIFT, and at R=48 matches hnswlib on GloVe up to recall 0.93. At R=32 it
+  trails on GloVe by 20 to 30%, and PQ costs about 0.02 recall per beam on
+  these 100-dim vectors (25 subspaces of 4). It does this while holding 32
+  bytes of PQ codes per vector in RAM instead of the whole index; the other
+  three keep every vector and every edge in memory.
+- usearch was forced to f32 so that the four libraries hold the same data.
+  Its default f16 and i8 modes are faster and are not measured here.
+- `*` faiss build times are not comparable between its two groups: the
+  upstream adapter calls `omp_set_num_threads(1)` after each build, and in
+  the harness's local mode that setting persists into the next group's
+  build, so the second group of each dataset built single-threaded (M=24 on
+  SIFT, M=16 on GloVe). Builds are multi-threaded for every library
+  otherwise; sanadb's are sharded above 1M vectors, which is why the R=48
+  GloVe build is slow.
+- The GloVe table exists because its first run found a real defect: before
+  0.1.3 cosine recall at beam 64 was 0.24, since RobustPrune's alpha test
+  misbehaves on negative distances and cosine used negative dot product
+  internally. See CHANGELOG.
+- The harness's "index size" column is omitted: it measures process memory
+  growth during build, which is near zero for a memory-mapped index.
 
 ### Cold cache, 5M vectors from SIFT1B
 
@@ -248,21 +271,31 @@ prefetch or an explicit block cache.
 
 ### Build memory
 
-Same 5M set. Peak resident memory of the whole process from `/usr/bin/time -l`,
-which includes the 2.6 GB of bulk-loaded vectors the delta holds until the
-first checkpoint.
+Same 5M set, `examples/bigann.rs build`, which streams the 5M inserts through
+the normal write path with auto-checkpoint on. Peak resident memory of the
+whole process from `/usr/bin/time -l`.
 
-| | single shard | 5 shards of 1M |
-|---|---|---|
-| build | 731 s | 1396 s |
-| peak RSS | about 7 GB (estimated, not measured) | 4.47 GB |
-| recall@10, beam 64 | 0.932 | 0.934 |
+| | 0.1.1, single shard | 0.1.1, 5 shards of 1M | 0.1.3, 5 shards of 1M |
+|---|---|---|---|
+| insert 5M (with auto-checkpoints) | | | 1114 s |
+| final checkpoint | 731 s | 1396 s | 856 s |
+| max RSS | about 7 GB (estimated, not measured) | 4.47 GB | 5.13 GB |
+| peak anonymous memory | | not recorded | 3.58 GB |
+| recall@10, beam 64 | 0.932 | 0.934 | 0.936 |
 
-Sharding halves the build's memory at the cost of doubling its time, since
-every vector is inserted into two shard graphs. Recall does not move. Since
-that run the delta stopped holding vectors in RAM (it reads them from the
-mapped log), so the 2.6 GB bulk-load share of that peak is gone; the 5M build
-has not been re-measured since.
+Sharding halves the build's anonymous memory at the cost of inserting every
+vector into two shard graphs. Recall does not move.
+
+Reading the 0.1.3 column: the delta no longer holds vectors in RAM (it reads
+them from the mapped log), so the 2.6 GB bulk-load share of the old peak is
+gone and the anonymous footprint is 3.58 GB (macOS "peak memory footprint").
+Max RSS went up, not down, because RSS also counts resident pages of
+memory-mapped files, and this build maps the 2.4 GB vector snapshot and the
+index it is writing; those pages are reclaimable and are not what limits the
+machine. The final checkpoint is 39% faster than the 0.1.1 sharded build.
+The insert row is the realistic streaming path: the geometric auto-checkpoint
+rule built intermediate graphs at 250K, 500K, 1M, 2M and 4M records along the
+way; a bulk load that sets `auto_checkpoint_delta(0)` skips those.
 
 ### Synthetic
 
@@ -272,9 +305,9 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. More ann-benchmarks coverage: faiss HNSW and usearch alongside hnswlib; a
-   VectorDBBench client. Close the R=32 gap on cosine data.
-2. e-means (Meta FAIR's mini-batch k-means) for PQ training and shard partitioning.
+1. Hand-written SIMD distance kernels (NEON and AVX2); the faiss gap above
+   is mostly that. Close the R=32 gap on cosine data. A VectorDBBench client.
+2. Typed metadata and filter-aware graph traversal.
 3. Format freeze and 1.0.
 4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.

@@ -7,6 +7,8 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-16
+
 ### Added
 - Incremental checkpoint. When a graph exists and the pending change (new
   writes plus deletes) is smaller than the live graph, and the result fits
@@ -22,6 +24,8 @@ the new version migrates old stores on open.
   reopened) and a corruption fuzz test over the log decoder, both in the
   regular suite.
 - Rust tests run on Windows in CI.
+- ann-benchmarks comparison extended to faiss HNSW and usearch (README
+  "ann-benchmarks"); the usearch adapter lives in `benchmarks/ann-benchmarks/`.
 
 ### Fixed
 - Cosine recall. The cosine metric used negative dot product as its internal
@@ -46,6 +50,10 @@ the new version migrates old stores on open.
   mini-batch k-means recipe, with its small-dimension batch law) seeded by
   k-means++, instead of 8 to 12 rounds of Lloyd. A test keeps its distortion
   within 5% of a 20-iteration Lloyd baseline on a PQ-sized problem.
+- Re-measured the 5M SIFT1B-prefix sharded build (README "Build memory"):
+  final checkpoint 1396 s to 856 s, peak anonymous memory 3.58 GB now that
+  the delta reads vectors from the mapped log. Max RSS reads 5.13 GB because
+  it counts resident pages of the mapped snapshot and index.
 - Locks are `parking_lot`: a panic on one thread no longer poisons the store
   for the others. `Error::Poisoned` is gone.
 
@@ -105,6 +113,7 @@ published.
 - One process per store. No replication, encryption, typed metadata or range
   filters. Formats may change before 1.0 (with migration).
 
-[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/RohithOrg/sanadb/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/RohithOrg/sanadb/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/RohithOrg/sanadb/releases/tag/v0.1.1
