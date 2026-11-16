@@ -8,6 +8,9 @@ the new version migrates old stores on open.
 ## [Unreleased]
 
 ### Changed
+- Release workflow: `sanadb` and `sanadb-studio` are uploaded to PyPI in
+  two steps; one upload of both packages' files was refused in 0.2.3 (the
+  trusted-publisher token is per project), so 0.2.3 never reached PyPI.
 - Release workflow: the macOS arm64 wheel is cross-compiled on the Intel
   macOS runner; GitHub's arm64 macOS runners cancelled the job for lack
   of capacity twice during the 0.2.3 release.

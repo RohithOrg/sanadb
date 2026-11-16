@@ -158,19 +158,31 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # Two projects, two uploads: a trusted-publisher token is minted per
+      # project, and 0.2.3 failed by uploading both packages' files at once.
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
+          pattern: wheels-[!s]*
           path: dist
           merge-multiple: true
       - uses: actions/download-artifact@v4
         with:
           name: sdist
           path: dist
-      - run: ls -la dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-studio-*
+          path: dist-studio
+          merge-multiple: true
+      - run: ls -la dist dist-studio
+      - name: Publish sanadb
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+      - name: Publish sanadb-studio
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-studio
 
   github-release:
     name: GitHub release
