@@ -5,27 +5,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
-## [Unreleased]
-
-### Added
-- Bring your own embedding model. Rust: the `Embedder` trait (implemented
-  by any closure `Fn(&[&str]) -> Result<Vec<Vec<f32>>>`), `Db::add_text`
-  and `Db::search_text_embedded`, and `OpenAiEmbedder` for any
-  OpenAI-compatible `/v1/embeddings` endpoint behind the `embed-http`
-  feature. Python: `Db(..., embedding_function=fn)` with `add(documents,
-  ids, metas)` and `query(texts, k, filter)`. Studio: `--embed-url` with
-  `--embed-model` (and `--embed-key-env`), or `--embed-cmd`; a "Text to
-  embed" query box and an Add record form.
-- Studio: a record's headline from a name key (`title`, `name`, `doc`,
-  `path`, `file`, `url`, `label`, `text`, `body`) with the id labelled
-  beneath; the score's meaning stated per metric; counts as 1M / 4K with
-  exact values on hover; cluster labels drawn only where one value holds
-  at least 20% of its cluster; monochrome instrument chrome with the
-  accent reserved for data.
-
 ## [0.2.1] - 2026-11-16
 
-sanadb studio, and the small public API it needed. No format change.
+sanadb studio, bring-your-own embedding model in Rust, Python and studio, and the small public API they needed. No format change.
 
 ### Added
 - `sanadb-studio` (`cargo install sanadb-studio`, or a prebuilt binary
@@ -41,6 +23,20 @@ sanadb studio, and the small public API it needed. No format change.
   graph walk expanded, in order. The index reader also accepts the
   32-byte footer that 0.2.0 development builds wrote, so stores built with
   them still open.
+- Bring your own embedding model. Rust: the `Embedder` trait (implemented
+  by any closure `Fn(&[&str]) -> Result<Vec<Vec<f32>>>`), `Db::add_text`
+  and `Db::search_text_embedded`, and `OpenAiEmbedder` for any
+  OpenAI-compatible `/v1/embeddings` endpoint behind the `embed-http`
+  feature. Python: `Db(..., embedding_function=fn)` with `add(documents,
+  ids, metas)` and `query(texts, k, filter)`. Studio: `--embed-url` with
+  `--embed-model` (and `--embed-key-env`), or `--embed-cmd`; a "Text to
+  embed" query box and an Add record form.
+- Studio: a record's headline from a name key (`title`, `name`, `doc`,
+  `path`, `file`, `url`, `label`, `text`, `body`) with the id labelled
+  beneath; the score's meaning stated per metric; counts as 1M / 4K with
+  exact values on hover; cluster labels drawn only where one value holds
+  at least 20% of its cluster; monochrome instrument chrome with the
+  accent reserved for data.
 
 ## [0.2.0] - 2026-11-16
 
