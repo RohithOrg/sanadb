@@ -62,7 +62,9 @@ hits = db.search(query, k=10, text="tokio select cancellation")   # hybrid: vect
 db.checkpoint()
 ```
 
-Scores are distances, lower is closer. The full API is on
+Scores are distances, lower is closer. Every feature in one walk:
+[docs/getting-started.md](docs/getting-started.md), with runnable tours in
+`examples/tour.rs` and `python/examples/tour.py`. The full API is on
 [docs.rs](https://docs.rs/sanadb) for Rust; the Python package ships type
 stubs.
 
@@ -131,6 +133,7 @@ The detail behind each of these is in [docs/operations.md](docs/operations.md).
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md): every feature in one walk.
 - [How it works](docs/architecture.md): log, graph, PQ, delta, checkpoint,
   filters, concurrency, keyword and sparse search.
 - [Operating a store](docs/operations.md): durability, processes, backup,
