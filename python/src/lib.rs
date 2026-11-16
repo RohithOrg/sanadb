@@ -15,7 +15,8 @@ fn err(e: sanadb_core::Error) -> PyErr {
         sanadb_core::Error::DimMismatch { .. }
         | sanadb_core::Error::MetaTooLarge
         | sanadb_core::Error::HeaderMismatch { .. }
-        | sanadb_core::Error::InvalidVector => PyValueError::new_err(e.to_string()),
+        | sanadb_core::Error::InvalidVector
+        | sanadb_core::Error::SecondSparseKey { .. } => PyValueError::new_err(e.to_string()),
         sanadb_core::Error::TypeMismatch { .. } => PyTypeError::new_err(e.to_string()),
         sanadb_core::Error::ReadOnly => pyo3::exceptions::PyPermissionError::new_err(e.to_string()),
         other => PyRuntimeError::new_err(other.to_string()),
@@ -33,7 +34,45 @@ fn to_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f32>> {
     obj.extract::<Vec<f32>>()
 }
 
+/// A sparse vector as an `(indices, weights)` pair of sequences or arrays.
+fn to_sparse(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(u32, f32)>> {
+    let bad = || {
+        PyTypeError::new_err(
+            "a sparse vector is a pair (indices, weights) of equal-length sequences",
+        )
+    };
+    let (ids, ws) = (
+        obj.get_item(0).map_err(|_| bad())?,
+        obj.get_item(1).map_err(|_| bad())?,
+    );
+    let ids: Vec<u32> = if let Ok(a) = ids.downcast::<PyArray1<u32>>() {
+        a.readonly().as_slice()?.to_vec()
+    } else if let Ok(a) = ids.downcast::<PyArray1<i64>>() {
+        a.readonly()
+            .as_slice()?
+            .iter()
+            .map(|&i| {
+                u32::try_from(i).map_err(|_| PyValueError::new_err("sparse index out of range"))
+            })
+            .collect::<PyResult<_>>()?
+    } else {
+        ids.extract::<Vec<u32>>().map_err(|_| bad())?
+    };
+    let ws = to_vec(&ws).map_err(|_| bad())?;
+    if ids.len() != ws.len() {
+        return Err(bad());
+    }
+    Ok(ids.into_iter().zip(ws).collect())
+}
+
+fn sparse_to_py<'py>(py: Python<'py>, p: &[(u32, f32)]) -> PyResult<Bound<'py, PyTuple>> {
+    let ids = PyArray1::from_vec(py, p.iter().map(|x| x.0).collect());
+    let ws = PyArray1::from_vec(py, p.iter().map(|x| x.1).collect());
+    PyTuple::new(py, [ids.into_any(), ws.into_any()])
+}
+
 /// `bool` is checked before `int` because Python's bool is an int subclass.
+/// A 2-tuple is a sparse vector `(indices, weights)`.
 fn to_value(v: &Bound<'_, PyAny>) -> PyResult<Value> {
     if v.is_instance_of::<PyBool>() {
         Ok(Value::Bool(v.extract()?))
@@ -43,9 +82,11 @@ fn to_value(v: &Bound<'_, PyAny>) -> PyResult<Value> {
         Ok(Value::Float(v.extract()?))
     } else if v.is_instance_of::<PyString>() {
         Ok(Value::Str(v.extract()?))
+    } else if v.is_instance_of::<PyTuple>() {
+        Ok(Value::Sparse(to_sparse(v)?))
     } else {
         Err(PyTypeError::new_err(format!(
-            "metadata values must be str, int, float or bool, got {}",
+            "metadata values must be str, int, float, bool or an (indices, weights) tuple, got {}",
             v.get_type().name()?
         )))
     }
@@ -69,6 +110,7 @@ fn meta_to_py<'py>(py: Python<'py>, m: &Metadata) -> PyResult<Bound<'py, PyDict>
             Value::Int(i) => d.set_item(k, *i)?,
             Value::Float(x) => d.set_item(k, *x)?,
             Value::Bool(b) => d.set_item(k, *b)?,
+            Value::Sparse(p) => d.set_item(k, sparse_to_py(py, p)?)?,
         }
     }
     Ok(d)
@@ -371,7 +413,7 @@ impl PyDb {
     ///
     /// `filter` is a dict of metadata pairs that must all match exactly, or a
     /// callable `meta -> bool`. Dict filters run with the GIL released.
-    #[pyo3(signature = (query, k = 10, filter = None, text = None))]
+    #[pyo3(signature = (query, k = 10, filter = None, text = None, sparse = None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -379,10 +421,11 @@ impl PyDb {
         k: usize,
         filter: Option<&Bound<'_, PyAny>>,
         text: Option<String>,
+        sparse: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<(u64, f32)>> {
         let q = to_vec(query)?;
-        if let Some(text) = text {
-            // Hybrid: dense plus keyword, fused by reciprocal rank.
+        if text.is_some() || sparse.is_some() {
+            // Hybrid: dense plus keyword or sparse, fused by reciprocal rank.
             let f = match filter {
                 None => None,
                 Some(f) if f.is_instance_of::<PyDict>() => {
@@ -394,9 +437,17 @@ impl PyDb {
                     ));
                 }
             };
+            if text.is_some() && sparse.is_some() {
+                return Err(PyValueError::new_err("pass text or sparse, not both"));
+            }
+            let sp = sparse.map(to_sparse).transpose()?;
             let db = self.inner.clone();
             let hits = py
-                .allow_threads(move || db.search_hybrid(&q, &text, k, f.as_ref()))
+                .allow_threads(move || match (text, sp) {
+                    (Some(text), _) => db.search_hybrid(&q, &text, k, f.as_ref()),
+                    (_, Some(sp)) => db.search_hybrid_sparse(&q, &sp, k, f.as_ref()),
+                    _ => unreachable!(),
+                })
                 .map_err(err)?;
             return Ok(hits.into_iter().map(|h| (h.id, h.score)).collect());
         }
@@ -491,6 +542,25 @@ impl PyDb {
     }
 
     /// Copy the store into `dir` in a consistent state; returns the copy's path.
+    /// Dot-product search over the store's sparse key: `query` is an `(indices,
+    /// weights)` pair. Scores are negated dot products.
+    #[pyo3(signature = (query, k = 10, filter = None))]
+    fn search_sparse(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        k: usize,
+        filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<(u64, f32)>> {
+        let q = to_sparse(query)?;
+        let f = filter.map(to_filter).transpose()?;
+        let db = self.inner.clone();
+        let hits = py
+            .allow_threads(move || db.search_sparse(&q, k, f.as_ref()))
+            .map_err(err)?;
+        Ok(hits.into_iter().map(|h| (h.id, h.score)).collect())
+    }
+
     fn backup(&self, py: Python<'_>, dir: String) -> PyResult<String> {
         let db = self.inner.clone();
         py.allow_threads(move || db.backup(dir))
@@ -537,6 +607,33 @@ impl PyDb {
                 Ok(Some(d))
             }
         }
+    }
+
+    /// Operation counters since open, as a dict (see `sanadb::Stats`).
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = self.inner.stats();
+        let d = PyDict::new(py);
+        for (k, v) in [
+            ("searches", s.searches),
+            ("graph_walks", s.graph_walks),
+            ("filtered_walks", s.filtered_walks),
+            ("exact_scans", s.exact_scans),
+            ("delta_only", s.delta_only),
+            ("text_searches", s.text_searches),
+            ("sparse_searches", s.sparse_searches),
+            ("inserts", s.inserts),
+            ("deletes", s.deletes),
+            ("batches", s.batches),
+            ("checkpoints", s.checkpoints),
+            ("incremental_checkpoints", s.incremental_checkpoints),
+            ("failed_checkpoints", s.failed_checkpoints),
+            ("last_checkpoint_ms", s.last_checkpoint_ms),
+            ("refresh_appended", s.refresh_appended),
+            ("refresh_reloaded", s.refresh_reloaded),
+        ] {
+            d.set_item(k, v)?;
+        }
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {

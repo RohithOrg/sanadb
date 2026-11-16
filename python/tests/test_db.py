@@ -243,3 +243,37 @@ def test_text_and_hybrid_search(tmp_path):
     hybrid = [i for i, _ in db.search(np.array([0, 1, 0, 0], dtype=np.float32), k=2, text="borrow checker")]
     assert set(hybrid) == {1, 3}
     assert [i for i, _ in db.search(np.array([0, 1, 0, 0], dtype=np.float32), k=1, text="asyncio")] == [2]
+
+
+def test_stats_counters(tmp_path):
+    db = sanadb.Db(str(tmp_path / "s.sana"), dim=4)
+    assert db.stats()["inserts"] == 0
+    db.insert_many([1, 2, 3], np.eye(4, dtype=np.float32)[:3])
+    db.insert(4, np.ones(4, dtype=np.float32))
+    db.search(np.ones(4, dtype=np.float32), k=2)
+    db.checkpoint()
+    db.search(np.ones(4, dtype=np.float32), k=2)
+    s = db.stats()
+    assert (s["inserts"], s["batches"], s["searches"], s["delta_only"], s["graph_walks"]) == (1, 1, 2, 1, 1)
+    assert s["checkpoints"] == 1 and s["failed_checkpoints"] == 0
+
+
+def test_sparse_vectors(tmp_path):
+    db = sanadb.Db(str(tmp_path / "sp.sana"), dim=4)
+    db.insert(1, np.ones(4, dtype=np.float32), {"sp": ([3, 7], [1.0, 2.0]), "g": "a"})
+    db.insert(2, np.ones(4, dtype=np.float32), {"sp": (np.array([7, 9], dtype=np.uint32), np.array([0.5, 1.0], dtype=np.float32))})
+    db.insert(3, np.ones(4, dtype=np.float32), {"sp": ([3], [4.0]), "g": "a"})
+    ids, ws = db.get(1)[1]["sp"]
+    assert ids.tolist() == [3, 7] and ws.tolist() == [1.0, 2.0]
+    hits = db.search_sparse(([7], [1.0]), k=5)
+    assert [i for i, _ in hits] == [1, 2]
+    assert hits[0][1] == pytest.approx(-2.0)
+    db.checkpoint()
+    assert [i for i, _ in db.search_sparse(([7], [1.0]), k=5)] == [1, 2]
+    assert [i for i, _ in db.search_sparse(([3], [1.0]), k=5, filter={"g": "a"})] == [3, 1]
+    assert db.get(2)[1]["sp"][0].tolist() == [7, 9]
+    hybrid = db.search(np.ones(4, dtype=np.float32), k=2, sparse=([3], [1.0]))
+    assert set(i for i, _ in hybrid) == {3, 1}
+    with pytest.raises(ValueError):
+        db.insert(4, np.ones(4, dtype=np.float32), {"other": ([1], [1.0])})
+    assert db.stats()["sparse_searches"] == 4

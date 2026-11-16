@@ -17,6 +17,11 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// A learned sparse vector: `(index, weight)` pairs, ascending by index
+    /// with no duplicates. Pairs given out of order or repeated are sorted
+    /// and summed on insert; a zero weight is dropped. Indexed for
+    /// `search_sparse`; a store holds one such key.
+    Sparse(Vec<(u32, f32)>),
 }
 
 /// The type of a `Value`, without its payload.
@@ -27,6 +32,7 @@ pub enum Kind {
     Int = 1,
     Float = 2,
     Bool = 3,
+    Sparse = 4,
 }
 
 impl Kind {
@@ -36,6 +42,7 @@ impl Kind {
             1 => Some(Kind::Int),
             2 => Some(Kind::Float),
             3 => Some(Kind::Bool),
+            4 => Some(Kind::Sparse),
             _ => None,
         }
     }
@@ -48,6 +55,14 @@ impl Value {
             Value::Int(_) => Kind::Int,
             Value::Float(_) => Kind::Float,
             Value::Bool(_) => Kind::Bool,
+            Value::Sparse(_) => Kind::Sparse,
+        }
+    }
+
+    pub fn as_sparse(&self) -> Option<&[(u32, f32)]> {
+        match self {
+            Value::Sparse(p) => Some(p),
+            _ => None,
         }
     }
 
@@ -89,6 +104,7 @@ impl fmt::Display for Value {
             Value::Int(i) => write!(f, "{i}"),
             Value::Float(x) => write!(f, "{x}"),
             Value::Bool(b) => write!(f, "{b}"),
+            Value::Sparse(p) => write!(f, "sparse[{}]", p.len()),
         }
     }
 }
@@ -131,6 +147,11 @@ impl From<f32> for Value {
 impl From<bool> for Value {
     fn from(b: bool) -> Value {
         Value::Bool(b)
+    }
+}
+impl From<Vec<(u32, f32)>> for Value {
+    fn from(p: Vec<(u32, f32)>) -> Value {
+        Value::Sparse(p)
     }
 }
 

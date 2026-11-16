@@ -13,12 +13,15 @@
 //! keep going while it runs.
 
 mod attrs;
+#[doc(hidden)]
+pub mod fault;
 mod filter;
 mod graph;
 mod index;
 mod kmeans;
 mod pq;
 mod quant;
+mod sparse;
 mod text;
 mod wal;
 
@@ -28,11 +31,24 @@ pub use graph::Storage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // parking_lot locks do not poison: a panic on one thread (for instance from
 // a filter closure) leaves the store usable by the others.
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
+
+/// A `tracing` event when the feature is on; nothing otherwise.
+macro_rules! event {
+    (warn, $($t:tt)*) => {
+        #[cfg(feature = "tracing")]
+        tracing::warn!(target: "sanadb", $($t)*);
+    };
+    ($($t:tt)*) => {
+        #[cfg(feature = "tracing")]
+        tracing::info!(target: "sanadb", $($t)*);
+    };
+}
 
 use graph::GraphIndex;
 pub use graph::GraphParams;
@@ -60,6 +76,12 @@ pub enum Error {
         key: String,
         expected: Kind,
         got: Kind,
+    },
+    /// A second metadata key holds `Value::Sparse` values; a store indexes
+    /// one sparse key.
+    SecondSparseKey {
+        have: String,
+        got: String,
     },
     /// A vector contained NaN or infinity.
     InvalidVector,
@@ -110,6 +132,10 @@ impl std::fmt::Display for Error {
             Error::MetaTooLarge => write!(
                 f,
                 "metadata key/value longer than 65535 bytes or more than 65535 pairs"
+            ),
+            Error::SecondSparseKey { have, got } => write!(
+                f,
+                "a store holds one sparse key: {got:?} conflicts with {have:?}"
             ),
             Error::TypeMismatch { key, expected, got } => write!(
                 f,
@@ -307,6 +333,86 @@ pub struct IndexStats {
     pub storage: Storage,
 }
 
+/// Counters since this `Db` was opened, from `Db::stats`. Everything is a
+/// monotonic count except `last_checkpoint_ms`. Cheap enough to poll.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Vector searches, by the regime that answered the graph part.
+    pub searches: u64,
+    /// Plain or closure-filtered graph walks.
+    pub graph_walks: u64,
+    /// `search_where` answered by walking the graph with the filter
+    /// steering it (large matching set).
+    pub filtered_walks: u64,
+    /// `search_where` answered by scanning the posting lists' candidates
+    /// (small matching set).
+    pub exact_scans: u64,
+    /// Searches that had no graph yet (delta only).
+    pub delta_only: u64,
+    pub text_searches: u64,
+    pub sparse_searches: u64,
+    pub inserts: u64,
+    pub deletes: u64,
+    pub batches: u64,
+    pub checkpoints: u64,
+    /// Checkpoints that updated the graph in place instead of rebuilding.
+    pub incremental_checkpoints: u64,
+    pub failed_checkpoints: u64,
+    pub last_checkpoint_ms: u64,
+    /// Read-only refreshes that replayed appended log frames.
+    pub refresh_appended: u64,
+    /// Read-only refreshes that reloaded after the writer's checkpoint.
+    pub refresh_reloaded: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    searches: AtomicU64,
+    graph_walks: AtomicU64,
+    filtered_walks: AtomicU64,
+    exact_scans: AtomicU64,
+    delta_only: AtomicU64,
+    text_searches: AtomicU64,
+    sparse_searches: AtomicU64,
+    inserts: AtomicU64,
+    deletes: AtomicU64,
+    batches: AtomicU64,
+    checkpoints: AtomicU64,
+    incremental_checkpoints: AtomicU64,
+    failed_checkpoints: AtomicU64,
+    last_checkpoint_ms: AtomicU64,
+    refresh_appended: AtomicU64,
+    refresh_reloaded: AtomicU64,
+}
+
+fn bump(c: &AtomicU64) {
+    c.fetch_add(1, Ordering::Relaxed);
+}
+
+impl Counters {
+    fn snapshot(&self) -> Stats {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        Stats {
+            searches: g(&self.searches),
+            graph_walks: g(&self.graph_walks),
+            filtered_walks: g(&self.filtered_walks),
+            exact_scans: g(&self.exact_scans),
+            delta_only: g(&self.delta_only),
+            text_searches: g(&self.text_searches),
+            sparse_searches: g(&self.sparse_searches),
+            inserts: g(&self.inserts),
+            deletes: g(&self.deletes),
+            batches: g(&self.batches),
+            checkpoints: g(&self.checkpoints),
+            incremental_checkpoints: g(&self.incremental_checkpoints),
+            failed_checkpoints: g(&self.failed_checkpoints),
+            last_checkpoint_ms: g(&self.last_checkpoint_ms),
+            refresh_appended: g(&self.refresh_appended),
+            refresh_reloaded: g(&self.refresh_reloaded),
+        }
+    }
+}
+
 /// Inserts and deletes to apply together with `Db::write_batch`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Batch {
@@ -412,6 +518,7 @@ pub struct Db {
     /// (`open_read_only`) hold no lock at all.
     _file_lock: Option<std::fs::File>,
     read_only: bool,
+    counters: Counters,
 }
 
 impl Db {
@@ -458,6 +565,7 @@ impl Db {
             checkpoint_lock: Mutex::new(()),
             _file_lock: Some(file_lock),
             read_only: false,
+            counters: Counters::default(),
         })
     }
 
@@ -480,6 +588,7 @@ impl Db {
             checkpoint_lock: Mutex::new(()),
             _file_lock: None,
             read_only: true,
+            counters: Counters::default(),
         })
     }
 
@@ -513,6 +622,12 @@ impl Db {
         if let Some(g) = &inner.graph {
             for (k, kind) in g.attr_kinds() {
                 inner.types.entry(k.to_string()).or_insert(kind);
+            }
+            if let Some(sp) = g.sparse() {
+                inner
+                    .types
+                    .entry(sp.name(g.bytes()).to_string())
+                    .or_insert(Kind::Sparse);
             }
         }
         for e in entries {
@@ -554,6 +669,7 @@ impl Db {
             let is_index = name == prefix
                 || (name.starts_with(&prefix) && name[prefix.len()..].starts_with('.'));
             if is_index && e.path() != keep {
+                event!(warn, orphan = %e.path().display(), "removing index file no log names");
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -570,6 +686,7 @@ impl Db {
         let mut i = self.inner.write();
         match i.wal.refresh(&self.path)? {
             wal::Refresh::Appended(entries) => {
+                bump(&self.counters.refresh_appended);
                 i.log_entries += entries.len();
                 for e in entries {
                     i.replay(e);
@@ -579,6 +696,8 @@ impl Db {
                 // The writer swaps the index before the log, so the log we
                 // see now names an index that exists.
                 *i = Self::load(&self.path, self.header, true)?;
+                bump(&self.counters.refresh_reloaded);
+                event!(path = %self.path.display(), records = i.len(), "reader reloaded after checkpoint");
             }
         }
         Ok(())
@@ -675,6 +794,11 @@ impl Db {
         self.inner.read().delta.len()
     }
 
+    /// Operation counters since open; see [`Stats`].
+    pub fn stats(&self) -> Stats {
+        self.counters.snapshot()
+    }
+
     /// Shape of the on-disk graph index, or `None` before the first checkpoint.
     pub fn index_stats(&self) -> Option<IndexStats> {
         let _ = self.refresh();
@@ -695,14 +819,7 @@ impl Db {
                 got: vector.len(),
             });
         }
-        if meta.len() > u16::MAX as usize
-            || meta.iter().any(|(k, v)| {
-                k.len() > u16::MAX as usize
-                    || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)
-            })
-        {
-            return Err(Error::MetaTooLarge);
-        }
+        let meta = check_meta(meta)?;
         let vector = prepare(self.header.metric, vector)?;
         let garbage = {
             let mut i = self.write()?;
@@ -718,6 +835,7 @@ impl Db {
             i.apply_insert(id, off, meta);
             i.garbage()
         };
+        bump(&self.counters.inserts);
         self.maybe_auto_checkpoint(garbage)
     }
 
@@ -732,6 +850,7 @@ impl Db {
             i.apply_delete(id);
             i.garbage()
         };
+        bump(&self.counters.deletes);
         self.maybe_auto_checkpoint(garbage)?;
         Ok(true)
     }
@@ -757,19 +876,12 @@ impl Db {
                             got: vector.len(),
                         });
                     }
-                    if meta.len() > u16::MAX as usize
-                        || meta.iter().any(|(k, v)| {
-                            k.len() > u16::MAX as usize
-                                || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)
-                        })
-                    {
-                        return Err(Error::MetaTooLarge);
-                    }
+                    let meta = check_meta(meta.clone())?;
                     let v = prepare(self.header.metric, vector)?.into_owned();
                     prepared.push(Entry::Insert {
                         id: *id,
                         vector: v,
-                        meta: meta.clone(),
+                        meta,
                     });
                 }
                 BatchOp::Delete { id } => prepared.push(Entry::Delete { id: *id }),
@@ -813,6 +925,7 @@ impl Db {
             }
             i.garbage()
         };
+        bump(&self.counters.batches);
         self.maybe_auto_checkpoint(garbage)
     }
 
@@ -873,6 +986,7 @@ impl Db {
             .text_field
             .as_deref()
             .ok_or(Error::Corrupt("search_text needs Options::text_field"))?;
+        bump(&self.counters.text_searches);
         let terms = text::tokenize(query);
         if terms.is_empty() || k == 0 {
             return Ok(Vec::new());
@@ -977,20 +1091,85 @@ impl Db {
             Some(f) => self.search_where(query, wide, f)?,
             None => self.search(query, wide)?,
         };
-        let sparse = self.search_text(text, wide, filter)?;
-        let mut fused: HashMap<u64, f32> = HashMap::new();
-        for list in [&dense, &sparse] {
-            for (rank, h) in list.iter().enumerate() {
-                *fused.entry(h.id).or_insert(0.0) += 1.0 / (60.0 + rank as f32 + 1.0);
+        let keyword = self.search_text(text, wide, filter)?;
+        Ok(fuse(&[dense, keyword], k))
+    }
+
+    /// Dot-product search over the store's sparse key (the one metadata key
+    /// holding `Value::Sparse` values): indexed records through the inverted
+    /// index in the index file, records written since the last checkpoint by
+    /// brute force over their metadata. `Hit::score` is the negated dot
+    /// product. The query's pairs are normalised like stored ones (sorted,
+    /// duplicates summed). Empty before any sparse value was written.
+    pub fn search_sparse(
+        &self,
+        query: &[(u32, f32)],
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<Hit>> {
+        bump(&self.counters.sparse_searches);
+        let mut q = query.to_vec();
+        if !sparse::normalise(&mut q) {
+            return Err(Error::InvalidVector);
+        }
+        if q.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        self.refresh()?;
+        let i = self.read()?;
+        let Some(field) = i.sparse_key() else {
+            return Ok(Vec::new());
+        };
+        let dead = !i.tombstones.is_empty();
+        let passes = |id: u64| filter.is_none_or(|f| i.metadata_of(id).is_some_and(|m| f.eval(&m)));
+        let mut hits: Vec<Hit> = Vec::new();
+        if let Some(g) = &i.graph
+            && let Some(sp) = g.sparse()
+        {
+            let mut scores: HashMap<u32, f32> = HashMap::new();
+            for &(term, qw) in &q {
+                for (slot, w) in sp.postings(g.bytes(), term) {
+                    if dead && i.tombstones.contains(&slot) {
+                        continue;
+                    }
+                    *scores.entry(slot).or_insert(0.0) += qw * w;
+                }
+            }
+            hits.extend(scores.into_iter().map(|(slot, s)| Hit {
+                id: g.id(slot),
+                score: -s,
+            }));
+        }
+        for (id, _) in i.delta.iter() {
+            if let Some(Value::Sparse(p)) = i.meta.get(&id).and_then(|m| m.get(field)) {
+                let s = sparse::dot(&q, p);
+                if s != 0.0 {
+                    hits.push(Hit { id, score: -s });
+                }
             }
         }
-        let mut hits: Vec<Hit> = fused
-            .into_iter()
-            .map(|(id, s)| Hit { id, score: -s })
-            .collect();
+        hits.retain(|h| passes(h.id));
         hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
         hits.truncate(k);
         Ok(hits)
+    }
+
+    /// Dense and sparse search fused by reciprocal rank, as `search_hybrid`
+    /// does for dense and keyword search.
+    pub fn search_hybrid_sparse(
+        &self,
+        query: &[f32],
+        sparse: &[(u32, f32)],
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<Hit>> {
+        let wide = k.saturating_mul(3).max(k);
+        let dense = match filter {
+            Some(f) => self.search_where(query, wide, f)?,
+            None => self.search(query, wide)?,
+        };
+        let sparse = self.search_sparse(sparse, wide, filter)?;
+        Ok(fuse(&[dense, sparse], k))
     }
 
     pub fn search_many_where(
@@ -1063,6 +1242,10 @@ impl Db {
         let mut hits = i
             .delta
             .search(query, k, passes, &|off| i.wal.vector_at(off));
+        bump(&self.counters.searches);
+        if i.graph.is_none() {
+            bump(&self.counters.delta_only);
+        }
         if let Some(g) = &i.graph {
             let (beam, max_beam, width) = (
                 self.opts.search_beam as usize,
@@ -1084,27 +1267,36 @@ impl Db {
                         .flatten()
                         .filter(|c| c.len() <= max_scan);
                     match scan {
-                        Some(c) => g.scan(query, k, c.into_iter().filter(|&s| live(s))),
-                        None => g.search(
-                            query,
-                            k,
-                            beam,
-                            max_beam,
-                            width,
-                            |slot| live(slot) && g.pass(p, slot),
-                            true,
-                        ),
+                        Some(c) => {
+                            bump(&self.counters.exact_scans);
+                            g.scan(query, k, c.into_iter().filter(|&s| live(s)))
+                        }
+                        None => {
+                            bump(&self.counters.filtered_walks);
+                            g.search(
+                                query,
+                                k,
+                                beam,
+                                max_beam,
+                                width,
+                                |slot| live(slot) && g.pass(p, slot),
+                                true,
+                            )
+                        }
                     }
                 }
-                None => g.search(
-                    query,
-                    k,
-                    beam,
-                    max_beam,
-                    width,
-                    |slot| live(slot) && passes(g.id(slot)),
-                    false,
-                ),
+                None => {
+                    bump(&self.counters.graph_walks);
+                    g.search(
+                        query,
+                        k,
+                        beam,
+                        max_beam,
+                        width,
+                        |slot| live(slot) && passes(g.id(slot)),
+                        false,
+                    )
+                }
             };
             hits.extend(graph_hits.into_iter().map(|(score, slot)| Hit {
                 id: g.id(slot),
@@ -1140,6 +1332,30 @@ impl Db {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        let t = std::time::Instant::now();
+        match self.checkpoint_inner() {
+            Ok(incremental) => {
+                let ms = t.elapsed().as_millis() as u64;
+                self.counters
+                    .last_checkpoint_ms
+                    .store(ms, Ordering::Relaxed);
+                bump(&self.counters.checkpoints);
+                if incremental {
+                    bump(&self.counters.incremental_checkpoints);
+                }
+                event!(path = %self.path.display(), incremental, ms, records = self.len(), "checkpoint");
+                Ok(())
+            }
+            Err(e) => {
+                bump(&self.counters.failed_checkpoints);
+                event!(warn, path = %self.path.display(), error = %e, "checkpoint failed");
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns whether the graph was updated in place.
+    fn checkpoint_inner(&self) -> Result<bool> {
         let _one_at_a_time = self.checkpoint_lock.lock();
         let dim = self.header.dim as usize;
         // The new index gets its own file name; nothing is ever renamed over
@@ -1153,7 +1369,7 @@ impl Db {
         //    The temp file is memory-mapped, so the build's working set, not
         //    the dataset, has to fit in RAM.
         let vec_tmp = sidecar(&self.path, ".vec.tmp");
-        let (ids, snap_seq, base, metas, old_graph) = {
+        let (ids, snap_seq, base, metas, old_graph, sparse_key) = {
             let mut i = self.write()?;
             i.wal.sync()?;
             let live_in_graph = i.graph.as_ref().map_or(0, |g| g.len() - i.tombstones.len());
@@ -1196,7 +1412,8 @@ impl Db {
             let metas: HashMap<u64, Arc<Metadata>> =
                 i.meta.iter().map(|(&id, m)| (id, m.clone())).collect();
             let old_graph = i.graph.clone();
-            (ids, i.write_seq, base, metas, old_graph)
+            let sparse_key = i.sparse_key().map(str::to_string);
+            (ids, i.write_seq, base, metas, old_graph, sparse_key)
         };
         let meta_of = |id: u64| {
             metas.get(&id).cloned().or_else(|| {
@@ -1231,6 +1448,7 @@ impl Db {
                     self.opts.graph,
                     &meta_of,
                     self.opts.text_field.as_deref(),
+                    sparse_key.as_deref(),
                 ),
                 None => graph::build_and_write(
                     &idx_new,
@@ -1241,9 +1459,11 @@ impl Db {
                     self.opts.graph,
                     &meta_of,
                     self.opts.text_field.as_deref(),
+                    sparse_key.as_deref(),
                 ),
             }
         })();
+        let incremental = base.is_some();
         drop(base);
         drop(old_graph);
         let _ = std::fs::remove_file(&vec_tmp);
@@ -1312,7 +1532,7 @@ impl Db {
         // unchanged, so the delta's offsets stay valid) and report the error.
         i.wal.release();
         if let Err(e) = io_ctx(
-            std::fs::rename(&log_tmp, &self.path),
+            fault::log_rename(&self.path).and_then(|_| std::fs::rename(&log_tmp, &self.path)),
             "replace log",
             &self.path,
         ) {
@@ -1354,7 +1574,7 @@ impl Db {
         if old_index != idx_new {
             let _ = std::fs::remove_file(&old_index);
         }
-        Ok(())
+        Ok(incremental)
     }
 
     fn maybe_auto_checkpoint(
@@ -1452,8 +1672,25 @@ impl Inner {
                     got: v.kind(),
                 });
             }
+            if v.kind() == Kind::Sparse
+                && let Some(have) = self.sparse_key()
+                && have != k
+            {
+                return Err(Error::SecondSparseKey {
+                    have: have.to_string(),
+                    got: k.clone(),
+                });
+            }
         }
         Ok(())
+    }
+
+    /// The one metadata key holding sparse vectors, if any has been written.
+    fn sparse_key(&self) -> Option<&str> {
+        self.types
+            .iter()
+            .find(|(_, k)| **k == Kind::Sparse)
+            .map(|(k, _)| k.as_str())
     }
 
     /// Record each key's type; first writer wins (used on replay, where the
@@ -1532,6 +1769,44 @@ impl Inner {
 }
 
 /// `<path>.idx.<16 hex digits>` for a numbered snapshot, `<path>.idx` otherwise.
+/// Size limits of the log's metadata encoding, and sparse vectors sorted,
+/// merged and checked for finite weights.
+fn check_meta(mut meta: Metadata) -> Result<Metadata> {
+    if meta.len() > u16::MAX as usize
+        || meta.iter().any(|(k, v)| {
+            k.len() > u16::MAX as usize || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)
+        })
+    {
+        return Err(Error::MetaTooLarge);
+    }
+    for v in meta.values_mut() {
+        if let Value::Sparse(p) = v
+            && !sparse::normalise(p)
+        {
+            return Err(Error::InvalidVector);
+        }
+    }
+    Ok(meta)
+}
+
+/// Reciprocal rank fusion: a record scores `sum(1 / (60 + rank))` over the
+/// lists it appears in; the result is the top `k` by that, score negated.
+fn fuse(lists: &[Vec<Hit>], k: usize) -> Vec<Hit> {
+    let mut fused: HashMap<u64, f32> = HashMap::new();
+    for list in lists {
+        for (rank, h) in list.iter().enumerate() {
+            *fused.entry(h.id).or_insert(0.0) += 1.0 / (60.0 + rank as f32 + 1.0);
+        }
+    }
+    let mut hits: Vec<Hit> = fused
+        .into_iter()
+        .map(|(id, s)| Hit { id, score: -s })
+        .collect();
+    hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
+    hits.truncate(k);
+    hits
+}
+
 fn index_path_for(path: &Path, snapshot: Option<u64>) -> PathBuf {
     match snapshot {
         Some(id) => sidecar(path, &format!(".idx.{id:016x}")),

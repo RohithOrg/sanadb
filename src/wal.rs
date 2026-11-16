@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
@@ -126,6 +126,7 @@ pub(crate) struct Wal {
     buf: Option<Vec<u8>>,
     /// Identity of the file `buf` was read from, to notice a replacement.
     ident: Option<FileIdent>,
+    path: PathBuf,
 }
 
 /// What tells one log file from the one that replaced it at the same path.
@@ -187,6 +188,7 @@ impl Wal {
             dim: wanted.dim as usize,
             buf: Some(buf),
             ident: Some(ident),
+            path: path.to_path_buf(),
         };
         Ok((wal, entries))
     }
@@ -266,6 +268,7 @@ impl Wal {
                 dim: wanted.dim as usize,
                 buf: None,
                 ident: None,
+                path: path.to_path_buf(),
             },
             entries,
         ))
@@ -279,6 +282,7 @@ impl Wal {
 
     /// Append a frame. For an insert, returns the byte offset of its vector.
     pub fn append(&mut self, entry: &Entry) -> Result<u64> {
+        crate::fault::log_append(&self.path)?;
         let mut body = Vec::new();
         encode(entry, &mut body);
         let needed = self.len + 8 + body.len() as u64;
@@ -634,6 +638,13 @@ fn put_meta(out: &mut Vec<u8>, meta: &Metadata) {
             Value::Int(i) => out.extend_from_slice(&i.to_le_bytes()),
             Value::Float(x) => out.extend_from_slice(&x.to_le_bytes()),
             Value::Bool(b) => out.push(*b as u8),
+            Value::Sparse(p) => {
+                out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                for (i, w) in p {
+                    out.extend_from_slice(&i.to_le_bytes());
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
+            }
         }
     }
 }
@@ -729,6 +740,23 @@ impl<'a> Cursor<'a> {
                 1 => true,
                 _ => return None,
             }),
+            Kind::Sparse => {
+                let n = u32::from_le_bytes(self.take(4)?.try_into().ok()?) as usize;
+                let bytes = self.take(n.checked_mul(8)?)?;
+                Value::Sparse(
+                    bytes
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| {
+                            (
+                                u32::from_le_bytes(c[..4].try_into().unwrap()),
+                                f32::from_le_bytes(c[4..].try_into().unwrap()),
+                            )
+                        })
+                        .collect(),
+                )
+            }
         })
     }
     fn meta(&mut self) -> Option<Metadata> {

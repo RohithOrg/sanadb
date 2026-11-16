@@ -1,0 +1,21 @@
+site_name: sanadb
+site_description: Disk-first embedded vector + metadata store
+repo_url: https://github.com/RohithOrg/sanadb
+docs_dir: docs
+theme:
+  name: material
+  palette:
+    - scheme: default
+      toggle: { icon: material/brightness-7, name: Dark }
+    - scheme: slate
+      toggle: { icon: material/brightness-4, name: Light }
+  features: [navigation.sections, content.code.copy]
+markdown_extensions: [tables, fenced_code, toc]
+nav:
+  - Overview: index.md
+  - File format: FORMAT.md
+  - Design notes:
+      - Snapshot and tail: design/snapshot-and-tail.md
+      - Typed metadata and filtered search: design/typed-metadata-and-filtered-search.md
+      - Hybrid search: design/hybrid-search.md
+  - Changelog: CHANGELOG.md

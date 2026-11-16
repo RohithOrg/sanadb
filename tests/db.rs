@@ -4,6 +4,10 @@ use std::io::Write;
 
 use sanadb::{Db, Metadata, Metric, Options, Value};
 
+/// Process start, for timestamping diagnostics across tests.
+static START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
 fn meta(pairs: &[(&str, &str)]) -> Metadata {
     pairs
         .iter()
@@ -860,6 +864,10 @@ fn survives_being_killed_mid_write() {
     let exe = std::env::current_exe().unwrap();
     let mut expected_min = 0usize;
     for round in 0..6 {
+        eprintln!(
+            "crash test: spawning child round {round} at {:?}",
+            START.elapsed()
+        );
         let mut child = std::process::Command::new(&exe)
             .args([
                 "crash_child_writes_until_killed",
@@ -876,6 +884,10 @@ fn survives_being_killed_mid_write() {
         std::thread::sleep(std::time::Duration::from_millis(150 + 90 * round));
         child.kill().unwrap();
         child.wait().unwrap();
+        eprintln!(
+            "crash test: child round {round} gone at {:?}",
+            START.elapsed()
+        );
 
         let db = Db::open(&path, Options::new(8))
             .unwrap_or_else(|e| panic!("round {round}: reopen failed: {e}"));
@@ -959,14 +971,28 @@ fn corrupted_logs_never_panic() {
             | Err(sanadb::Error::HeaderMismatch { .. })
             | Err(sanadb::Error::NeedsNewerVersion { .. }) => outcomes[1] += 1,
             Err(e) => {
-                // Who holds it? Ask lsof before retrying, so a transient holder is named.
+                // How long does it stay held? Retry every millisecond and
+                // time it, then ask lsof; a holder that outlives the retry
+                // window shows up there, a release lag does not.
+                let t0 = std::time::Instant::now();
+                let mut held_for = None;
+                for _ in 0..500 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    if Db::open(&path, Options::new(4)).is_ok() {
+                        held_for = Some(t0.elapsed());
+                        break;
+                    }
+                }
+                eprintln!(
+                    "lock held for {held_for:?} after the failure at {:?} since test start",
+                    START.elapsed()
+                );
                 let lock = format!("{}.lock", path.display());
                 let who = std::process::Command::new("lsof")
                     .arg(&lock)
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                     .unwrap_or_default();
-                std::thread::sleep(std::time::Duration::from_millis(50));
                 let again = Db::open(&path, Options::new(4)).map(|_| ());
                 eprintln!(
                     "unexpected error class at iteration {iter} (bytes {}): {e}; this pid {}; lsof:\n{who}retry after 50 ms: {:?}",
@@ -1690,6 +1716,19 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
         w.len()
     );
     assert!(rounds > 10);
+    // While the reader mapped an old index, the writer could not delete it on
+    // Windows (Unix deletes it at once). Either way, once the reader is gone,
+    // the next writer open leaves exactly the current index behind.
+    drop(w);
+    let w = Db::open(&path, Options::new(dim as u32)).unwrap();
+    let idx_files: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .filter(|n| n.starts_with("xp.sana.idx"))
+        .collect();
+    assert_eq!(idx_files.len(), 1, "{idx_files:?}");
+    assert_eq!(dir.path().join(&idx_files[0]), w.index_path().unwrap());
 }
 
 /// Flip bits in the index file at random; every open must be `Ok` or a
@@ -1785,7 +1824,9 @@ fn corrupted_indexes_never_panic() {
 
 /// Stores written by the published 0.1.1, 0.1.3 and 0.1.4 crates
 /// (`tests/fixtures/`, 68 records of dim 4 with two string keys, one delete
-/// and one overwrite before the checkpoint, ten inserts and a delete after).
+/// and one overwrite before the checkpoint, ten inserts and a delete after)
+/// and by 0.2.0 (67 records, typed keys and a text field; the recipe is
+/// `current_layout_matches_the_format_document`).
 /// Each must open, read back exactly, accept new writes, checkpoint into the
 /// current layout and reopen.
 #[test]
@@ -1795,15 +1836,17 @@ fn opens_stores_written_by_every_published_version() {
             .map(|d| ((i * 7 + d * 13) % 101) as f32 / 101.0)
             .collect()
     };
-    for version in ["0.1.1", "0.1.3", "0.1.4"] {
+    for version in ["0.1.1", "0.1.3", "0.1.4", "0.2.0"] {
         let dir = tempfile::tempdir().unwrap();
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(format!("v{version}"));
-        for name in ["fixture.sana", "fixture.sana.idx"] {
-            std::fs::copy(src.join(name), dir.path().join(name)).unwrap();
+        for e in std::fs::read_dir(&src).unwrap().flatten() {
+            std::fs::copy(e.path(), dir.path().join(e.file_name())).unwrap();
         }
         let path = dir.path().join("fixture.sana");
+        let typed = matches!(version, "0.1.4" | "0.2.0");
+        let records = if version == "0.2.0" { 67 } else { 68 };
         let check = |db: &Db, stage: &str, len: usize| {
             assert_eq!(db.len(), len, "{version} {stage}: len");
             assert!(
@@ -1814,7 +1857,14 @@ fn opens_stores_written_by_every_published_version() {
             assert_eq!(v, vec_of4(1), "{version} {stage}: vector");
             assert_eq!(m["k"], "v1", "{version} {stage}: metadata");
             // 0.1.4 wrote typed ints; the older two wrote strings, kept as strings.
-            if version == "0.1.4" {
+            if version == "0.2.0" {
+                assert_eq!(
+                    m["sp"],
+                    Value::Sparse(vec![(1, 1.0), (101, 0.5)]),
+                    "{version} {stage}"
+                );
+            }
+            if typed {
                 assert_eq!(m["i"], Value::Int(1), "{version} {stage}");
             } else {
                 assert_eq!(m["i"], "1", "{version} {stage}");
@@ -1844,7 +1894,7 @@ fn opens_stores_written_by_every_published_version() {
         };
         let db =
             Db::open(&path, Options::new(4)).unwrap_or_else(|e| panic!("{version}: open: {e}"));
-        check(&db, "opened", 68);
+        check(&db, "opened", records);
         // Write with the current version, then move everything into the new layout.
         db.insert(
             100,
@@ -1860,7 +1910,7 @@ fn opens_stores_written_by_every_published_version() {
         );
         drop(db);
         let db = Db::open(&path, Options::new(4)).unwrap();
-        check(&db, "after checkpoint and reopen", 69);
+        check(&db, "after checkpoint and reopen", records + 1);
         assert_eq!(db.get(100).unwrap().1["k"], "new");
         let r = Db::open_read_only(&path, Options::new(4)).unwrap();
         assert_eq!(r.get(100).unwrap().1["k"], "new");
@@ -2484,4 +2534,694 @@ fn contains_filter_runs_on_the_text_index() {
         .search_where(&q, 5, &Filter::contains("tags", "common"))
         .unwrap();
     assert!(got.len() == 5 && got.iter().all(|h| !h.id.is_multiple_of(500)));
+}
+
+/// Each injected failure must leave the store usable: the failed operation
+/// reports an error, nothing already acknowledged is lost, and the next
+/// attempt succeeds. Faults are process-global, so this test runs its
+/// scenarios one after another in one function.
+#[test]
+fn injected_io_failures_leave_the_store_consistent() {
+    use sanadb::fault::{Fault, set_fault};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("faults.sana");
+    let dim = 4usize;
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..2000u64 {
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "a")])).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let first_index = db.index_path().unwrap();
+    for i in 2000..2100u64 {
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "b")])).unwrap();
+    }
+    let check = |db: &Db, stage: &str| {
+        assert_eq!(db.len(), 2100, "{stage}");
+        assert_eq!(db.get(5).unwrap().1["k"], "a", "{stage}");
+        assert_eq!(db.get(2050).unwrap().1["k"], "b", "{stage}");
+        assert_eq!(
+            db.search(&vec_of(dim, 2050), 1).unwrap()[0].id,
+            2050,
+            "{stage}"
+        );
+    };
+
+    // 1. Disk fills while the new index is being written.
+    set_fault(&path, Some(Fault::IndexWriteAfter(100_000)));
+    let r = db.checkpoint();
+    assert!(matches!(r, Err(sanadb::Error::Io(_))), "{r:?}");
+    check(&db, "after failed index write");
+    assert_eq!(
+        db.index_path().unwrap(),
+        first_index,
+        "old index still current"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .filter(|n| n.contains(".idx.") || n.ends_with(".tmp"))
+        .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "no partial index or temp file left: {leftovers:?}"
+    );
+
+    // 2. The index fsync fails.
+    set_fault(&path, Some(Fault::IndexSync));
+    assert!(db.checkpoint().is_err());
+    check(&db, "after failed index sync");
+    assert_eq!(db.index_path().unwrap(), first_index);
+
+    // 3. The log rename at the end of the swap fails: the new index is
+    //    discarded and the old log stays, so nothing acknowledged is lost.
+    set_fault(&path, Some(Fault::LogRename));
+    assert!(db.checkpoint().is_err());
+    check(&db, "after failed log rename");
+    assert_eq!(db.index_path().unwrap(), first_index);
+    db.insert(2100, &vec_of(dim, 2100), meta(&[("k", "c")]))
+        .unwrap();
+    assert_eq!(db.len(), 2101);
+
+    // 4. A log append fails: the insert reports it and writes nothing.
+    set_fault(&path, Some(Fault::LogAppend));
+    assert!(matches!(
+        db.insert(3000, &vec_of(dim, 3000), HashMap::new()),
+        Err(sanadb::Error::Io(_))
+    ));
+    assert!(db.get(3000).is_none());
+    assert_eq!(db.len(), 2101);
+    set_fault(&path, Some(Fault::LogAppend));
+    assert!(db.delete(0).is_err());
+    assert!(db.get(0).is_some());
+    set_fault(&path, Some(Fault::LogAppend));
+    assert!(
+        db.write_batch(sanadb::Batch::new().insert(3001, &vec_of(dim, 3001), HashMap::new()))
+            .is_err()
+    );
+    assert!(db.get(3001).is_none());
+
+    // 5. With the faults gone, the checkpoint succeeds and a reopen agrees.
+    set_fault(&path, None);
+    db.checkpoint().unwrap();
+    assert_ne!(db.index_path().unwrap(), first_index);
+    assert_eq!(db.len(), 2101);
+    assert_eq!(db.get(2100).unwrap().1["k"], "c");
+    drop(db);
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), 2101);
+    assert_eq!(db.get(2050).unwrap().1["k"], "b");
+    let idx_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .filter(|n| n.contains(".idx."))
+        .collect();
+    assert_eq!(idx_files.len(), 1, "{idx_files:?}");
+}
+
+#[test]
+fn stats_count_operations_by_regime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats.sana");
+    let dim = 4usize;
+    let db = Db::open(&path, Options::new(dim as u32).exact_filter_scan(100)).unwrap();
+    assert_eq!(db.stats(), sanadb::Stats::default());
+    for i in 0..3000u64 {
+        let k = if i % 1000 == 0 { "rare" } else { "common" };
+        db.insert(i, &vec_of(dim, i), meta(&[("k", k)])).unwrap();
+    }
+    db.search(&vec_of(dim, 1), 5).unwrap();
+    let s = db.stats();
+    assert_eq!(
+        (s.inserts, s.searches, s.delta_only, s.checkpoints),
+        (3000, 1, 1, 0)
+    );
+    db.checkpoint().unwrap();
+    db.insert(5000, &vec_of(dim, 5000), meta(&[("k", "rare")]))
+        .unwrap();
+    db.delete(1).unwrap();
+    db.write_batch(sanadb::Batch::new().delete(2).delete(3))
+        .unwrap();
+    db.checkpoint().unwrap();
+    db.search(&vec_of(dim, 1), 5).unwrap();
+    db.search_filtered(&vec_of(dim, 1), 5, |_| true).unwrap();
+    db.search_where(&vec_of(dim, 1), 5, &sanadb::Filter::eq("k", "rare"))
+        .unwrap();
+    db.search_where(&vec_of(dim, 1), 5, &sanadb::Filter::eq("k", "common"))
+        .unwrap();
+    let s = db.stats();
+    assert_eq!(s.inserts, 3001);
+    assert_eq!((s.deletes, s.batches), (1, 1));
+    assert_eq!(
+        (
+            s.checkpoints,
+            s.incremental_checkpoints,
+            s.failed_checkpoints
+        ),
+        (2, 1, 0)
+    );
+    assert_eq!(
+        (s.searches, s.graph_walks, s.exact_scans, s.filtered_walks),
+        (5, 2, 1, 1)
+    );
+    assert_eq!(s.delta_only, 1);
+
+    let reader = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
+    db.insert(6000, &vec_of(dim, 6000), HashMap::new()).unwrap();
+    assert_eq!(reader.len(), 2999);
+    db.checkpoint().unwrap();
+    assert_eq!(reader.len(), 2999);
+    let r = reader.stats();
+    assert_eq!((r.refresh_appended, r.refresh_reloaded), (1, 1), "{r:?}");
+}
+
+/// The store the current version writes, checked byte for byte against
+/// `docs/FORMAT.md`: the layout is frozen from 0.2.0 on, so the constants
+/// here change only with a reader level and a changelog entry. Run with
+/// `SANADB_WRITE_FIXTURE=1` to write `tests/fixtures/v<version>/` for the
+/// upgrade test above (done once per release, after the version bump).
+#[test]
+fn current_layout_matches_the_format_document() {
+    let vec_of4 = |i: u64| -> Vec<f32> {
+        (0..4u64)
+            .map(|d| ((i * 7 + d * 13) % 101) as f32 / 101.0)
+            .collect()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.sana");
+    let opts = || Options::new(4).text_field("body").exact_filter_scan(8);
+    let db = Db::open(&path, opts()).unwrap();
+    for i in 0..60u64 {
+        db.insert(
+            i,
+            &vec_of4(i),
+            HashMap::from([
+                ("k".to_string(), Value::from(format!("v{}", i % 3))),
+                ("i".to_string(), Value::Int(i as i64)),
+                ("f".to_string(), Value::Float(i as f64 / 4.0)),
+                ("b".to_string(), Value::Bool(i % 2 == 0)),
+                (
+                    "body".to_string(),
+                    Value::from(format!("record {i} tag{}", i % 5)),
+                ),
+                (
+                    "sp".to_string(),
+                    Value::Sparse(vec![(i as u32 % 7, 1.0), (100 + i as u32, 0.5)]),
+                ),
+            ]),
+        )
+        .unwrap();
+    }
+    db.delete(5).unwrap();
+    db.delete(7).unwrap();
+    db.insert(6, &vec_of4(6), meta(&[("k", "over")])).unwrap();
+    db.checkpoint().unwrap();
+    db.write_batch(
+        (60..70u64)
+            .fold(sanadb::Batch::new(), |b, i| {
+                b.insert(
+                    i,
+                    &vec_of4(i),
+                    meta(&[("k", if i == 65 { "tail" } else { "v9" })]),
+                )
+            })
+            .delete(8),
+    )
+    .unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.len(), 67);
+
+    // Log bytes.
+    let log = std::fs::read(&path).unwrap();
+    assert_eq!(&log[..8], b"SANADB02");
+    assert_eq!(u32::from_le_bytes(log[8..12].try_into().unwrap()), 4, "dim");
+    assert_eq!(log[12], 0, "metric L2");
+    assert_eq!(log[13], 3, "log reader level");
+    assert_eq!(&log[14..16], &[0, 0]);
+    // Frame 1 is the Snapshot naming the index.
+    let len = u32::from_le_bytes(log[16..20].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(log[20..24].try_into().unwrap());
+    let body = &log[24..24 + len];
+    assert_eq!(len, 12, "snapshot body: kind, pad, id");
+    assert_eq!(crc32fast::hash(body), crc);
+    assert_eq!(&body[..4], &[4, 0, 0, 0], "kind Snapshot");
+    let snap = u64::from_le_bytes(body[4..12].try_into().unwrap());
+    let idx = dir.path().join(format!("fixture.sana.idx.{snap:016x}"));
+    assert_eq!(db.index_path().unwrap(), idx);
+    // Then Begin, eight Inserts, a Delete, Commit.
+    let mut pos = 24 + len;
+    let mut kinds = Vec::new();
+    while pos < log.len() {
+        let len = u32::from_le_bytes(log[pos..pos + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            break; // growth slack: the file is extended ahead of the frames
+        }
+        assert!(len.is_multiple_of(4));
+        kinds.push(log[pos + 8]);
+        if log[pos + 8] == 1 {
+            // Insert: id, 4 f32, metadata count u16, key "k" (len 1), kind Str (0), value.
+            let b = &log[pos + 8..pos + 8 + len];
+            assert!(b.len() >= 4 + 8 + 16 + 2 + 3 + 1 + 2);
+            assert_eq!(
+                u16::from_le_bytes(b[28..30].try_into().unwrap()),
+                1,
+                "one key"
+            );
+            assert_eq!(&b[30..33], &[1, 0, b'k'], "key length and bytes");
+            assert_eq!(b[33], 0, "value kind Str");
+        }
+        pos += 8 + len;
+    }
+    assert_eq!(
+        kinds,
+        [5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 6],
+        "frame kinds"
+    );
+
+    // Index bytes.
+    let ix = std::fs::read(&idx).unwrap();
+    assert_eq!(&ix[..8], b"SANAIDX2");
+    assert_eq!(u32::from_le_bytes(ix[8..12].try_into().unwrap()), 4);
+    assert_eq!(
+        &ix[12..16],
+        &[0, 1, 0, 0],
+        "metric, index level 1, f32 storage, pad"
+    );
+    let u32_at = |o: usize| u32::from_le_bytes(ix[o..o + 4].try_into().unwrap()) as usize;
+    let u64_at = |o: usize| u64::from_le_bytes(ix[o..o + 8].try_into().unwrap()) as usize;
+    let (n, r, entry, block, m) = (u32_at(16), u32_at(20), u32_at(24), u32_at(28), u32_at(32));
+    assert_eq!(n, 58, "60 inserted, two deleted before the checkpoint");
+    assert_eq!(r, 32);
+    assert!(entry < n);
+    assert_eq!(block, (4 * 4 + 4 + 4 * r).next_multiple_of(64));
+    assert_eq!(m, 0, "PQ is skipped below pq::MIN_N");
+    let ids: Vec<u64> = (0..n).map(|s| u64_at(36 + s * 8) as u64).collect();
+    assert!(!ids.contains(&5) && !ids.contains(&7) && ids.contains(&6));
+    let blocks_off = (36 + n * 8).next_multiple_of(64);
+    for s in 0..n {
+        let b = &ix[blocks_off + s * block..blocks_off + (s + 1) * block];
+        let v: Vec<f32> = b[..16]
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let want = if ids[s] == 6 {
+            vec_of4(6)
+        } else {
+            vec_of4(ids[s])
+        };
+        assert_eq!(v, want, "vector of slot {s}");
+        let degree = u32::from_le_bytes(b[16..20].try_into().unwrap()) as usize;
+        assert!(degree <= r);
+        for e in 0..degree {
+            assert!(
+                (u32::from_le_bytes(b[20 + e * 4..24 + e * 4].try_into().unwrap()) as usize) < n
+            );
+        }
+        assert!(
+            b[20 + degree * 4..].iter().all(|&x| x == 0),
+            "zero after the edges"
+        );
+    }
+    assert_eq!(&ix[ix.len() - 8..], b"SANAFTR2");
+    let f = ix.len() - 40;
+    let (attrs_table, idtab, text_table, sparse_table) =
+        (u64_at(f), u64_at(f + 8), u64_at(f + 16), u64_at(f + 24));
+    assert_eq!(u64_at(attrs_table), n, "attribute table starts with n");
+    assert_eq!(
+        u32_at(attrs_table + 8),
+        5,
+        "five columns: b, body, f, i, k; the sparse key is not a column"
+    );
+    assert_eq!(u64_at(sparse_table), n, "sparse table starts with n");
+    assert_eq!(u64_at(sparse_table + 16), 2, "field name length");
+    assert_eq!(&ix[u64_at(sparse_table + 8)..][..2], b"sp");
+    assert_eq!(
+        u64_at(sparse_table + 40),
+        (n - 1) * 2,
+        "two pairs per record with a body"
+    );
+    // Id table: sorted ids then their slots.
+    let sorted: Vec<u64> = (0..n).map(|s| u64_at(idtab + s * 8) as u64).collect();
+    assert!(sorted.windows(2).all(|w| w[0] < w[1]));
+    for (s, id) in sorted.iter().enumerate() {
+        let slot = u32_at(idtab + n * 8 + s * 4);
+        assert_eq!(ids[slot], *id);
+    }
+    assert_eq!(u64_at(text_table), n, "text table starts with n");
+    assert_eq!(
+        u64_at(text_table + 8),
+        n - 1,
+        "record 6 was overwritten without a body"
+    );
+    assert_eq!(
+        u64_at(text_table + 64),
+        1 + 5 + 57,
+        "terms: 'record', five tags, 57 numbers"
+    );
+    drop(db);
+
+    if std::env::var_os("SANADB_WRITE_FIXTURE").is_some() {
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("v{}", env!("CARGO_PKG_VERSION")));
+        std::fs::create_dir_all(&out).unwrap();
+        for e in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let name = e.file_name();
+            if name.to_str().unwrap().ends_with(".lock") {
+                continue;
+            }
+            std::fs::copy(e.path(), out.join(name)).unwrap();
+        }
+    }
+}
+
+/// Soak: one writer (inserts, overwrites, deletes, batches), a checkpoint
+/// loop, two read-only handles in this process and one in a child process,
+/// for `SANADB_SOAK_SECS` seconds (default 30). Every reader checks what it
+/// sees for internal consistency; at the end the store must agree with the
+/// writer's model exactly, before and after a reopen. Ignored by default:
+/// `cargo test --release -- --ignored soak --nocapture`, or `scripts/soak.sh`.
+#[test]
+#[ignore]
+fn soak_readers_writer_and_checkpoints() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let secs: u64 = std::env::var("SANADB_SOAK_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("soak.sana");
+    let dim = 8usize;
+    let opts = || Options::new(dim as u32).exact_filter_scan(1000);
+    let w = Db::open(&path, opts()).unwrap();
+    // Model of what the store holds: id -> present. Vectors and metadata are
+    // functions of the id (`vec_of`, `i == id`), as the child reader expects.
+    let model: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
+    for i in 0..1000u64 {
+        w.insert(
+            i,
+            &vec_of(dim, i),
+            HashMap::from([("i".to_string(), Value::from(i as i64))]),
+        )
+        .unwrap();
+        model.lock().unwrap().insert(i);
+    }
+    w.checkpoint().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "reader_child_reads_until_told_to_stop",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("SANADB_READER_CHILD", &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let counts = Mutex::new([0u64; 4]); // inserts, deletes, batches, checkpoints
+    std::thread::scope(|s| {
+        // Writer.
+        s.spawn(|| {
+            let mut next = 1000u64;
+            let mut rng = 0x5EEDu64;
+            let mut rnd = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mk = |i: u64| HashMap::from([("i".to_string(), Value::from(i as i64))]);
+            while std::time::Instant::now() < deadline {
+                let mut m = model.lock().unwrap();
+                let mut c = counts.lock().unwrap();
+                match rnd() % 10 {
+                    0..=5 => {
+                        w.insert(next, &vec_of(dim, next), mk(next)).unwrap();
+                        m.insert(next);
+                        next += 1;
+                        c[0] += 1;
+                    }
+                    6 => {
+                        // Overwrite an existing id with the same content.
+                        let id = rnd() % next;
+                        if m.contains(&id) {
+                            w.insert(id, &vec_of(dim, id), mk(id)).unwrap();
+                            c[0] += 1;
+                        }
+                    }
+                    7 => {
+                        let id = rnd() % next;
+                        // Keep the count growing so the child's monotonic check holds.
+                        if m.len() > 1000 && m.remove(&id) {
+                            assert!(w.delete(id).unwrap());
+                            c[1] += 1;
+                        }
+                    }
+                    _ => {
+                        let mut b = sanadb::Batch::new();
+                        for _ in 0..20 {
+                            b = b.insert(next, &vec_of(dim, next), mk(next));
+                            m.insert(next);
+                            next += 1;
+                        }
+                        w.write_batch(b).unwrap();
+                        c[2] += 1;
+                    }
+                }
+                drop(c);
+                drop(m);
+                if rnd() % 50 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            stop.store(true, Ordering::Release);
+        });
+        // Checkpoints.
+        s.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                w.checkpoint().unwrap();
+                counts.lock().unwrap()[3] += 1;
+            }
+        });
+        // In-process readers: everything a hit points at must be its own id's content.
+        for t in 0..2u64 {
+            let stop = &stop;
+            let path = &path;
+            s.spawn(move || {
+                let r = Db::open_read_only(path, opts()).unwrap();
+                let mut rounds = 0u64;
+                let mut max_len = 0usize;
+                while !stop.load(Ordering::Acquire) {
+                    let q = vec_of(dim, (rounds * 31 + t) % 4000);
+                    for h in r.search(&q, 5).unwrap() {
+                        if let Some((v, m)) = r.get(h.id) {
+                            assert_eq!(v, vec_of(dim, h.id), "reader {t}: vector of {}", h.id);
+                            assert_eq!(
+                                m["i"],
+                                Value::Int(h.id as i64),
+                                "reader {t}: meta of {}",
+                                h.id
+                            );
+                        }
+                    }
+                    let n = r.len();
+                    assert!(n + 2 >= max_len, "reader {t}: len {n} after {max_len}");
+                    max_len = max_len.max(n);
+                    let f = sanadb::Filter::ge("i", 500i64);
+                    for h in r.search_where(&q, 3, &f).unwrap() {
+                        assert!(h.id >= 500, "reader {t}: filter let {} through", h.id);
+                    }
+                    rounds += 1;
+                }
+                eprintln!("reader {t}: {rounds} rounds");
+                assert!(rounds > 10);
+            });
+        }
+    });
+    std::fs::write(path.with_extension("stop"), b"").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "reader child failed: {status}");
+
+    // Final agreement with the model, then after a reopen.
+    let m = model.into_inner().unwrap();
+    let c = counts.into_inner().unwrap();
+    let st = w.stats();
+    eprintln!(
+        "soak {secs}s: {} inserts, {} deletes, {} batches, {} checkpoints ({} incremental, {} failed), {} records",
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        st.incremental_checkpoints,
+        st.failed_checkpoints,
+        m.len()
+    );
+    assert_eq!(st.failed_checkpoints, 0);
+    let agree = |db: &Db, who: &str| {
+        assert_eq!(db.len(), m.len(), "{who}: len");
+        for &id in m.iter().step_by(7) {
+            let (v, meta) = db.get(id).unwrap_or_else(|| panic!("{who}: {id} missing"));
+            assert_eq!(v, vec_of(dim, id), "{who}: vector of {id}");
+            assert_eq!(meta["i"], Value::Int(id as i64), "{who}: meta of {id}");
+        }
+        for id in (0..5000u64).step_by(13) {
+            assert_eq!(
+                db.get(id).is_some(),
+                m.contains(&id),
+                "{who}: presence of {id}"
+            );
+        }
+    };
+    agree(&w, "writer");
+    drop(w);
+    let db = Db::open(&path, opts()).unwrap();
+    agree(&db, "reopened");
+    let idx: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .filter(|n| n.contains(".idx."))
+        .collect();
+    assert_eq!(idx.len(), 1, "one index file after reopen: {idx:?}");
+}
+
+#[test]
+fn sparse_vectors_index_search_and_round_trip() {
+    use sanadb::Filter;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse.sana");
+    let dim = 4usize;
+    let opts = || Options::new(dim as u32);
+    let db = Db::open(&path, opts()).unwrap();
+    let sp_of = |i: u64| -> Vec<(u32, f32)> {
+        vec![
+            (i as u32 % 13, 1.0 + (i % 5) as f32),
+            (50 + i as u32 % 7, 0.5),
+            (1000 + i as u32, 0.1),
+        ]
+    };
+    let n = 400u64;
+    for i in 0..n {
+        db.insert(
+            i,
+            &vec_of(dim, i),
+            HashMap::from([
+                ("sp".to_string(), Value::Sparse(sp_of(i))),
+                ("g".to_string(), Value::Int((i % 3) as i64)),
+            ]),
+        )
+        .unwrap();
+    }
+    let q = [(3u32, 1.0f32), (52, 2.0)];
+    let dot = |p: &[(u32, f32)]| -> f32 {
+        q.iter()
+            .map(|(qi, qw)| p.iter().find(|(i, _)| i == qi).map_or(0.0, |(_, w)| qw * w))
+            .sum()
+    };
+    let brute = |upto: u64, pred: &dyn Fn(u64) -> bool| -> Vec<(u64, f32)> {
+        let mut v: Vec<(u64, f32)> = (0..upto)
+            .filter(|&i| pred(i))
+            .map(|i| (i, dot(&sp_of(i))))
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(10);
+        v
+    };
+    let got = |db: &Db, f: Option<&Filter>| -> Vec<(u64, f32)> {
+        db.search_sparse(&q, 10, f)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.id, -h.score))
+            .collect()
+    };
+    let same = |a: &[(u64, f32)], b: &[(u64, f32)], stage: &str| {
+        assert_eq!(a.len(), b.len(), "{stage}: {a:?} vs {b:?}");
+        for (x, y) in a.iter().zip(b) {
+            assert_eq!(x.0, y.0, "{stage}: {a:?} vs {b:?}");
+            assert!((x.1 - y.1).abs() < 1e-5, "{stage}: {x:?} vs {y:?}");
+        }
+    };
+    // Tail only (brute force), then indexed (inverted lists), then mixed.
+    same(&got(&db, None), &brute(n, &|_| true), "tail");
+    db.checkpoint().unwrap();
+    same(&got(&db, None), &brute(n, &|_| true), "indexed");
+    let f = Filter::eq("g", 1i64);
+    same(
+        &got(&db, Some(&f)),
+        &brute(n, &|i| i % 3 == 1),
+        "indexed, filtered",
+    );
+    for i in n..n + 50 {
+        db.insert(
+            i,
+            &vec_of(dim, i),
+            HashMap::from([("sp".to_string(), Value::Sparse(sp_of(i)))]),
+        )
+        .unwrap();
+    }
+    db.delete(3).unwrap();
+    same(
+        &got(&db, None),
+        &brute(n + 50, &|i| i != 3),
+        "index plus tail, one tombstone",
+    );
+    // Round trip from the index's forward section and from the tail.
+    assert_eq!(db.get(7).unwrap().1["sp"], Value::Sparse(sp_of(7)));
+    assert_eq!(db.get(n + 7).unwrap().1["sp"], Value::Sparse(sp_of(n + 7)));
+    // Normalisation on insert: sorted, duplicates summed, zeros dropped.
+    let messy = vec![(5, 1.0), (2, 1.0), (5, 2.0), (9, 0.0)];
+    db.insert(
+        9000,
+        &vec_of(dim, 9000),
+        HashMap::from([("sp".to_string(), Value::Sparse(messy))]),
+    )
+    .unwrap();
+    assert_eq!(
+        db.get(9000).unwrap().1["sp"],
+        Value::Sparse(vec![(2, 1.0), (5, 3.0)])
+    );
+    let nan = HashMap::from([("sp".to_string(), Value::Sparse(vec![(1, f32::NAN)]))]);
+    assert!(matches!(
+        db.insert(9001, &vec_of(dim, 9001), nan),
+        Err(sanadb::Error::InvalidVector)
+    ));
+    assert!(matches!(
+        db.insert(9002, &vec_of(dim, 9002), meta(&[("sp", "text")])),
+        Err(sanadb::Error::TypeMismatch { .. })
+    ));
+    let second = HashMap::from([("other".to_string(), Value::Sparse(vec![(1, 1.0)]))]);
+    assert!(matches!(
+        db.insert(9003, &vec_of(dim, 9003), second),
+        Err(sanadb::Error::SecondSparseKey { .. })
+    ));
+    // Hybrid: the top sparse hit is in the fused list.
+    let top = got(&db, None)[0].0;
+    let hy = db
+        .search_hybrid_sparse(&vec_of(dim, 1), &q, 10, None)
+        .unwrap();
+    assert_eq!(hy.len(), 10);
+    assert!(hy.iter().any(|h| h.id == top));
+    assert!(db.stats().sparse_searches >= 5);
+    // Reopen and a read-only handle agree.
+    let expect = got(&db, None);
+    db.checkpoint().unwrap();
+    same(&got(&db, None), &expect, "after second checkpoint");
+    drop(db);
+    let db = Db::open(&path, opts()).unwrap();
+    same(&got(&db, None), &expect, "reopened");
+    let r = Db::open_read_only(&path, opts()).unwrap();
+    same(&got(&r, None), &expect, "reader");
+    assert_eq!(
+        r.get(9000).unwrap().1["sp"],
+        Value::Sparse(vec![(2, 1.0), (5, 3.0)])
+    );
 }

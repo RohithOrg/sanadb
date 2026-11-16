@@ -29,6 +29,42 @@ the new version migrates old stores on open.
 
   Published Anserini BM25 on SciFact is 0.665 nDCG@10; the small
   differences are the idf variant.
+- `Filter::Contains(key, token)`: the key's string, tokenised like the text
+  index, contains the token. On the text field it runs on the inverted index
+  (membership by binary search over the term's postings, the postings as
+  scan candidates); on another `Str` column the value is decoded and
+  tokenised. Python: `{"tags": {"$contains": "t12"}}`. This is how tag sets
+  are filtered: on the big-ann-benchmarks YFCC filter track at 1M records
+  (`examples/yfcc.rs`) every selectivity bucket gets recall 1.0 (0.994 above
+  10,000 matches) where post-filtering got 0.17 to 0.83; table in README.
+- Learned sparse vectors. `Value::Sparse(Vec<(u32, f32)>)` is a metadata
+  value (Python: an `(indices, weights)` pair of arrays); pairs are sorted,
+  duplicates summed and zero weights dropped on insert, non-finite weights
+  are `Error::InvalidVector`. One key per store may hold them
+  (`Error::SecondSparseKey` otherwise); at checkpoint it is written to a
+  sparse section of the index file (forward lists for `get`, inverted
+  lists for search; log value kind 4, footer slot 4, see `docs/FORMAT.md`).
+  `Db::search_sparse(query, k, filter)` scores by dot product over the
+  inverted lists plus the tail; `Db::search_hybrid_sparse(vector, sparse,
+  k, filter)` fuses it with the dense result by reciprocal rank. Python:
+  `search_sparse()`, `search(query, sparse=...)`. No public-dataset quality
+  number yet: that needs a SPLADE encoding of a BEIR set, which is on the
+  list. MaxScore for long BM25 posting lists is not implemented; SciFact
+  queries take 1.2 ms term-at-a-time and no measured workload needed it.
+- `Db::stats()` (Python `Db.stats()`): operation counters since open:
+  searches by regime (graph walk, filtered walk, exact scan, delta only),
+  text searches, inserts, deletes, batches, checkpoints (total,
+  incremental, failed, last duration) and read-only refreshes (appended,
+  reloaded). Relaxed atomics; polling them costs nothing measurable.
+- Cargo feature `tracing`: `tracing` events on target `sanadb` for
+  checkpoints (incremental, duration, records), failed checkpoints, reader
+  reloads and orphan index files removed at open. Off by default; the crate
+  has no new mandatory dependency.
+- Failure injection in the test suite (`sanadb::fault`, hidden from docs):
+  a checkpoint whose index write fails part way, whose index fsync fails or
+  whose log rename fails, and a failed log append, each leave the store
+  serving everything acknowledged, with the old index current and no
+  partial files; the next checkpoint succeeds and a reopen agrees.
 
 ## [0.2.0] - 2026-11-16
 

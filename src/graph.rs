@@ -44,6 +44,7 @@ use std::sync::Arc;
 use crate::attrs::{self, Attrs, Pred};
 use crate::index::distance;
 use crate::pq::{self, Codebook};
+use crate::sparse::SparseIndex;
 use crate::text::{self, TextIndex};
 use crate::{Error, Filter, Metadata, Metric, Result};
 
@@ -51,12 +52,13 @@ use crate::{Error, Filter, Metadata, Metric, Result};
 pub(crate) type MetaFn<'a> = dyn Fn(u64) -> Option<Arc<Metadata>> + Sync + 'a;
 
 const MAGIC: &[u8; 8] = b"SANAIDX2";
-/// Footer closing an index written by 0.2.0 or later:
-/// `attrs_table_off u64 | idtab_off u64 | reserved u64 | "SANAFTR2"`. The
-/// id table is `n` ids sorted ascending (`u64` each) followed by their slots
-/// (`u32` each), so `slot(id)` is a binary search on the mapping.
+/// Footer closing an index written by 0.2.0 or later: `attrs_table_off u64
+/// | idtab_off u64 | text_table_off u64 | sparse_table_off u64 |
+/// "SANAFTR2"`, a zero offset meaning no such section. The id table is `n`
+/// ids sorted ascending (`u64` each) followed by their slots (`u32` each), so
+/// `slot(id)` is a binary search on the mapping.
 const FOOTER_MAGIC: &[u8; 8] = b"SANAFTR2";
-const FOOTER_LEN: usize = 32;
+const FOOTER_LEN: usize = 40;
 const HEADER_LEN: usize = 8 + 4 + 1 + 3 + 4 + 4 + 4 + 4 + 4;
 const ALIGN: usize = 64;
 /// Reader level of the index file (header byte 13), independent of the log's.
@@ -168,6 +170,8 @@ pub(crate) struct GraphIndex {
     attrs: Option<Attrs>,
     /// Inverted index over the text field, when the store has one.
     text: Option<TextIndex>,
+    /// Forward and inverted index over the sparse field, when the store has one.
+    sparse: Option<SparseIndex>,
 }
 
 impl GraphIndex {
@@ -245,17 +249,22 @@ impl GraphIndex {
         // attribute table; anything else is a 0.1.3 file with neither.
         let fixed_end = pq_off + pq_len;
         let tail = &mmap[fixed_end..];
-        let (attrs_off, idtab, text_off) = if tail.len() >= FOOTER_LEN
+        let (attrs_off, idtab, text_off, sparse_off) = if tail.len() >= FOOTER_LEN
             && &mmap[mmap.len() - 8..] == FOOTER_MAGIC
         {
             let f = mmap.len() - FOOTER_LEN;
             let at =
                 |o: usize| u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize;
-            let (a, t, x) = (at(0), at(8), at(16));
+            let (a, t, x, sp) = (at(0), at(8), at(16), at(24));
             if t < fixed_end || t + n * 12 > f {
                 return Err(Error::Corrupt("index id table inconsistent"));
             }
-            (Some(a), Some(t), (x != 0).then_some(x))
+            (
+                Some(a),
+                Some(t),
+                (x != 0).then_some(x),
+                (sp != 0).then_some(sp),
+            )
         } else if tail.len() >= attrs::LEGACY_TRAILER_LEN
             && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC
         {
@@ -264,10 +273,14 @@ impl GraphIndex {
                 Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize),
                 None,
                 None,
+                None,
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
+        let sparse = sparse_off
+            .map(|x| SparseIndex::parse(&mmap, fixed_end, x, n))
+            .transpose()?;
         let text = text_off
             .map(|x| TextIndex::parse(&mmap, fixed_end, x, n))
             .transpose()?;
@@ -303,6 +316,7 @@ impl GraphIndex {
             pq,
             attrs,
             text,
+            sparse,
         }))
     }
 
@@ -489,7 +503,19 @@ impl GraphIndex {
 
     /// A slot's metadata decoded from the columns; `None` without columns.
     pub fn metadata(&self, slot: u32) -> Option<Metadata> {
-        self.attrs.as_ref().map(|a| a.record(&self.mmap, slot))
+        let mut m = self.attrs.as_ref().map(|a| a.record(&self.mmap, slot));
+        if let Some(sp) = &self.sparse
+            && let Some(p) = sp.record(&self.mmap, slot)
+        {
+            m.get_or_insert_with(Metadata::new)
+                .insert(sp.name(&self.mmap).to_string(), crate::Value::Sparse(p));
+        }
+        m
+    }
+
+    /// The sparse index, if the store has a sparse field and has checkpointed.
+    pub fn sparse(&self) -> Option<&SparseIndex> {
+        self.sparse.as_ref()
     }
 
     /// The text index, if the store has a text field and has checkpointed.
@@ -1031,6 +1057,7 @@ pub(crate) fn build_and_write(
     params: GraphParams,
     meta_of: &MetaFn<'_>,
     text_field: Option<&str>,
+    sparse_field: Option<&str>,
 ) -> Result<()> {
     let n = ids.len();
     assert_eq!(vectors.len(), n * dim);
@@ -1064,6 +1091,7 @@ pub(crate) fn build_and_write(
             meta_of,
             params.storage,
             text_field,
+            sparse_field,
         );
     }
 
@@ -1108,6 +1136,7 @@ pub(crate) fn build_and_write(
         meta_of,
         params.storage,
         text_field,
+        sparse_field,
     );
     drop(files);
     for p in tmp_paths {
@@ -1133,6 +1162,7 @@ pub(crate) fn update_and_write(
     params: GraphParams,
     meta_of: &MetaFn<'_>,
     text_field: Option<&str>,
+    sparse_field: Option<&str>,
 ) -> Result<()> {
     let dim = existing.dim;
     let metric = existing.metric;
@@ -1148,9 +1178,18 @@ pub(crate) fn update_and_write(
         Storage::I8 => {
             let tmp = path.with_extension("f32.tmp");
             {
-                let mut w = BufWriter::new(File::create(&tmp)?);
-                for s in 0..old as u32 {
-                    w.write_all(bytemuck::cast_slice(&existing.vector(s)))?;
+                // Dequantise in parallel chunks, write sequentially: the
+                // serial version of this was most of the extra build time of
+                // an int8 store loaded through auto-checkpoints.
+                let mut w = BufWriter::with_capacity(8 << 20, File::create(&tmp)?);
+                const CHUNK: usize = 1 << 16;
+                for start in (0..old).step_by(CHUNK) {
+                    let end = (start + CHUNK).min(old);
+                    let block: Vec<f32> = (start..end)
+                        .into_par_iter()
+                        .flat_map_iter(|s| existing.vector(s as u32).into_owned())
+                        .collect();
+                    w.write_all(bytemuck::cast_slice(&block))?;
                 }
                 w.flush()?;
             }
@@ -1317,6 +1356,7 @@ pub(crate) fn update_and_write(
         meta_of,
         params.storage,
         text_field,
+        sparse_field,
     );
     if let Some((m, tmp)) = expanded {
         drop(m);
@@ -1341,11 +1381,12 @@ fn write_index(
     meta_of: &MetaFn<'_>,
     storage: Storage,
     text_field: Option<&str>,
+    sparse_field: Option<&str>,
 ) -> Result<()> {
     let n = ids.len();
     let m = pq.map_or(0, |(cb, _)| cb.m);
     let block = block_size(dim, r, storage);
-    let mut w = BufWriter::new(File::create(path)?);
+    let mut w = BufWriter::new(crate::fault::Budgeted::new(path, File::create(path)?));
     w.write_all(MAGIC)?;
     w.write_all(&(dim as u32).to_le_bytes())?;
     w.write_all(&[metric as u8, IDX_READER_LEVEL, storage as u8, 0])?;
@@ -1408,25 +1449,39 @@ fn write_index(
     w.write_all(bytemuck::cast_slice(&order))?;
     let after = idtab + n as u64 * 12;
     w.write_all(&vec![0u8; (after.next_multiple_of(8) - after) as usize])?;
+    let mut cur = after.next_multiple_of(8);
     // Text section, when the store indexes a text field.
     let mut text_table = 0u64;
     if let Some(field) = text_field {
-        let start = after.next_multiple_of(8);
         let text_of = |s: u32| {
             meta_of(ids[s as usize])
                 .and_then(|m| m.get(field).and_then(|v| v.as_str().map(str::to_string)))
         };
-        let (len, table) = text::write(&mut w, start, n, &text_of)?;
+        let (len, table) = text::write(&mut w, cur, n, &text_of)?;
         text_table = table;
-        let end = start + len;
+        let end = cur + len;
+        w.write_all(&vec![0u8; (end.next_multiple_of(8) - end) as usize])?;
+        cur = end.next_multiple_of(8);
+    }
+    // Sparse section, when the store indexes a sparse field.
+    let mut sparse_table = 0u64;
+    if let Some(field) = sparse_field {
+        let of = |s: u32| {
+            meta_of(ids[s as usize])
+                .and_then(|m| m.get(field).and_then(|v| v.as_sparse().map(<[_]>::to_vec)))
+        };
+        let (len, table) = crate::sparse::write(&mut w, cur, n, field, &of)?;
+        sparse_table = table;
+        let end = cur + len;
         w.write_all(&vec![0u8; (end.next_multiple_of(8) - end) as usize])?;
     }
-    for v in [attrs_table, idtab, text_table] {
+    for v in [attrs_table, idtab, text_table, sparse_table] {
         w.write_all(&v.to_le_bytes())?;
     }
     w.write_all(FOOTER_MAGIC)?;
     w.flush()?;
-    w.get_ref().sync_all()?;
+    crate::fault::index_sync(path)?;
+    w.get_ref().get_ref().sync_all()?;
     Ok(())
 }
 

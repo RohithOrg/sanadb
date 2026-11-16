@@ -83,7 +83,8 @@ pub(crate) fn write(
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for m in metas.iter().flatten() {
         for (k, v) in m.iter() {
-            if !seen.contains_key(k.as_str()) {
+            // Sparse vectors live in their own section, not in a column.
+            if v.kind() != Kind::Sparse && !seen.contains_key(k.as_str()) {
                 seen.insert(k.as_str(), kinds.len());
                 kinds.push((k.clone(), v.kind()));
             }
@@ -214,6 +215,7 @@ pub(crate) fn write(
                 attr.n_distinct = 2;
                 postings_by_code = Some((2, col.iter().map(|&b| b as u32).collect()));
             }
+            Kind::Sparse => unreachable!("sparse values are not columns"),
         }
         if let Some((n_distinct, codes)) = postings_by_code {
             // Counting sort of present slots by code.
@@ -324,6 +326,7 @@ impl Attrs {
                 Kind::Str => 4,
                 Kind::Int | Kind::Float => 8,
                 Kind::Bool => 1,
+                Kind::Sparse => return Err(bad()),
             };
             if presence + n.div_ceil(64) * 8 > table_off || column + n * width > table_off {
                 return Err(bad());
@@ -367,6 +370,7 @@ impl Attrs {
                 Kind::Int => Value::Int(self.int_at(b, a, slot)),
                 Kind::Float => Value::Float(self.float_at(b, a, slot)),
                 Kind::Bool => Value::Bool(self.bool_at(b, a, slot)),
+                Kind::Sparse => continue,
             };
             m.insert(attr.name.clone(), v);
         }
@@ -705,7 +709,7 @@ impl Attrs {
             Kind::Int => self
                 .dict_search(b, a, &Value::Int(self.int_at(b, a, slot)))
                 .unwrap_or(u32::MAX),
-            Kind::Float => u32::MAX,
+            Kind::Float | Kind::Sparse => u32::MAX,
         }
     }
 

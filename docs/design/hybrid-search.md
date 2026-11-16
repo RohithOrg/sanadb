@@ -1,11 +1,15 @@
 # Hybrid search: BM25 and sparse vectors beside the graph
 
-Status: steps 1 to 3 of "Order of work" are implemented (tokeniser without
+Status: steps 1 to 5 of "Order of work" are implemented (tokeniser without
 the segmentation dependency, inverted index section, `search_text` with
-term-at-a-time BM25, `search_hybrid` with reciprocal rank fusion, Python
-bindings). Not yet: MaxScore skipping, block-max metadata, weighted fusion,
-sparse vectors. SciFact nDCG@10 0.662 against rank_bm25's 0.654 and
-Anserini's published 0.665.
+term-at-a-time BM25, `search_hybrid` with reciprocal rank fusion,
+`Value::Sparse` with its own index section and `search_sparse` /
+`search_hybrid_sparse`, Python bindings). Differences from the plan below:
+the sparse key needs no option, it is whichever one key holds sparse
+values, and the sparse section has its own forward lists so `get` returns
+the pairs. Not yet: MaxScore skipping, block-max metadata, weighted fusion,
+a BEIR number for sparse retrieval. SciFact BM25 nDCG@10 0.662 against
+rank_bm25's 0.654 and Anserini's published 0.665.
 
 ## What users want
 

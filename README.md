@@ -70,8 +70,15 @@ below are real and reproducible; the track record is not there yet.
   `Error::NeedsNewerVersion` rather than misreading. `CHANGELOG.md` lists
   every format change and its upgrade notes.
 
-Not provided: replication, encryption, multi-process access, typed metadata,
-range filters, format stability before 1.0.
+- The file layout is documented byte for byte in [docs/FORMAT.md](docs/FORMAT.md)
+  and frozen from 0.2.0 for the 0.x series: later 0.x versions add to it
+  (frame kinds and sections older readers skip) and only raise the reader
+  level, with conversion on open, for a change an older reader would
+  misread. Stores written by every published version are fixtures in the
+  test suite and each release opens all of them.
+
+Not provided: streaming replication, built-in encryption, more than one
+writer per store.
 
 ## Usage
 
@@ -110,10 +117,18 @@ db.checkpoint()
 search: `search_text` is BM25 over an inverted index in the index file
 (SciFact nDCG@10 0.662, matching the reference implementations), and
 `search_hybrid` fuses it with the vector result by reciprocal rank.
+A `Value::Sparse` metadata value (SPLADE-style `(index, weight)` pairs,
+one key per store) is indexed at checkpoint too: `search_sparse` scores by
+dot product and `search_hybrid_sparse` fuses it with the vector result.
 `Options::storage(Storage::I8)` keeps indexed vectors as 8-bit codes (half
 the index file on SIFT1M, under a point of recall); `Db::write_batch`
 applies inserts and deletes atomically; `Db::open_read_only` opens a store
 beside its writer from any process.
+
+`Db::stats()` returns operation counters (searches by regime, writes,
+checkpoints and their last duration, reader refreshes), and the optional
+`tracing` feature emits events for checkpoints, reader reloads and orphan
+cleanup.
 
 `Db` is thread-safe. Reads run concurrently, a checkpoint builds the new index
 without blocking readers or writers, and the Python bindings release the GIL
@@ -337,6 +352,29 @@ passing nodes before it can stop; the beam is the knob, measured at 10%:
 
 The post-filter closure path never passes 0.80 at any beam on this filter.
 
+Real label sets: the big-ann-benchmarks filter track (YFCC100M, CLIP
+embeddings as uint8, dim 192, 8.8 labels per record, queries asking for one
+or two labels). `examples/yfcc.rs` on the first 1,000,000 records, 500
+queries, ground truth by brute force over the records carrying the query's
+labels; the labels are a space-separated string in the text field and the
+query is `Filter::contains` terms and-ed together, answered from the
+inverted index. Beam 64, warm, same machine:
+
+| matching records | queries | recall@10 | mean | post-filter recall@10 | post-filter mean |
+|---|---|---|---|---|---|
+| under 100 | 119 | 1.000 | 0.6 ms | 0.173 | 20.1 ms |
+| 100 to 1,000 | 131 | 1.000 | 2.0 ms | 0.422 | 18.7 ms |
+| 1,000 to 10,000 | 147 | 1.000 | 11.4 ms | 0.829 | 15.5 ms |
+| over 10,000 | 103 | 0.994 | 11.2 ms | 0.818 | 1.1 ms |
+
+The first three rows are the exact-scan regime; the last mixes scan and
+filtered walk. The scan's cost is the random reads of the matching
+records' blocks (768 bytes each here), which is why the 1,000 to 10,000 row
+is slower than the walk would be at that selectivity on a warm index; the
+`exact_filter_scan` threshold was tuned on 128-dim SIFT and should be lower
+for wider vectors. The full 10M set is not run here: its ground truth is
+published, but building it takes an hour on this laptop.
+
 ### Cold cache, 5M vectors from SIFT1B
 
 First 5,000,000 vectors of big-ann-benchmarks "bigann" (uint8, dim 128, L2),
@@ -401,8 +439,9 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 ## Next
 
 1. Hybrid search, the rest of the [design note](docs/design/hybrid-search.md):
-   MaxScore skipping for long posting lists, weighted fusion, learned sparse
-   vectors. BM25 and reciprocal rank fusion are in.
+   MaxScore skipping for long posting lists, weighted fusion, a BEIR
+   quality number for sparse vectors. BM25, sparse vectors and reciprocal
+   rank fusion are in.
 2. x86 kernels: AVX2 for build, exact scan and re-ranking, where the
    default target has no FMA. Query latency is memory-bound and will not
    move; builds and scans will. The int8 path gets a fused kernel.
@@ -418,9 +457,10 @@ the exact scan takes 3.8 ms and the graph 140 µs.
    ceiling from the configuration. More ann-benchmarks datasets. A
    VectorDBBench client is in `benchmarks/vectordbbench/`; the harness has
    not been run against it yet.
-5. Format freeze and 1.0. Readers in other processes and metadata off the
-   heap are done ([design note](docs/design/snapshot-and-tail.md)); what
-   remains before freezing is a year of other people's workloads.
+5. 1.0. The format is frozen and documented ([docs/FORMAT.md](docs/FORMAT.md)),
+   readers in other processes and metadata off the heap are done
+   ([design note](docs/design/snapshot-and-tail.md)); what remains is a
+   year of other people's workloads.
 6. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.
 
@@ -436,5 +476,12 @@ cd python && maturin develop --release && pytest tests
 `scripts/ci-local.sh` runs the Linux CI steps (clippy with `-D warnings`,
 tests, example build) in Docker on x86-64 and arm64 before a push; the
 x86-64 run is emulated on Apple Silicon and is the only local way to compile
-the AVX2 paths. Releases are cut by tagging `vX.Y.Z`; the workflow publishes
+the AVX2 paths. `scripts/soak.sh [seconds]` runs a writer, a checkpoint
+loop and readers in this and a child process against a model for as long
+as you like (it is the ignored `soak_readers_writer_and_checkpoints` test).
+The test suite injects I/O failures (disk full mid-index, failed fsync,
+failed rename, failed append) and mutates index files at random; the store
+written by every published version lives under `tests/fixtures/` and a
+release adds its own with `SANADB_WRITE_FIXTURE=1 cargo test --release
+--test db current_layout`. Releases are cut by tagging `vX.Y.Z`; the workflow publishes
 the crate and the wheels. Licensed under MIT or Apache-2.0, at your option.
