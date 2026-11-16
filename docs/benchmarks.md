@@ -24,6 +24,24 @@ processing. Published Anserini BM25 on SciFact is 0.665 nDCG@10.
 | sanadb `search_text` | 0.662 | 0.886 | 1.2 |
 | rank_bm25 (Okapi) | 0.654 | 0.876 | 30.6 |
 
+## Dense retrieval with a real model, BEIR SciFact
+
+`benchmarks/beir/scifact_dense.py`: all-MiniLM-L6-v2 vectors (384
+dims) for the 5,183 documents and 300 test queries, cosine, graph search
+against brute force over the same vectors and against the relevance
+labels.
+
+| beam | recall@10 against brute force | nDCG@10 | µs/query |
+|---|---|---|---|
+| exact (brute force over the model's vectors) | 1.000 | 0.645 | |
+| 16 | 0.945 | 0.641 | 106 |
+| 32 | 0.986 | 0.642 | 103 |
+| 64 (default) | 0.996 | 0.645 | 128 |
+| 128 | 0.999 | 0.645 | 164 |
+
+The model card's published nDCG@10 for all-MiniLM-L6-v2 on SciFact is
+0.645; brute force reproduces it and the default beam matches it.
+
 Sparse vectors have no public-dataset number yet; that needs a SPLADE
 encoding of a BEIR set and is on the roadmap.
 

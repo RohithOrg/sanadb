@@ -538,6 +538,39 @@ words; the hybrid list puts records present in both the vector and the
 keyword result first; the read-only handle sees the writer's new record
 without being told; the counters show what ran.
 
+## Does the index lose what the model found? SciFact with a real model
+
+`benchmarks/beir/scifact_dense.py` encodes BEIR SciFact (5,183 documents,
+300 test queries) with all-MiniLM-L6-v2, stores the vectors in sanadb
+with cosine, and measures two things: recall@10 of the graph search
+against brute-force cosine over the same vectors (what the index could
+lose), and nDCG@10 against the human relevance labels (what the whole
+pipeline retrieves), next to the published figure for this model.
+
+```bash
+pip install sanadb sentence-transformers
+python benchmarks/beir/scifact_dense.py data/beir/scifact
+```
+
+```text
+5183 documents and 300 queries encoded with all-MiniLM-L6-v2 (384 dims) in 16s
+sanadb: inserted and indexed in 0.6s; {'nodes': 5183, 'pq_subspaces': 96, 'tombstones': 0, 'storage': 'f32'}
+```
+
+| beam | recall@10 against brute force | nDCG@10 | µs/query |
+|---|---|---|---|
+| exact (brute force over the model's vectors) | 1.000 | 0.645 | |
+| 16 | 0.945 | 0.641 | 106 |
+| 32 | 0.986 | 0.642 | 103 |
+| 64 (default) | 0.996 | 0.645 | 128 |
+| 128 | 0.999 | 0.645 | 164 |
+
+The sentence-transformers model card gives 0.645 nDCG@10 for this model
+on SciFact; brute force over its vectors reproduces that exactly, and the
+graph at the default beam returns 99.6% of what brute force would and the
+same 0.645, at about 130 µs a query on a laptop. The index is not where
+quality is lost; the model is where it is decided.
+
 ## Keyword search measured against a reference
 
 `benchmarks/beir/scifact_bm25.py` runs `search_text` on BEIR SciFact

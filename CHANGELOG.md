@@ -5,6 +5,18 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
+## [Unreleased]
+
+### Added
+- `benchmarks/beir/scifact_dense.py`: end-to-end check with a real
+  embedding model (all-MiniLM-L6-v2 on BEIR SciFact). Brute force over
+  the model's vectors reproduces the published nDCG@10 of 0.645; sanadb's
+  graph at the default beam returns 99.6% of brute force's top 10 and the
+  same 0.645. Documented in `docs/examples.md` and `docs/benchmarks.md`.
+- `python/examples/semantic_search.py` and `python/examples/embed_server.py`:
+  a sentence-transformers walkthrough with its output, and the model as a
+  local OpenAI-compatible endpoint for studio.
+
 ## [0.2.3] - 2026-11-16
 
 ### Added
