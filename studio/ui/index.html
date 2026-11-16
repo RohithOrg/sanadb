@@ -98,6 +98,16 @@ aside .sect.grow{flex:1;min-height:0;display:flex;flex-direction:column;border-b
 .keys .k{display:inline-flex;align-items:baseline;gap:5px;border:1px solid var(--line);border-radius:999px;padding:1px 9px 1px 8px;background:var(--chrome)}
 .keys code{font:12.5px var(--mono);color:var(--ink)}
 .keys span{color:var(--muted);font-size:11.5px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:10px}
+.tab{height:30px;padding:0 10px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted);margin-bottom:-1px}
+.tab:hover{background:transparent;color:var(--ink)}
+.tab.on{color:var(--ink);border-bottom-color:var(--accent)}
+.pane{display:none;flex:1;min-height:0;flex-direction:column}
+.pane.on{display:flex}
+.files{display:grid;grid-template-columns:auto 1fr auto;column-gap:10px;row-gap:3px;font-size:12.5px;align-items:baseline}
+.files .role{color:var(--muted)}
+.files .name{font:12px var(--mono);color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
+.files .size{font:12px var(--mono);color:var(--ink-2);text-align:right;white-space:nowrap}
 .list{flex:1;min-height:0;overflow:auto;margin:0 -6px}
 .list .r{display:grid;grid-template-columns:8ch 1fr;gap:12px;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:13px;line-height:1.5}
 .list .r:hover{background:var(--chrome)}
@@ -112,7 +122,12 @@ main{position:relative;background:var(--stage);overflow:hidden;min-height:0}
 canvas{display:block;width:100%;height:100%;cursor:crosshair}
 .hud{position:absolute;font-size:12.5px;color:var(--stage-ink);background:rgba(14,22,38,.72);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);border-radius:var(--r);padding:6px 10px}
 .hud b{color:#fff;font-weight:600;font-variant-numeric:tabular-nums}
-.hud.title{left:14px;top:12px}
+.hud.title{left:14px;top:12px;white-space:nowrap}
+.hud.labelctl{right:14px;bottom:12px;color:var(--stage-muted);white-space:nowrap}
+.hud .lbl{color:var(--stage-muted)}
+.hud select{background:transparent;color:#fff;border:0;border-bottom:1px solid rgba(255,255,255,.3);font:12.5px var(--sans);padding:0 2px;cursor:pointer}
+.hud select option{color:#0B1220}
+.hud.legend{white-space:nowrap}
 .hud.walk{right:14px;top:12px;display:flex;align-items:center;gap:10px}
 .hud.walk[hidden]{display:none}
 .hud.walk .step{font:12.5px var(--mono);color:var(--walk);min-width:7.5em;text-align:right}
@@ -185,6 +200,8 @@ footer b{color:var(--ink);font:12.5px var(--mono);font-weight:500}
       <input type="text" id="qid" placeholder="e.g. 4211" inputmode="numeric" autocomplete="off">
       <label for="qtext">Keyword text <span class="hint">BM25 on the text field; together with an id, hybrid</span></label>
       <input type="text" id="qtext" placeholder="words to match" autocomplete="off">
+      <label for="qsparse">Sparse vector <span class="hint">index:weight pairs; alone or fused with an id</span></label>
+      <input type="text" id="qsparse" placeholder="e.g. 3:1.0 52:2.0" autocomplete="off">
       <label for="qfilter">Filter <span class="hint">JSON with the Python operators, or empty</span></label>
       <textarea id="qfilter" spellcheck="false" placeholder='{"lang": "rust", "year": {"$gte": 2020}}'></textarea>
       <div class="row" style="margin-top:12px">
@@ -194,14 +211,24 @@ footer b{color:var(--ink);font:12.5px var(--mono);font-weight:500}
       <label class="check"><input type="checkbox" id="qwalk" checked> draw the graph walk on the map</label>
       <div class="msg" id="qmsg"></div>
     </div>
-    <div class="sect">
-      <h2>Metadata keys</h2>
-      <div class="keys" id="keys"></div>
-    </div>
     <div class="sect grow">
-      <h2>Records</h2>
-      <div class="list" id="list"></div>
-      <div class="pager"><button class="small" id="prev">Previous</button><span id="pageinfo"></span><button class="small" id="next">Next</button></div>
+      <div class="tabs" role="tablist">
+        <button role="tab" class="tab on" data-tab="records">Records</button>
+        <button role="tab" class="tab" data-tab="keys">Keys</button>
+        <button role="tab" class="tab" data-tab="files">Files</button>
+      </div>
+      <div class="pane on" id="pane-records">
+        <div class="list" id="list"></div>
+        <div class="pager"><button class="small" id="prev">Previous</button><span id="pageinfo"></span><button class="small" id="next">Next</button></div>
+      </div>
+      <div class="pane" id="pane-keys">
+        <div class="keys" id="keys"></div>
+        <p class="empty" style="margin:10px 0 0">A key's type is fixed by the first value written under it. Columns in the index serve filters on these keys.</p>
+      </div>
+      <div class="pane" id="pane-files">
+        <div class="files" id="files"></div>
+        <p class="empty" style="margin:10px 0 0">Hover a name for its path and what it holds. A checkpoint writes a new index file and replaces the log by rename.</p>
+      </div>
     </div>
   </aside>
 
@@ -216,8 +243,9 @@ footer b{color:var(--ink);font:12.5px var(--mono);font-weight:500}
       <span><i style="background:#fff;box-shadow:0 0 0 2px #3B6CFF inset"></i>result</span>
       <span><i style="background:var(--walk)"></i>expanded by the walk</span>
       <span><i style="background:transparent;border:2px solid #fff;width:7px;height:7px"></i>query</span>
-      <span>scroll to zoom · drag to pan · click a point to inspect</span>
+      <span>zoom · pan · click to inspect</span>
     </div>
+    <div class="hud labelctl"><span class="lbl">label clusters by <select id="labelkey"><option value="">nothing</option></select></span></div>
     <div class="tip" id="tip"></div>
   </main>
 
@@ -294,6 +322,23 @@ async function loadInfo() {
     `<span>checkpoints <b>${fmt(s.checkpoints)}</b>${s.last_checkpoint_ms ? ` · last ${fmt(s.last_checkpoint_ms)} ms` : ""}</span>`;
 }
 
+/* ---------- tabs ---------- */
+for (const t of document.querySelectorAll(".tab")) t.onclick = () => {
+  for (const o of document.querySelectorAll(".tab")) o.classList.toggle("on", o === t);
+  for (const p of document.querySelectorAll(".pane")) p.classList.toggle("on", p.id === "pane-" + t.dataset.tab);
+};
+
+/* ---------- files ---------- */
+const fbytes = (b) => b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(1) + " kB" : b + " B";
+async function loadFiles() {
+  const j = await api("/api/files");
+  $("files").innerHTML = j.files.map(f => {
+    const name = f.path.split("/").pop();
+    const facts = [f.level !== undefined && f.level !== null ? `reader level ${f.level}` : null, f.snapshot ? `snapshot ${f.snapshot}` : null].filter(Boolean).join(" · ");
+    return `<span class="role">${f.role}</span><span class="name" title="${esc(f.path)}\n${esc(f.note)}${facts ? "\n" + facts : ""}">${esc(name)}</span><span class="size">${fbytes(f.bytes)}</span>`;
+  }).join("");
+}
+
 /* ---------- records list ---------- */
 function metaShort(m) {
   if (!m) return "";
@@ -359,9 +404,16 @@ async function search() {
   const body = {k: +$("qk").value || 10, walk: $("qwalk").checked};
   const id = $("qid").value.trim(); if (id) body.id = +id;
   const text = $("qtext").value.trim(); if (text) body.text = text;
+  const sp = $("qsparse").value.trim();
+  if (sp) {
+    const pairs = sp.split(/[\s,]+/).filter(Boolean).map(t => t.split(":"));
+    if (pairs.some(p => p.length !== 2 || !/^\d+$/.test(p[0]) || isNaN(+p[1]))) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Sparse vector: index:weight pairs separated by spaces."; return; }
+    body.sparse = [pairs.map(p => +p[0]), pairs.map(p => +p[1])];
+  }
+  if (text && sp) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Keyword text or a sparse vector, not both."; return; }
   const f = $("qfilter").value.trim();
   if (f) { try { body.filter = JSON.parse(f); } catch (e) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Filter is not valid JSON: " + e.message; return; } }
-  if (!id && !text) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Give a record id, keyword text, or both."; return; }
+  if (!id && !text && !sp) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Give a record id, keyword text or a sparse vector."; return; }
   $("go").disabled = true; $("qmsg").className = "msg"; $("qmsg").textContent = "Searching…";
   try {
     const j = await api("/api/search", {method: "POST", body: JSON.stringify(body)});
@@ -382,7 +434,7 @@ async function search() {
   $("go").disabled = false;
 }
 $("go").onclick = search;
-for (const id of ["qid", "qtext"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") search(); });
+for (const id of ["qid", "qtext", "qsparse"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") search(); });
 $("qfilter").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) search(); });
 $("ckpt").onclick = async () => {
   $("ckpt").disabled = true; $("ckpt").textContent = "Building…";
@@ -404,10 +456,22 @@ async function loadMap() {
   try {
     mapData = await api("/api/map?n=4000&clusters=8");
     $("maptitle").innerHTML = `<b>${fmt(mapData.sampled)}</b> of ${fmt(mapData.total)} records · PCA to two dimensions · ${mapData.clusters} k-means colours`;
+    const sel = $("labelkey"), cur = sel.value;
+    sel.innerHTML = `<option value="">nothing</option>` + info.keys.filter(k => k.kind !== "sparse").map(k => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("");
+    sel.value = info.keys.some(k => k.name === cur) ? cur : "";
+    await loadLabels();
     $("mapempty").hidden = result.hits.length > 0;
   } catch (e) { $("maptitle").textContent = e.message; mapData = null; }
   draw();
 }
+let clusterLabels = [];
+async function loadLabels() {
+  const key = $("labelkey").value;
+  if (!key) { clusterLabels = []; draw(); return; }
+  try { clusterLabels = (await api(`/api/labels?key=${encodeURIComponent(key)}`)).labels; } catch (e) { clusterLabels = []; }
+  draw();
+}
+$("labelkey").onchange = loadLabels;
 function toScreen(x, y) {
   const w = canvas.width, h = canvas.height, s = Math.min(w, h) * 0.42 * view.z;
   return [w / 2 + (x + view.x) * s, h / 2 - (y + view.y) * s];
@@ -433,6 +497,20 @@ function draw() {
     ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill();
   }
   ctx.globalAlpha = 1;
+  // cluster labels: the most common value of the chosen key, at the centroid
+  if (clusterLabels.length) {
+    ctx.font = `${12 * dpr}px "IBM Plex Sans", system-ui, sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (const l of clusterLabels) {
+      if (l.value === null || l.value === undefined) continue;
+      const [sx, sy] = toScreen(l.x, l.y);
+      const text = `${l.value}  ${Math.round(l.share * 100)}%`;
+      const wdt = ctx.measureText(text).width + 14 * dpr;
+      ctx.fillStyle = "rgba(11,18,32,.78)"; ctx.strokeStyle = "rgba(255,255,255,.14)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.roundRect(sx - wdt / 2, sy - 10 * dpr, wdt, 20 * dpr, 4 * dpr); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = "#fff"; ctx.fillText(text, sx, sy);
+    }
+  }
   // walk: trail in expansion order up to the animation step, older segments dimmer
   const n = anim.running ? anim.t : result.walk.length;
   if (n > 0) {
@@ -519,8 +597,9 @@ function nearest(e) {
   await loadInfo();
   resize();
   loadList();
+  loadFiles();
   await loadMap();
-  setInterval(loadInfo, 3000);
+  setInterval(() => { loadInfo(); loadFiles(); }, 3000);
 })();
 </script>
 </body>

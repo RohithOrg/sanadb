@@ -11,7 +11,9 @@ the new version migrates old stores on open.
 - `sanadb-studio` (workspace crate `studio/`, not published to crates.io
   yet): a local web page for one store with a PCA map of a sample, every
   search mode, the graph walk drawn on the map, record inspection,
-  metadata editing and deletion, and live counters. See `docs/studio.md`.
+  metadata editing and deletion, sparse-vector queries, cluster labels
+  from a metadata key, a files view, live counters, and light and dark
+  chrome. See `docs/studio.md`.
 - `Db::peek(path)` reads a store's dimension and metric from the file;
   `Db::ids()` lists live ids; `Db::keys()` lists metadata keys with their
   types; `Db::search_traced(query, k)` returns the hits and the nodes the

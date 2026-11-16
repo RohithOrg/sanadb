@@ -31,6 +31,8 @@ struct MapState {
     axes: [Vec<f32>; 2],
     scale: f32,
     points: J,
+    /// The sampled records' metadata and cluster, for labelling clusters.
+    sampled: Vec<(sanadb::Metadata, usize, f32, f32)>,
 }
 
 fn main() {
@@ -146,6 +148,8 @@ fn handle(app: Arc<App>, mut req: Request) {
         (Method::Delete, "/api/record") => remove(&app, &query),
         (Method::Post, "/api/search") => search(&app, &body),
         (Method::Get, "/api/map") => map(&app, &query),
+        (Method::Get, "/api/labels") => labels(&app, &query),
+        (Method::Get, "/api/files") => Ok(files(&app)),
         (Method::Post, "/api/checkpoint") => checkpoint(&app),
         _ => Err("not found".to_string()),
     };
@@ -404,16 +408,16 @@ fn hits_json(app: &App, hits: &[Hit], with_meta: bool) -> Vec<J> {
     hits.iter()
         .map(|h| {
             let mut o = json!({"id": h.id, "score": h.score});
-            if with_meta || st.is_some() {
-                if let Some((v, m)) = app.db.get(h.id) {
-                    if with_meta {
-                        o["meta"] = meta_json(&m);
-                    }
-                    if let Some(s) = st.as_ref() {
-                        let (x, y) = project(s, &v);
-                        o["x"] = json!(x);
-                        o["y"] = json!(y);
-                    }
+            if (with_meta || st.is_some())
+                && let Some((v, m)) = app.db.get(h.id)
+            {
+                if with_meta {
+                    o["meta"] = meta_json(&m);
+                }
+                if let Some(s) = st.as_ref() {
+                    let (x, y) = project(s, &v);
+                    o["x"] = json!(x);
+                    o["y"] = json!(y);
                 }
             }
             o
@@ -550,15 +554,25 @@ fn map(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
     if all.is_empty() {
         return Err("empty store".into());
     }
+    // A deterministic but non-periodic sample: a regular stride aliases
+    // with any periodic structure in the ids (synthetic labels, sharded
+    // imports), so jitter each pick within its stride.
     let step = (all.len() / n).max(1);
-    let ids: Vec<u64> = all.iter().step_by(step).take(n).copied().collect();
+    let ids: Vec<u64> = (0..n.min(all.len()))
+        .map(|i| {
+            let jitter = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+            all[(i * step + (jitter as usize % step)).min(all.len() - 1)]
+        })
+        .collect();
     let dim = app.dim;
     let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(ids.len());
     let mut kept = Vec::with_capacity(ids.len());
+    let mut metas = Vec::with_capacity(ids.len());
     for &id in &ids {
-        if let Some((v, _)) = app.db.get(id) {
+        if let Some((v, m)) = app.db.get(id) {
             vecs.push(v);
             kept.push(id);
+            metas.push(m);
         }
     }
     let m = vecs.len() as f32;
@@ -595,13 +609,100 @@ fn map(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
         .map(|((id, (x, y)), c)| json!([id, x / scale, y / scale, c]))
         .collect();
     let out = json!({"n": n, "clusters": clusters, "sampled": kept.len(), "total": all.len(), "points": points});
+    let sampled = metas
+        .into_iter()
+        .zip(&coords)
+        .zip(&labels)
+        .map(|((m, (x, y)), c)| (m, *c, x / scale, y / scale))
+        .collect();
     *app.map.lock().unwrap() = Some(MapState {
         mean,
         axes,
         scale,
         points: out.clone(),
+        sampled,
     });
     Ok(out)
+}
+
+/// For each cluster of the current map, the most common value of `key`
+/// among its sampled records, with its share, at the cluster's centroid.
+fn labels(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
+    let key = q.get("key").ok_or("key required")?;
+    let st = app.map.lock().unwrap();
+    let st = st.as_ref().ok_or("build the map first")?;
+    let clusters = st.points["clusters"].as_u64().unwrap_or(0) as usize;
+    let mut out = Vec::new();
+    for c in 0..clusters {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let (mut n, mut sx, mut sy) = (0usize, 0f32, 0f32);
+        for (m, mc, x, y) in &st.sampled {
+            if *mc != c {
+                continue;
+            }
+            n += 1;
+            sx += x;
+            sy += y;
+            if let Some(v) = m.get(key.as_str()) {
+                let text = match v {
+                    Value::Sparse(p) => format!("sparse[{}]", p.len()),
+                    other => other.to_string(),
+                };
+                *counts.entry(text).or_insert(0) += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let best = counts.into_iter().max_by_key(|(_, k)| *k);
+        out.push(json!({
+            "cluster": c, "size": n, "x": sx / n as f32, "y": sy / n as f32,
+            "value": best.as_ref().map(|(v, _)| v.clone()),
+            "share": best.as_ref().map_or(0.0, |(_, k)| *k as f64 / n as f64),
+        }));
+    }
+    Ok(json!({"key": key, "labels": out}))
+}
+
+/// The store's files with sizes and the facts a user wants to see about
+/// them: the log's reader level, the index's name, level and snapshot id.
+fn files(app: &App) -> J {
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let byte13 = |p: &std::path::Path| -> Option<u8> {
+        let mut f = std::fs::File::open(p).ok()?;
+        let mut b = [0u8; 16];
+        std::io::Read::read_exact(&mut f, &mut b).ok()?;
+        Some(b[13])
+    };
+    let log = std::path::PathBuf::from(&app.path);
+    let mut lock = log.as_os_str().to_owned();
+    lock.push(".lock");
+    let lock = std::path::PathBuf::from(lock);
+    let mut out = vec![json!({
+        "role": "log", "path": log.display().to_string(), "bytes": size(&log),
+        "level": byte13(&log),
+        "note": "write-ahead log: header, then CRC-framed insert, delete, snapshot, begin and commit frames; replayed on open",
+    })];
+    if let Some(idx) = app.db.index_path() {
+        let name = idx
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let snapshot = name
+            .rsplit(".idx.")
+            .next()
+            .filter(|s| s.len() == 16)
+            .map(|s| s.to_string());
+        out.push(json!({
+            "role": "index", "path": idx.display().to_string(), "bytes": size(&idx),
+            "level": byte13(&idx), "snapshot": snapshot,
+            "note": "graph index named by the log's snapshot frame: record blocks, PQ codes, attribute columns, id table, text and sparse sections, footer; memory-mapped",
+        }));
+    }
+    if lock.exists() {
+        out.push(json!({"role": "lock", "path": lock.display().to_string(), "bytes": size(&lock), "note": "empty; the writer holds an exclusive flock on it"}));
+    }
+    json!({"files": out})
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
