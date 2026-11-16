@@ -7,6 +7,11 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-16
+
+No code changes: the first release after the return to PyPI trusted
+publishing, so its files carry build provenance again.
+
 ### Changed
 - Release workflow: back to PyPI trusted publishing, so releases carry
   build provenance again (0.2.4 and 0.2.5 went up by token and have
