@@ -3,11 +3,12 @@
 //! selective filters can enumerate their candidates from posting lists
 //! instead of walking the graph.
 //!
-//! Section layout (appended after the PQ section, 8-byte aligned):
-//! one region per attribute in sequence, then the attribute table, then a
-//! 16-byte trailer `table_off u64 LE | "ATTRTBL1"`. Readers find the table
-//! from the trailer; a file without the trailer (written before this
-//! existed) simply has no columns and filters fall back to the metadata map.
+//! Section layout (appended after the PQ section, 8-byte aligned): one
+//! region per attribute in sequence, then the attribute table. The index
+//! file's footer records where the table starts (0.1.4 wrote a 16-byte
+//! trailer `table_off u64 LE | "ATTRTBL1"` right after it instead; `graph.rs`
+//! reads both). A file with neither has no columns and filters fall back to
+//! the metadata map.
 //!
 //! Per attribute:
 //! - presence: `n` bits, one per slot, in `u64` words.
@@ -29,8 +30,9 @@ use std::sync::Arc;
 
 use crate::{Error, Filter, Kind, Metadata, Result, Value};
 
-const TRAILER_MAGIC: &[u8; 8] = b"ATTRTBL1";
-const TRAILER_LEN: usize = 16;
+/// Trailer written by 0.1.4 right after the table; read for compatibility.
+pub(crate) const LEGACY_TRAILER_MAGIC: &[u8; 8] = b"ATTRTBL1";
+pub(crate) const LEGACY_TRAILER_LEN: usize = 16;
 /// Dictionaries for `Int` (and so postings) are built for at most this many
 /// distinct values; above it an `Int` attribute keeps only its raw column,
 /// and a `Str` attribute keeps a dictionary for codes but no postings.
@@ -64,13 +66,14 @@ pub(crate) struct Attrs {
 
 /// Write the attribute section for `n` slots. `start` is the absolute file
 /// offset at which the first byte lands (it must be 8-aligned); `meta_of`
-/// yields a slot's metadata. Returns the number of bytes written.
+/// yields a slot's metadata. Returns `(bytes written, absolute offset of
+/// the attribute table)`; the caller records the table offset in the footer.
 pub(crate) fn write(
     w: &mut impl Write,
     start: u64,
     n: usize,
     meta_of: &(dyn Fn(u32) -> Option<Arc<Metadata>> + Sync),
-) -> std::io::Result<u64> {
+) -> std::io::Result<(u64, u64)> {
     debug_assert!(start.is_multiple_of(8));
     // Slot metadata is fetched once; the per-attribute passes borrow from it.
     let metas: Vec<Option<Arc<Metadata>>> = (0..n as u32).map(meta_of).collect();
@@ -270,10 +273,7 @@ pub(crate) fn write(
     }
     w.write_all(&t)?;
     pos += t.len() as u64;
-    w.write_all(&table_off.to_le_bytes())?;
-    w.write_all(TRAILER_MAGIC)?;
-    pos += TRAILER_LEN as u64;
-    Ok(pos - start)
+    Ok((pos - start, table_off))
 }
 
 // ---------------------------------------------------------------- reading
@@ -286,18 +286,14 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
 }
 
 impl Attrs {
-    /// Parse the attribute table of a mapped index file whose fixed sections
-    /// end at `min_off`. `Ok(None)` when the file has no attribute section.
-    pub(crate) fn parse(mmap: &[u8], min_off: usize, n: usize) -> Result<Option<Attrs>> {
-        if mmap.len() < min_off + TRAILER_LEN || &mmap[mmap.len() - 8..] != TRAILER_MAGIC {
-            return Ok(None);
-        }
+    /// Parse the attribute table that starts at `table_off` in a mapped index
+    /// file whose fixed sections end at `min_off`.
+    pub(crate) fn parse(mmap: &[u8], min_off: usize, table_off: usize, n: usize) -> Result<Attrs> {
         let bad = || Error::Corrupt("attribute table inconsistent");
-        let table_off = u64_at(mmap, mmap.len() - TRAILER_LEN).ok_or_else(bad)? as usize;
         if table_off < min_off || table_off + 16 > mmap.len() {
             return Err(bad());
         }
-        let t = &mmap[table_off..mmap.len() - TRAILER_LEN];
+        let t = &mmap[table_off..];
         if u64_at(t, 0).ok_or_else(bad)? as usize != n {
             return Err(bad());
         }
@@ -350,7 +346,7 @@ impl Attrs {
                 postings,
             });
         }
-        Ok(Some(Attrs { n, attrs, by_name }))
+        Ok(Attrs { n, attrs, by_name })
     }
 
     fn present(&self, b: &[u8], a: usize, slot: u32) -> bool {
@@ -762,8 +758,8 @@ mod tests {
         let metas: Vec<Arc<Metadata>> = records.iter().cloned().map(Arc::new).collect();
         let mut buf = vec![0u8; 64]; // stands in for the fixed sections
         let n = records.len();
-        write(&mut buf, 64, n, &|s| metas.get(s as usize).cloned()).unwrap();
-        let attrs = Attrs::parse(&buf, 64, n).unwrap().expect("section present");
+        let (_, table_off) = write(&mut buf, 64, n, &|s| metas.get(s as usize).cloned()).unwrap();
+        let attrs = Attrs::parse(&buf, 64, table_off as usize, n).unwrap();
         (buf, attrs)
     }
 
@@ -887,14 +883,10 @@ mod tests {
     }
 
     #[test]
-    fn file_without_section_has_no_attrs() {
-        assert!(Attrs::parse(&[0u8; 100], 64, 3).unwrap().is_none());
-        let (mut b, _) = build(&recs());
-        let len = b.len();
-        b[len - 1] ^= 1;
-        assert!(
-            Attrs::parse(&b, 64, 200).unwrap().is_none(),
-            "a damaged trailer reads as no section"
-        );
+    fn damaged_table_is_corrupt_not_a_panic() {
+        let (b, _) = build(&recs());
+        assert!(Attrs::parse(&b, 64, b.len() + 8, 200).is_err(), "table offset past the end");
+        assert!(Attrs::parse(&b, 64, 8, 200).is_err(), "table offset inside the fixed sections");
+        assert!(Attrs::parse(&b, 64, 72, 200).is_err(), "garbage where the table should be");
     }
 }

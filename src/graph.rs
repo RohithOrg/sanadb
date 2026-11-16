@@ -50,6 +50,12 @@ use crate::{Error, Filter, Metadata, Metric, Result};
 pub(crate) type MetaFn<'a> = dyn Fn(u64) -> Option<Arc<Metadata>> + Sync + 'a;
 
 const MAGIC: &[u8; 8] = b"SANAIDX2";
+/// Footer closing an index written by 0.2.0 or later:
+/// `attrs_table_off u64 | idtab_off u64 | reserved u64 | "SANAFTR2"`. The
+/// id table is `n` ids sorted ascending (`u64` each) followed by their slots
+/// (`u32` each), so `slot(id)` is a binary search on the mapping.
+const FOOTER_MAGIC: &[u8; 8] = b"SANAFTR2";
+const FOOTER_LEN: usize = 32;
 const HEADER_LEN: usize = 8 + 4 + 1 + 3 + 4 + 4 + 4 + 4 + 4;
 const ALIGN: usize = 64;
 /// Reader level of the index file (header byte 13), independent of the log's.
@@ -111,8 +117,11 @@ pub(crate) struct GraphIndex {
     entry: u32,
     block: usize,
     blocks_off: usize,
-    ids: Vec<u64>,
-    slot_of: HashMap<u64, u32>,
+    n: usize,
+    /// Offset of the sorted id table, when the file has one.
+    idtab: Option<usize>,
+    /// Built on open for files without an id table (written before 0.2.0).
+    slot_of: Option<HashMap<u64, u32>>,
     pq: Option<(Codebook, Vec<u8>)>,
     /// Attribute columns, when the file has them (written since 0.1.4).
     attrs: Option<Attrs>,
@@ -175,17 +184,6 @@ impl GraphIndex {
         {
             return Err(Error::Corrupt("index geometry inconsistent"));
         }
-        let ids: Vec<u64> = mmap[ids_off..ids_off + n * 8]
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|c| u64::from_le_bytes(*c))
-            .collect();
-        let slot_of = ids
-            .iter()
-            .enumerate()
-            .map(|(s, &id)| (id, s as u32))
-            .collect();
         let pq = (m != 0).then(|| {
             let cb_len = m * pq::K * (dim / m) * 4;
             let centroids = mmap[pq_off..pq_off + cb_len]
@@ -197,7 +195,31 @@ impl GraphIndex {
             let codes = mmap[pq_off + cb_len..pq_off + pq_len].to_vec();
             (Codebook::new(dim, m, centroids), codes)
         });
-        let attrs = Attrs::parse(&mmap, pq_off + pq_len, n)?;
+        // Optional sections after the fixed ones: a 0.2.0 footer names the
+        // attribute table and the id table; a 0.1.4 trailer names only the
+        // attribute table; anything else is a 0.1.3 file with neither.
+        let fixed_end = pq_off + pq_len;
+        let tail = &mmap[fixed_end..];
+        let (attrs_off, idtab) = if tail.len() >= FOOTER_LEN && &mmap[mmap.len() - 8..] == FOOTER_MAGIC {
+            let f = mmap.len() - FOOTER_LEN;
+            let at = |o: usize| u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize;
+            let (a, t) = (at(0), at(8));
+            if t < fixed_end || t + n * 12 > f {
+                return Err(Error::Corrupt("index id table inconsistent"));
+            }
+            (Some(a), Some(t))
+        } else if tail.len() >= attrs::LEGACY_TRAILER_LEN && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC {
+            let o = mmap.len() - attrs::LEGACY_TRAILER_LEN;
+            (Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize), None)
+        } else {
+            (None, None)
+        };
+        let attrs = attrs_off.map(|a| Attrs::parse(&mmap, fixed_end, a, n)).transpose()?;
+        let slot_of = idtab.is_none().then(|| {
+            (0..n)
+                .map(|s| (u64::from_le_bytes(mmap[ids_off + s * 8..ids_off + s * 8 + 8].try_into().unwrap()), s as u32))
+                .collect()
+        });
         Ok(Some(GraphIndex {
             mmap,
             dim,
@@ -206,7 +228,8 @@ impl GraphIndex {
             entry,
             block,
             blocks_off,
-            ids,
+            n,
+            idtab,
             slot_of,
             pq,
             attrs,
@@ -214,7 +237,7 @@ impl GraphIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.n
     }
 
     /// Number of PQ subspaces, 0 when the walk uses full vectors.
@@ -223,11 +246,30 @@ impl GraphIndex {
     }
 
     pub fn slot(&self, id: u64) -> Option<u32> {
-        self.slot_of.get(&id).copied()
+        if let Some(map) = &self.slot_of {
+            return map.get(&id).copied();
+        }
+        let t = self.idtab?;
+        let n = self.n;
+        let id_at = |i: usize| u64::from_le_bytes(self.mmap[t + i * 8..t + i * 8 + 8].try_into().unwrap());
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match id_at(mid).cmp(&id) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => {
+                    let o = t + n * 8 + mid * 4;
+                    return Some(u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()));
+                }
+            }
+        }
+        None
     }
 
     pub fn id(&self, slot: u32) -> u64 {
-        self.ids[slot as usize]
+        let o = HEADER_LEN + slot as usize * 8;
+        u64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap())
     }
 
     pub fn vector(&self, slot: u32) -> &[f32] {
@@ -274,11 +316,11 @@ impl GraphIndex {
         accept: impl Fn(u32) -> bool,
         filtered_walk: bool,
     ) -> Vec<(f32, u32)> {
-        if self.ids.is_empty() || k == 0 {
+        if self.n == 0 || k == 0 {
             return Vec::new();
         }
         let mut beam = beam.max(k);
-        let cap = max_beam.max(beam).min(self.ids.len());
+        let cap = max_beam.max(beam).min(self.n);
         let lut = self.pq.as_ref().map(|(cb, _)| cb.lut(q, self.metric));
         let pass: Option<&dyn Fn(u32) -> bool> =
             filtered_walk.then_some(&accept as &dyn Fn(u32) -> bool);
@@ -304,7 +346,7 @@ impl GraphIndex {
                     pass,
                 ),
             };
-            let exhausted = visited.len() >= self.ids.len();
+            let exhausted = visited.len() >= self.n;
             visited.retain(|&(_, s)| accept(s));
             if visited.len() >= k || beam >= cap || exhausted {
                 if self.pq.is_some() {
@@ -349,7 +391,7 @@ impl GraphIndex {
     pub fn estimate(&self, p: &Pred) -> usize {
         self.attrs
             .as_ref()
-            .map_or(self.ids.len(), |a| a.estimate(&self.mmap, p))
+            .map_or(self.n, |a| a.estimate(&self.mmap, p))
     }
     pub fn candidates(&self, p: &Pred) -> Option<Vec<u32>> {
         self.attrs.as_ref()?.candidates(&self.mmap, p)
@@ -358,7 +400,7 @@ impl GraphIndex {
 
 impl Walkable for GraphIndex {
     fn len(&self) -> usize {
-        self.ids.len()
+        self.n
     }
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
         out.extend_from_slice(self.neighbors(slot));
@@ -1174,7 +1216,22 @@ fn write_index(
     // Attribute columns, 8-aligned, found by readers through their trailer.
     let aligned = pos.next_multiple_of(8);
     w.write_all(&vec![0u8; aligned - pos])?;
-    attrs::write(&mut w, aligned as u64, n, &|s| meta_of(ids[s as usize]))?;
+    let (attr_len, attrs_table) = attrs::write(&mut w, aligned as u64, n, &|s| meta_of(ids[s as usize]))?;
+    // Sorted id table: ids ascending, then the matching slots.
+    let idtab = (aligned as u64 + attr_len).next_multiple_of(8);
+    w.write_all(&vec![0u8; (idtab - aligned as u64 - attr_len) as usize])?;
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by_key(|&s| ids[s as usize]);
+    for &s in &order {
+        w.write_all(&ids[s as usize].to_le_bytes())?;
+    }
+    w.write_all(bytemuck::cast_slice(&order))?;
+    let after = idtab + n as u64 * 12;
+    w.write_all(&vec![0u8; (after.next_multiple_of(8) - after) as usize])?;
+    for v in [attrs_table, idtab, 0u64] {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    w.write_all(FOOTER_MAGIC)?;
     w.flush()?;
     w.get_ref().sync_all()?;
     Ok(())
