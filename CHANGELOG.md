@@ -7,6 +7,42 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Added
+- `Db::search_many` and `search_many_filtered`: k-NN for a batch of queries
+  (row-major slice) spread over all cores with rayon. In Python,
+  `Db.search_many(queries, k, filter=None)` takes a 2-D float32 array and
+  returns `(ids, scores)` as `(n, k)` arrays, padded with `-1` and `nan`,
+  with the GIL released.
+
+### Changed
+- Warm queries are 27 to 30% faster on SIFT1M (beam 64: 202 µs to 146 µs,
+  beam 256: 572 µs to 405 µs; 10,000 queries, old and new binary back to
+  back on the same index, same recall), from profiling the walk rather than
+  from SIMD: the distance loop already compiled to NEON. Three changes, each
+  measured with the macOS sampler on a warm index:
+  - The candidate list is two heaps (unexpanded candidates, and the `beam`
+    best seen) instead of a sorted `Vec`; its shifting inserts were 18% of a
+    query.
+  - The visited set is a bitmap over slots with a touched-word list for
+    clearing (n/8 bytes per thread) instead of a hash set; its inserts were
+    14%.
+  - Not changed, after measuring: the `madvise` prefetch calls are 15% of a
+    warm query and a probe gate that skipped them when recent blocks read as
+    resident was tried and dropped, since it cost 45% on a cold query in a
+    purge-then-query A/B on the 5M index. `io_width(1)` remains the switch
+    for stores known to be in RAM.
+  - The PQ lookup sum uses four accumulators and the per-query table is
+    built from a dimension-major copy of the codebook, so both vectorise.
+- Unfiltered searches no longer look up each visited node's metadata (6%).
+- `rustc-hash` is no longer a dependency.
+
+### Fixed
+- A record deleted while a checkpoint was building now gets a Delete frame
+  in the compacted log, so reopening the store replays its tombstone.
+  Before, the stale graph node was hidden only by the per-node metadata
+  lookup during search, and `index_stats().tombstones` under-counted after
+  a reopen.
+
 ## [0.1.3] - 2026-11-16
 
 ### Added

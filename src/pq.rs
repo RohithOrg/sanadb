@@ -24,17 +24,28 @@ pub(crate) struct Codebook {
     pub m: usize,
     /// `m * K * sub` floats, centroid `c` of subspace `s` at `(s*K + c) * sub`.
     pub centroids: Vec<f32>,
+    /// The same centroids transposed per subspace, dimension-major:
+    /// `by_dim[(s*sub + d) * K + c]`, so `lut` runs over the 256 centroids of
+    /// one dimension contiguously and vectorises.
+    by_dim: Vec<f32>,
 }
 
 impl Codebook {
-    pub fn sub(&self) -> usize {
-        self.dim / self.m
+    pub fn new(dim: usize, m: usize, centroids: Vec<f32>) -> Codebook {
+        let sub = dim / m;
+        let mut by_dim = vec![0f32; centroids.len()];
+        for s in 0..m {
+            for c in 0..K {
+                for d in 0..sub {
+                    by_dim[(s * sub + d) * K + c] = centroids[(s * K + c) * sub + d];
+                }
+            }
+        }
+        Codebook { dim, m, centroids, by_dim }
     }
 
-    fn centroid(&self, s: usize, c: usize) -> &[f32] {
-        let sub = self.sub();
-        let o = (s * K + c) * sub;
-        &self.centroids[o..o + sub]
+    pub fn sub(&self) -> usize {
+        self.dim / self.m
     }
 
     /// e-means per subspace over a sample of `vectors` (row-major).
@@ -62,7 +73,7 @@ impl Codebook {
                 crate::kmeans::emeans(&point, sample.len(), sub, K, 3, seed ^ (s as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15))
             })
             .collect();
-        Codebook { dim, m, centroids: centroids.concat() }
+        Codebook::new(dim, m, centroids.concat())
     }
 
     /// Encode every row of `vectors` to `m` bytes each.
@@ -85,13 +96,14 @@ impl Codebook {
         let sub = self.sub();
         let mut lut = vec![0f32; self.m * K];
         for s in 0..self.m {
-            let qs = &q[s * sub..(s + 1) * sub];
-            for c in 0..K {
-                let cent = self.centroid(s, c);
-                lut[s * K + c] = match metric {
-                    Metric::L2 | Metric::Cosine => qs.iter().zip(cent).map(|(a, b)| (a - b) * (a - b)).sum(),
-                    Metric::Dot => -qs.iter().zip(cent).map(|(a, b)| a * b).sum::<f32>(),
-                };
+            let row = &mut lut[s * K..(s + 1) * K];
+            for d in 0..sub {
+                let qd = q[s * sub + d];
+                let cents = &self.by_dim[(s * sub + d) * K..(s * sub + d + 1) * K];
+                match metric {
+                    Metric::L2 | Metric::Cosine => row.iter_mut().zip(cents).for_each(|(l, &c)| *l += (qd - c) * (qd - c)),
+                    Metric::Dot => row.iter_mut().zip(cents).for_each(|(l, &c)| *l -= qd * c),
+                }
             }
         }
         lut
@@ -101,7 +113,18 @@ impl Codebook {
 /// Approximate distance from a query (via its `lut`) to one stored code.
 #[inline]
 pub(crate) fn lut_distance(lut: &[f32], code: &[u8]) -> f32 {
-    code.iter().enumerate().map(|(s, &c)| lut[s * K + c as usize]).sum()
+    // Four accumulators: a single running sum is a serial chain of dependent
+    // adds, and the table gathers cannot hide it (30% slower in isolation).
+    let (chunks, rest) = code.as_chunks::<4>();
+    let mut acc = [0f32; 4];
+    for (j, c) in chunks.iter().enumerate() {
+        let base = j * 4 * K;
+        for i in 0..4 {
+            acc[i] += lut[base + i * K + c[i] as usize];
+        }
+    }
+    let done = chunks.len() * 4;
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + rest.iter().enumerate().map(|(i, &c)| lut[(done + i) * K + c as usize]).sum::<f32>()
 }
 
 use crate::kmeans::{XorShift, nearest};

@@ -803,3 +803,32 @@ fn exact_search_matches_brute_force() {
     let hits = db.search(&q, 10).unwrap();
     assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), expect[..10].iter().map(|e| e.1).collect::<Vec<_>>());
 }
+
+#[test]
+fn search_many_matches_single_searches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.sana");
+    let dim = 16usize;
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    let n = 3000u64;
+    for i in 0..n {
+        let m = if i % 2 == 0 { meta(&[("even", "yes")]) } else { HashMap::new() };
+        db.insert(i, &vec_of(dim, i), m).unwrap();
+    }
+    db.checkpoint().unwrap();
+    for i in n..n + 100 {
+        db.insert(i, &vec_of(dim, i), HashMap::new()).unwrap();
+    }
+    let queries: Vec<f32> = (0..64u64).flat_map(|q| vec_of(dim, 5_000_000 + q * 7)).collect();
+    let many = db.search_many(&queries, 10).unwrap();
+    assert_eq!(many.len(), 64);
+    for (row, q) in queries.chunks(dim).enumerate() {
+        assert_eq!(many[row], db.search(q, 10).unwrap(), "row {row}");
+    }
+    let filtered = db.search_many_filtered(&queries, 5, |m| m.contains_key("even")).unwrap();
+    for (row, q) in queries.chunks(dim).enumerate() {
+        assert_eq!(filtered[row], db.search_filtered(q, 5, |m| m.contains_key("even")).unwrap(), "row {row}");
+        assert!(filtered[row].iter().all(|h| h.id % 2 == 0));
+    }
+    assert!(matches!(db.search_many(&queries[..dim + 3], 10), Err(sanadb::Error::DimMismatch { .. })));
+}

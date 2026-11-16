@@ -46,24 +46,31 @@ fn main() {
     let n_queries = n_queries.min(queries.len() / dim);
     println!("SIFT1M: dim={dim} base={n_total} using={n} queries={n_queries} pq={use_pq}");
 
+    // SIFT_STORE=<dir> keeps the store between runs and skips the build when
+    // an index over the same `n` already exists there (for profiling queries).
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("sift.sana");
+    let keep = std::env::var_os("SIFT_STORE").map(std::path::PathBuf::from);
+    let path = keep.as_deref().unwrap_or(tmp.path()).join(format!("sift{}.{}.sana", n / 1000, if use_pq { "pq" } else { "nopq" }));
     let params = GraphParams { use_pq, prune_slack, ..GraphParams::default() };
     // Bulk load: one explicit build at the end, no automatic ones in between.
     let mut db = Db::open(&path, Options::new(dim as u32).graph(params).auto_checkpoint_delta(0)).unwrap();
     println!("prune_slack={prune_slack}");
 
-    let t = Instant::now();
-    for i in 0..n {
-        db.insert(i as u64, &base[i * dim..(i + 1) * dim], HashMap::new()).unwrap();
+    if db.index_stats().is_some_and(|s| s.nodes == n) {
+        println!("reusing index at {}", path.display());
+    } else {
+        let t = Instant::now();
+        for i in 0..n {
+            db.insert(i as u64, &base[i * dim..(i + 1) * dim], HashMap::new()).unwrap();
+        }
+        println!("insert {n}: {:.1?}", t.elapsed());
+        let t = Instant::now();
+        db.checkpoint().unwrap();
+        let build = t.elapsed();
+        let stats = db.index_stats().unwrap();
+        let idx_bytes = fs::metadata(format!("{}.idx", path.display())).unwrap().len();
+        println!("build: {build:.1?}  nodes={} pq_subspaces={} index={:.0} MB", stats.nodes, stats.pq_subspaces, idx_bytes as f64 / 1e6);
     }
-    println!("insert {n}: {:.1?}", t.elapsed());
-    let t = Instant::now();
-    db.checkpoint().unwrap();
-    let build = t.elapsed();
-    let stats = db.index_stats().unwrap();
-    let idx_bytes = fs::metadata(path.with_file_name("sift.sana.idx")).unwrap().len();
-    println!("build: {build:.1?}  nodes={} pq_subspaces={} index={:.0} MB", stats.nodes, stats.pq_subspaces, idx_bytes as f64 / 1e6);
 
     // Ground truth: published top-100 for the full set, brute force otherwise.
     let k = 10;

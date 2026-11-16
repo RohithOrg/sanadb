@@ -119,3 +119,21 @@ def test_threads_write_during_checkpoint(tmp_path):
     db.checkpoint()
     assert db.delta_len == 0 and db.index_stats()["tombstones"] == 0
     assert len(db) == n + 300 - 100
+
+
+def test_search_many_matches_single(tmp_path):
+    import numpy as np
+    db = sanadb.Db(str(tmp_path / "many.sana"), dim=8)
+    rng = np.random.default_rng(3)
+    vecs = rng.random((2000, 8), dtype=np.float32)
+    db.insert_many(list(range(2000)), vecs, [{"even": "yes"} if i % 2 == 0 else None for i in range(2000)])
+    db.checkpoint()
+    qs = rng.random((17, 8), dtype=np.float32)
+    ids, scores = db.search_many(qs, k=5)
+    assert ids.shape == (17, 5) and scores.shape == (17, 5)
+    for row in range(17):
+        single = db.search(qs[row], k=5)
+        assert [i for i, _ in single] == ids[row].tolist()
+        assert np.allclose([s for _, s in single], scores[row])
+    ids, _ = db.search_many(qs, k=3, filter={"even": "yes"})
+    assert (ids % 2 == 0).all()

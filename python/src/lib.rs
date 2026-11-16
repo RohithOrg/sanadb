@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -206,6 +206,34 @@ impl PyDb {
             }
         };
         Ok(hits.into_iter().map(|h| (h.id, h.score)).collect())
+    }
+
+    /// k nearest neighbours for every row of a 2-D float32 array, computed
+    /// across all cores with the GIL released. Returns `(ids, scores)`, two
+    /// `(n, k)` arrays; rows with fewer than `k` results are padded with
+    /// `ids = -1` and `scores = nan`. `filter` is a dict of metadata pairs
+    /// that must all match (callables are not accepted here).
+    #[pyo3(signature = (queries, k = 10, filter = None))]
+    fn search_many<'py>(&self, py: Python<'py>, queries: PyReadonlyArray2<'py, f32>, k: usize, filter: Option<&Bound<'py, PyDict>>) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
+        let n = queries.shape()[0];
+        let flat: Vec<f32> = queries.as_slice()?.to_vec();
+        let want = filter.map(|f| to_meta(Some(f))).transpose()?;
+        let db = self.inner.clone();
+        let hits = py
+            .allow_threads(move || match want {
+                None => db.search_many(&flat, k),
+                Some(want) => db.search_many_filtered(&flat, k, |m| want.iter().all(|(k, v)| m.get(k) == Some(v))),
+            })
+            .map_err(err)?;
+        let mut ids = vec![-1i64; n * k];
+        let mut scores = vec![f32::NAN; n * k];
+        for (row, hs) in hits.iter().enumerate() {
+            for (j, h) in hs.iter().enumerate() {
+                ids[row * k + j] = h.id as i64;
+                scores[row * k + j] = h.score;
+            }
+        }
+        Ok((PyArray1::from_vec(py, ids).reshape([n, k])?, PyArray1::from_vec(py, scores).reshape([n, k])?))
     }
 
     /// fsync the log so acknowledged writes survive power loss.

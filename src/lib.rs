@@ -25,6 +25,7 @@ use std::sync::Arc;
 // parking_lot locks do not poison: a panic on one thread (for instance from
 // a filter closure) leaves the store usable by the others.
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use rayon::prelude::*;
 
 pub use graph::GraphParams;
 use graph::GraphIndex;
@@ -385,22 +386,46 @@ impl Db {
     /// k-nearest-neighbour search. Exact over records written since the last
     /// checkpoint, approximate (graph walk) over the rest.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
-        self.search_filtered(query, k, |_| true)
+        self.search_impl(query, k, None)
     }
 
     /// k-NN restricted to records whose metadata passes `filter`.
     pub fn search_filtered(&self, query: &[f32], k: usize, filter: impl Fn(&Metadata) -> bool) -> Result<Vec<Hit>> {
+        self.search_impl(query, k, Some(&filter))
+    }
+
+    /// k-NN for many queries at once, spread over all cores. `queries` is
+    /// row-major, `n * dim` floats; the result has one `Vec<Hit>` per row in
+    /// the same order. Each row sees the same store state as a single
+    /// `search` would, but rows may interleave with concurrent writes.
+    pub fn search_many(&self, queries: &[f32], k: usize) -> Result<Vec<Vec<Hit>>> {
+        self.search_many_filtered(queries, k, |_| true)
+    }
+
+    /// `search_many` restricted to records whose metadata passes `filter`.
+    pub fn search_many_filtered(&self, queries: &[f32], k: usize, filter: impl Fn(&Metadata) -> bool + Sync) -> Result<Vec<Vec<Hit>>> {
+        let dim = self.header.dim as usize;
+        if !queries.len().is_multiple_of(dim) {
+            return Err(Error::DimMismatch { expected: self.header.dim, got: queries.len() % dim });
+        }
+        queries.par_chunks(dim).map(|q| self.search_filtered(q, k, &filter)).collect()
+    }
+
+    fn search_impl(&self, query: &[f32], k: usize, filter: Option<&dyn Fn(&Metadata) -> bool>) -> Result<Vec<Hit>> {
         if query.len() != self.header.dim as usize {
             return Err(Error::DimMismatch { expected: self.header.dim, got: query.len() });
         }
         let query = &*prepare(self.header.metric, query)?;
         let i = self.read()?;
-        let passes = |id: u64| i.meta.get(&id).is_some_and(&filter);
+        // Without a filter the metadata map is never consulted: that lookup
+        // ran once per visited node and was 6% of a warm query.
+        let passes = |id: u64| filter.is_none_or(|f| i.meta.get(&id).is_some_and(f));
         let mut hits = i.delta.search(query, k, passes, &|off| i.wal.vector_at(off));
         if let Some(g) = &i.graph {
             let (beam, max_beam, width) = (self.opts.search_beam as usize, self.opts.max_search_beam as usize, self.opts.io_width as usize);
+            let dead = !i.tombstones.is_empty();
             hits.extend(
-                g.search(query, k, beam, max_beam, width, |slot| !i.tombstones.contains(&slot) && passes(g.id(slot)))
+                g.search(query, k, beam, max_beam, width, |slot| (!dead || !i.tombstones.contains(&slot)) && passes(g.id(slot)))
                     .into_iter()
                     .map(|(score, slot)| Hit { id: g.id(slot), score }),
             );
@@ -526,19 +551,21 @@ impl Db {
                 tombstones.insert(slot);
             }
         }
-        for id in deleted {
-            // Deleted during the build: hide its graph slot unless it was
-            // re-inserted (then the survivor loop already tombstoned it).
-            if let Some(slot) = graph.slot(id).filter(|_| !i.meta.contains_key(&id)) {
-                tombstones.insert(slot);
-            }
+        // Deleted during the build: hide its graph slot unless it was
+        // re-inserted (then the survivor loop already tombstoned it). These
+        // ids also get a Delete frame in the new log, so a reopen replays the
+        // tombstone instead of serving the stale graph node.
+        let dead: Vec<u64> = deleted.into_iter().filter(|id| !i.meta.contains_key(id)).filter(|id| graph.slot(*id).is_some()).collect();
+        for id in &dead {
+            tombstones.insert(graph.slot(*id).unwrap());
         }
 
         let log_tmp = self.path.with_extension("tmp");
         let survivor_ids: HashSet<u64> = survivors.iter().map(|(id, _)| *id).collect();
         let inserts = survivors.iter().map(|&(id, off)| Entry::Insert { id, vector: i.wal.vector_at(off).to_vec(), meta: i.meta[&id].clone() });
         let metas = i.meta.iter().filter(|(id, _)| !survivor_ids.contains(id)).map(|(&id, m)| Entry::Meta { id, meta: m.clone() });
-        let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas))?;
+        let deletes = dead.iter().map(|&id| Entry::Delete { id });
+        let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas).chain(deletes))?;
         // Same Windows rule for the log: close the old one before replacing
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.

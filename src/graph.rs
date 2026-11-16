@@ -28,12 +28,10 @@
 //! r u32 | entry u32 | block u32 | m u32 | ids u64*n | pad to 64 | blocks |
 //! codebook f32*(m*256*dim/m) | codes u8*(n*m)`.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 
-/// Visited-set hasher for the walk. SipHash (the std default) was a third of
-/// the walk's time in profiles; the keys are node ids, not attacker input.
-type FxHashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
@@ -80,6 +78,8 @@ impl Default for GraphParams {
 /// Anything the greedy walk can traverse: the in-RAM graph under construction
 /// or the memory-mapped file.
 trait Walkable: Sync {
+    /// Number of slots, for sizing the visited bitmap.
+    fn len(&self) -> usize;
     /// Append `slot`'s neighbours to `out`. A callback rather than a slice so
     /// the in-RAM graph can hand out lock-guarded adjacency.
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>);
@@ -139,9 +139,20 @@ impl GraphIndex {
             let cb_len = m * pq::K * (dim / m) * 4;
             let centroids = mmap[pq_off..pq_off + cb_len].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
             let codes = mmap[pq_off + cb_len..pq_off + pq_len].to_vec();
-            (Codebook { dim, m, centroids }, codes)
+            (Codebook::new(dim, m, centroids), codes)
         });
-        Ok(Some(GraphIndex { mmap, dim, metric, r, entry, block, blocks_off, ids, slot_of, pq }))
+        Ok(Some(GraphIndex {
+            mmap,
+            dim,
+            metric,
+            r,
+            entry,
+            block,
+            blocks_off,
+            ids,
+            slot_of,
+            pq,
+        }))
     }
 
     pub fn len(&self) -> usize {
@@ -223,6 +234,9 @@ impl GraphIndex {
 }
 
 impl Walkable for GraphIndex {
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
         out.extend_from_slice(self.neighbors(slot));
     }
@@ -231,6 +245,11 @@ impl Walkable for GraphIndex {
         if slots.len() < 2 {
             return;
         }
+        // Always advise when the caller asked for a width above 1. A probe
+        // gate (skip madvise once recent blocks read as resident) saved 15%
+        // of a warm query but cost 45% on a cold one in a purge-then-query
+        // A/B on the 5M index, because hub blocks are resident long before
+        // the rest of a cold file. Warm-only deployments set `io_width(1)`.
         for &s in slots {
             let o = self.blocks_off + s as usize * self.block;
             // Advisory: the kernel starts the read; a failure only costs the hint.
@@ -311,6 +330,9 @@ impl<'a> MemGraph<'a> {
 
 
 impl Walkable for MemGraph<'_> {
+    fn len(&self) -> usize {
+        self.adj.len()
+    }
     fn neighbors_into(&self, slot: u32, out: &mut Vec<u32>) {
         out.extend_from_slice(&self.adj[slot as usize].read());
     }
@@ -331,42 +353,110 @@ fn greedy<G: Walkable>(g: &G, start: u32, beam: usize, width: usize, dist: impl 
     }
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
-        let Scratch { cand, seen, nbrs, picks } = &mut *s;
+        let Scratch { cand, top, seen, nbrs, picks } = &mut *s;
         cand.clear();
-        seen.clear();
-        cand.push((dist(start), start, false));
+        top.clear();
+        seen.reset(g.len());
+        let c = Cand { d: dist(start), s: start };
         seen.insert(start);
-        greedy_in(g, beam, width, &dist, cand, seen, nbrs, picks)
+        cand.push(Reverse(c));
+        top.push(c);
+        greedy_in(g, beam, width, &dist, cand, top, seen, nbrs, picks)
     })
+}
+
+/// `(distance, slot)` with a total order, so it can sit in a heap.
+#[derive(Clone, Copy, PartialEq)]
+struct Cand {
+    d: f32,
+    s: u32,
+}
+impl Eq for Cand {}
+impl Ord for Cand {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.d.total_cmp(&o.d).then(self.s.cmp(&o.s))
+    }
+}
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// Visited set as a bitmap over slots. Clearing touches only the words a walk
+/// set, so a reset costs the walk's size, not the graph's, and the bitmap is
+/// n/8 bytes per thread: 125 KB for 1M nodes against the hash set it replaced,
+/// whose insert was 14% of a warm query.
+#[derive(Default)]
+struct Visited {
+    words: Vec<u64>,
+    touched: Vec<u32>,
+}
+
+impl Visited {
+    fn reset(&mut self, n: usize) {
+        for &w in &self.touched {
+            self.words[w as usize] = 0;
+        }
+        self.touched.clear();
+        let need = n.div_ceil(64);
+        if self.words.len() < need {
+            self.words.resize(need, 0);
+        }
+    }
+
+    /// True when `s` was not yet in the set.
+    #[inline]
+    fn insert(&mut self, s: u32) -> bool {
+        let (w, bit) = ((s >> 6) as usize, 1u64 << (s & 63));
+        if self.words[w] & bit != 0 {
+            return false;
+        }
+        self.words[w] |= bit;
+        self.touched.push(w as u32);
+        true
+    }
 }
 
 #[derive(Default)]
 struct Scratch {
-    /// (dist, slot, expanded), kept sorted ascending by dist.
-    cand: Vec<(f32, u32, bool)>,
-    seen: FxHashSet<u32>,
+    /// Unexpanded candidates, closest first.
+    cand: BinaryHeap<Reverse<Cand>>,
+    /// The `beam` closest nodes seen so far, farthest first, so the bound is
+    /// `top.peek()`.
+    top: BinaryHeap<Cand>,
+    seen: Visited,
     nbrs: Vec<u32>,
     picks: Vec<u32>,
 }
 
+/// The textbook best-first walk with two heaps: expand the closest unexpanded
+/// candidate while it is within the `beam` best seen; a neighbour enters the
+/// heaps only if it beats the current `beam`-th best. Replaces a sorted `Vec`
+/// whose shifting inserts were 18% of a warm query.
 #[allow(clippy::too_many_arguments)]
 fn greedy_in<G: Walkable>(
     g: &G,
     beam: usize,
     width: usize,
     dist: &impl Fn(u32) -> f32,
-    cand: &mut Vec<(f32, u32, bool)>,
-    seen: &mut FxHashSet<u32>,
+    cand: &mut BinaryHeap<Reverse<Cand>>,
+    top: &mut BinaryHeap<Cand>,
+    seen: &mut Visited,
     nbrs: &mut Vec<u32>,
     picks: &mut Vec<u32>,
 ) -> Vec<(f32, u32)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(beam * 2);
     loop {
         picks.clear();
-        for c in cand.iter_mut().filter(|c| !c.2).take(width.max(1)) {
-            c.2 = true;
-            out.push((c.0, c.1));
-            picks.push(c.1);
+        while picks.len() < width.max(1) {
+            let Some(&Reverse(c)) = cand.peek() else { break };
+            if top.len() >= beam && c.d > top.peek().map_or(f32::INFINITY, |t| t.d) {
+                break;
+            }
+            cand.pop();
+            out.push((c.d, c.s));
+            picks.push(c.s);
         }
         if picks.is_empty() {
             break;
@@ -380,12 +470,15 @@ fn greedy_in<G: Walkable>(
                     continue;
                 }
                 let nd = dist(nb);
-                if cand.len() >= beam && nd >= cand[beam - 1].0 {
+                if top.len() >= beam && nd >= top.peek().map_or(f32::INFINITY, |t| t.d) {
                     continue;
                 }
-                let pos = cand.partition_point(|c| c.0 <= nd);
-                cand.insert(pos, (nd, nb, false));
-                cand.truncate(beam);
+                let c = Cand { d: nd, s: nb };
+                cand.push(Reverse(c));
+                top.push(c);
+                if top.len() > beam {
+                    top.pop();
+                }
             }
         }
     }

@@ -756,7 +756,6 @@ dependencies = [
  "parking_lot",
  "rand",
  "rayon",
- "rustc-hash",
  "tempfile",
 ]
 

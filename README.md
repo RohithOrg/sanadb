@@ -70,6 +70,7 @@ use std::collections::HashMap;
 let db = Db::open("vectors.sana", Options::new(768).metric(Metric::Cosine))?;
 db.insert(1, &embedding, HashMap::from([("doc".into(), "intro.md".into())]))?;
 let hits = db.search_filtered(&query, 10, |m| m["doc"].ends_with(".md"))?;
+let batch = db.search_many(&queries, 10)?; // row-major `n * dim`, all cores
 db.sync()?;       // fsync: survive power loss
 db.checkpoint()?; // build the graph index, compact the log
 ```
@@ -84,12 +85,13 @@ db.insert(1, embedding, {"doc": "intro.md"})
 db.insert_many(ids, np.asarray(vectors, dtype=np.float32), metas)
 hits = db.search(query, k=10, filter={"doc": "intro.md"})   # [(id, score), ...]
 hits = db.search(query, k=10, filter=lambda m: m["doc"].endswith(".md"))
+ids, scores = db.search_many(queries, k=10)   # (n, k) arrays, all cores
 db.checkpoint()
 ```
 
 `Db` is thread-safe. Reads run concurrently, a checkpoint builds the new index
 without blocking readers or writers, and the Python bindings release the GIL
-during inserts, dict-filtered searches and checkpoints. Scores are distances:
+during inserts, dict-filtered searches, batch searches and checkpoints. Scores are distances:
 lower is closer. For cosine they are the negative cosine similarity, in
 `[-1, 1]`.
 
@@ -159,18 +161,26 @@ ground truth. Index fits in RAM, so this measures CPU, not disk.
 
 | | PQ on | PQ off |
 |---|---|---|
-| build | 77 s | 76 s |
+| build | 75 s | 71 s |
 | index file | 744 MB | 712 MB |
-| beam 32: recall@10, mean, p99 | 0.914, 250 µs, 1.1 ms | |
-| beam 64 | 0.966, 207 µs, 305 µs | 0.965, 311 µs |
-| beam 128 | 0.987, 343 µs, 478 µs | 0.985, 506 µs |
-| beam 256 | 0.995, 586 µs, 806 µs | 0.995, 840 µs |
+| beam 64: recall@10, mean, p99 | 0.966, 146 µs, 213 µs | 0.971, 225 µs, 319 µs |
+| beam 128 | 0.987, 240 µs, 328 µs | 0.989, 371 µs, 490 µs |
+| beam 256 | 0.995, 405 µs, 555 µs | 0.996, 623 µs, 832 µs |
 
-Beam 32 was the first pass after opening the index, so its tail includes
-first-touch page faults. PQ costs nothing in recall here and saves about a
-third of the CPU when the index is warm. The PQ-off row was measured with
-1,000 queries per beam rather than 10,000, so its cache was colder; treat it
-as an upper bound.
+10,000 queries per beam, index warm. PQ costs 0.001 to 0.005 recall here
+and saves about 35% of the CPU: the walk reads 32 bytes of codes per
+candidate instead of a 512-byte vector, and only the final `beam`
+candidates are re-ranked exactly.
+
+These are the numbers after profiling the walk (0.1.4), measured back to
+back against the 0.1.3 binary on the same index under the same load: beam
+64 went from 202 µs to 146 µs, beam 256 from 572 µs to 405 µs, recall
+unchanged to four digits. The sampler had shown that sorted-list inserts,
+hash-set visited checks and a metadata lookup per visited node were together
+about 40% of a warm query, and none of it was distance arithmetic. The
+`madvise` prefetch calls are another 15% on a warm index and stay, because
+they are what makes a cold query fast; `io_width(1)` turns them off. Absolute numbers move 20% with what
+else the machine is doing; the ratio holds. See CHANGELOG.
 
 ### ann-benchmarks, against hnswlib, faiss HNSW and usearch
 
@@ -191,13 +201,13 @@ the row's recall. Raw CSVs: `benchmarks/ann-benchmarks/results/`.
 
 | recall@10 | hnswlib M=16 | hnswlib M=24 | faiss HNSW M=16 | faiss HNSW M=24 | usearch M=16 | usearch M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
 |---|---|---|---|---|---|---|---|---|---|
-| ~0.93 | 5,938 (0.931) |  | 11,559 (0.939) |  | 5,119 (0.930) |  |  | 5,457 (0.934) | 4,579 (0.939) |
-| ~0.96 |  | 4,797 (0.958) |  | 9,844 (0.958) |  | 3,991 (0.956) | 3,947 (0.964) | 4,229 (0.957) |  |
-| ~0.98 | 3,452 (0.977) | 2,808 (0.989) | 6,498 (0.982) | 5,467 (0.990) | 2,936 (0.977) | 2,298 (0.988) | 2,800 (0.980) | 2,400 (0.983) | 3,003 (0.984) |
-| ~0.99 | 2,520 (0.990) | 2,808 (0.989) | 4,332 (0.992) | 5,467 (0.990) | 2,102 (0.989) | 2,298 (0.988) | 1,696 (0.993) | 2,041 (0.989) | 2,229 (0.993) |
-| ~0.996 | 1,639 (0.997) | 2,011 (0.996) | 2,796 (0.998) | 3,849 (0.996) | 1,357 (0.997) | 1,642 (0.995) | 1,348 (0.995) | 1,154 (0.996) | 1,774 (0.996) |
-| ~0.999 | 922 (1.000) | 1,323 (0.999) | 1,425 (1.000) | 2,424 (0.999) | 749 (0.999) | 1,073 (0.999) | 743 (0.998) | 635 (0.998) | 1,029 (0.999) |
-| build | 209 s | 266 s | 132 s | 764 s* | 252 s | 311 s | 119 s | 112 s | 222 s |
+| ~0.93 | 5,938 (0.931) |  | 11,559 (0.939) |  | 5,119 (0.930) |  |  | 7,517 (0.935) |  |
+| ~0.96 |  | 4,797 (0.958) |  | 9,844 (0.958) |  | 3,991 (0.956) | 8,209 (0.966) | 5,775 (0.961) |  |
+| ~0.98 | 3,452 (0.977) | 2,808 (0.989) | 6,498 (0.982) | 5,467 (0.990) | 2,936 (0.977) | 2,298 (0.988) | 6,124 (0.981) | 3,514 (0.984) | 7,665 (0.975) |
+| ~0.99 | 2,520 (0.990) | 2,808 (0.989) | 4,332 (0.992) | 5,467 (0.990) | 2,102 (0.989) | 2,298 (0.988) | 5,014 (0.988) | 2,883 (0.990) | 4,904 (0.994) |
+| ~0.996 | 1,639 (0.997) | 2,011 (0.996) | 2,796 (0.998) | 3,849 (0.996) | 1,357 (0.997) | 1,642 (0.995) | 2,955 (0.996) | 1,716 (0.997) | 3,936 (0.997) |
+| ~0.999 | 922 (1.000) | 1,323 (0.999) | 1,425 (1.000) | 2,424 (0.999) | 749 (0.999) | 1,073 (0.999) | 1,689 (0.999) | 1,073 (0.999) | 2,353 (0.999) |
+| build | 209 s | 266 s | 132 s | 764 s* | 252 s | 311 s | 122 s | 118 s | 206 s |
 
 #### glove-100-angular
 
@@ -207,30 +217,35 @@ is hard for every graph index; hnswlib reaches 0.98 only at ef = 800.
 
 | recall@10 | hnswlib M=16 | hnswlib M=24 | faiss HNSW M=16 | faiss HNSW M=24 | usearch M=16 | usearch M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
 |---|---|---|---|---|---|---|---|---|---|
-| ~0.73 | 5,174 (0.728) |  | 9,619 (0.732) |  | 3,697 (0.729) |  |  | 3,843 (0.732) |  |
-| ~0.81 | 2,979 (0.811) |  | 5,505 (0.816) |  | 2,237 (0.811) |  |  | 2,273 (0.810) |  |
-| ~0.86 |  | 2,266 (0.853) | 3,873 (0.852) | 4,084 (0.859) |  | 1,667 (0.853) | 1,517 (0.858) | 1,314 (0.866) | 2,248 (0.860) |
-| ~0.89 | 1,401 (0.889) | 1,610 (0.887) | 2,435 (0.889) | 2,854 (0.893) | 1,024 (0.887) | 1,187 (0.887) | 1,066 (0.885) | 927 (0.891) | 1,608 (0.890) |
-| ~0.93 | 787 (0.933) | 1,047 (0.922) | 1,241 (0.930) | 1,807 (0.928) | 553 (0.932) | 764 (0.923) |  |  | 882 (0.929) |
-| ~0.95 | 553 (0.952) | 577 (0.960) | 810 (0.948) |  | 380 (0.951) | 410 (0.959) |  |  | 697 (0.942) |
-| build | 319 s | 434 s | 967 s* | 257 s | 388 s | 555 s | 378 s | 322 s | 658 s |
+| ~0.73 | 5,174 (0.728) |  | 9,619 (0.732) |  | 3,697 (0.729) |  |  | 5,186 (0.731) |  |
+| ~0.81 | 2,979 (0.811) |  | 5,505 (0.816) |  | 2,237 (0.811) |  |  | 2,986 (0.806) |  |
+| ~0.86 |  | 2,266 (0.853) | 3,873 (0.852) | 4,084 (0.859) |  | 1,667 (0.853) | 2,957 (0.858) | 1,762 (0.866) | 4,202 (0.860) |
+| ~0.89 | 1,401 (0.889) | 1,610 (0.887) | 2,435 (0.889) | 2,854 (0.893) | 1,024 (0.887) | 1,187 (0.887) | 2,113 (0.885) | 1,286 (0.891) | 3,110 (0.890) |
+| ~0.93 | 787 (0.933) | 1,047 (0.922) | 1,241 (0.930) | 1,807 (0.928) | 553 (0.932) | 764 (0.923) |  |  | 1,717 (0.929) |
+| ~0.95 | 553 (0.952) | 577 (0.960) | 810 (0.948) |  | 380 (0.951) | 410 (0.959) |  |  | 1,355 (0.941) |
+| build | 319 s | 434 s | 967 s* | 257 s | 388 s | 555 s | 293 s | 298 s | 576 s |
 
 What the tables say:
 
 - faiss HNSW is the fastest of the four here, about 2x hnswlib at equal
-  recall on both datasets. The most likely reason is SIMD: faiss ships NEON
-  kernels for Apple Silicon, while hnswlib's and sanadb's distance loops are
-  SSE/AVX intrinsics with a scalar fallback (hnswlib) and plain Rust left to
-  the autovectoriser (sanadb). On an x86 server the gap between faiss and
-  hnswlib is small in ann-benchmarks' published plots; expect these ratios
-  to shift there. sanadb has no hand-written SIMD yet; that is the next
-  performance item.
-- sanadb lands within 10 to 25% of hnswlib and usearch at equal recall on
-  SIFT, and at R=48 matches hnswlib on GloVe up to recall 0.93. At R=32 it
-  trails on GloVe by 20 to 30%, and PQ costs about 0.02 recall per beam on
-  these 100-dim vectors (25 subspaces of 4). It does this while holding 32
-  bytes of PQ codes per vector in RAM instead of the whole index; the other
-  three keep every vector and every edge in memory.
+  recall on both datasets. Part of that is SIMD: faiss ships NEON kernels
+  for Apple Silicon, while hnswlib's distance code is SSE/AVX intrinsics
+  with a scalar fallback. It is not the whole story: sanadb's plain-Rust
+  distance loop already compiles to NEON here (18 ns per 128-dim distance,
+  hand-written intrinsics were no faster), and its gap to faiss turned out to
+  be walk bookkeeping, fixed in 0.1.4. On an x86 server the gap between faiss
+  and hnswlib is small in ann-benchmarks' published plots; expect these
+  ratios to shift there.
+- sanadb is now ahead of hnswlib and usearch at every recall on both
+  datasets, and trades places with faiss: on SIFT faiss leads below recall
+  0.99 and sanadb R=48 leads above it; on GloVe sanadb R=48 leads from
+  recall 0.86 up (at 0.93, 1,717 against faiss's 1,807 is the one anchor
+  faiss keeps). It does this while holding 32 bytes of PQ codes per vector
+  in RAM instead of the whole index; the other three keep every vector and
+  every edge in memory. PQ costs about 0.005 recall per beam on these
+  100-dim vectors (25 subspaces of 4) and is worth it for throughput. The
+  sanadb columns were measured after the 0.1.4 walk rewrite; the other
+  columns are from the same day on the same machine.
 - usearch was forced to f32 so that the four libraries hold the same data.
   Its default f16 and i8 modes are faster and are not measured here.
 - `*` faiss build times are not comparable between its two groups: the
@@ -261,6 +276,11 @@ same queries. Beam 64. `examples/bigann.rs` has the exact steps.
 | cold p50 | 5.6 ms | 4.5 ms | 2.7 ms | 2.2 ms |
 | cold p99 | 39 ms | 187 ms | 4.2 ms | 3.4 ms |
 | warm mean | 270 µs | 289 µs | 323 µs | 366 µs |
+
+Checked again for 0.1.4 with the walk rewrite, old and new binary each
+after a `purge`, on a busier machine (Docker running): cold mean 3.23 ms
+before and 3.20 ms after at width 4, warm 258 µs and 227 µs. The rewrite
+does not touch the cold path; the gap to the 2.75 ms above is the machine.
 
 Reading this table: PQ matters in the tail, where the walk without it reads
 every neighbour's block from disk. Beam width matters everywhere cold, because
@@ -305,8 +325,10 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. Hand-written SIMD distance kernels (NEON and AVX2); the faiss gap above
-   is mostly that. Close the R=32 gap on cosine data. A VectorDBBench client.
+1. Close the remaining gap to faiss HNSW: the heaps and the PQ table build
+   are the next items in the profile. AVX2 kernels for x86, where the
+   autovectoriser does less without `target-cpu`. Close the R=32 gap on
+   cosine data. A VectorDBBench client.
 2. Typed metadata and filter-aware graph traversal.
 3. Format freeze and 1.0.
 4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
