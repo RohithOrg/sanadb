@@ -5,12 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-16
+
+sanadb studio, and the small public API it needed. No format change.
 
 ### Added
-- `sanadb-studio` (workspace crate `studio/`, not published to crates.io
-  yet): a local web page for one store with a PCA map of a sample, every
-  search mode, the graph walk drawn on the map, record inspection,
+- `sanadb-studio` (`cargo install sanadb-studio`, or a prebuilt binary
+  from the GitHub release): a local web page for one store with a PCA map
+  of a sample, every search mode, the graph walk drawn on the map, record
+  inspection,
   metadata editing and deletion, sparse-vector queries, cluster labels
   from a metadata key, a files view, live counters, and light and dark
   chrome. See `docs/studio.md`.

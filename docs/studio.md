@@ -13,8 +13,8 @@ top right overrides it and is remembered.
 ![the same page with the dark chrome](img/studio-dark.png)
 
 ```bash
-cargo install --path studio          # from a checkout, or
-cargo run --release -p sanadb-studio -- data/vectors.sana
+cargo install sanadb-studio          # or a prebuilt binary from the GitHub release
+sanadb-studio data/vectors.sana
 # sanadb studio 0.2.0: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
 ```
 

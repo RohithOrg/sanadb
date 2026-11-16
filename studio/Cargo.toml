@@ -1,19 +1,22 @@
 [package]
 name = "sanadb-studio"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Local web UI for a sanadb store: browse, search, map, watch the walk, edit metadata"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/RohithOrg/sanadb"
-publish = false
+readme = "README.md"
+keywords = ["vector", "database", "embedded", "ui", "visualization"]
+categories = ["database", "visualization", "command-line-utilities"]
+include = ["src/**", "ui/**", "README.md"]
 
 [[bin]]
 name = "sanadb-studio"
 path = "src/main.rs"
 
 [dependencies]
-sanadb = { path = "..", version = "0.2.0" }
+sanadb = { path = "..", version = "0.2.1" }
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
