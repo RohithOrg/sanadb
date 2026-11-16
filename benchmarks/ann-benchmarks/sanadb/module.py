@@ -7,6 +7,12 @@ https://github.com/erikbern/ann-benchmarks and run, for example:
 
 The store is built in a temp directory, checkpointed once (that is the index
 build), and queried single-threaded like every other algorithm there.
+
+Set `SANADB_ANNB_KEEP=<dir>` to build each configuration's store under that
+directory instead and reuse it on later runs: a store whose index already
+holds every vector skips the build, so a query-only rerun of a 1M set takes
+seconds instead of a six-minute build. The build time reported for a reused
+store is then not a build.
 """
 
 import os
@@ -24,15 +30,28 @@ class Sanadb(BaseANN):
         self._metric = {"angular": "cosine", "euclidean": "l2"}[metric]
         self._param = method_param
         self._dir = None
+        self._keep = False
         self._db = None
         self._beam = 64
 
     def fit(self, X):
         X = np.ascontiguousarray(X, dtype=np.float32)
-        self._dir = tempfile.mkdtemp(prefix="sanadb-annb-")
-        self._path = os.path.join(self._dir, "index.sana")
         self._dim = X.shape[1]
+        keep = os.environ.get("SANADB_ANNB_KEEP")
+        if keep:
+            tag = "_".join(f"{k}{v}" for k, v in sorted(self._param.items()))
+            self._dir = os.path.join(keep, f"{self._metric}_{len(X)}x{self._dim}_{tag}")
+            os.makedirs(self._dir, exist_ok=True)
+            self._keep = True
+        else:
+            self._dir = tempfile.mkdtemp(prefix="sanadb-annb-")
+            self._keep = False
+        self._path = os.path.join(self._dir, "index.sana")
         self._open(beam=self._beam)
+        stats = self._db.index_stats()
+        if stats and stats["nodes"] == len(X) and stats["tombstones"] == 0:
+            print(f"sanadb: reusing {self._path}")
+            return
         self._db.insert_many(list(range(len(X))), X)
         self._db.checkpoint()
 
@@ -63,7 +82,7 @@ class Sanadb(BaseANN):
 
     def done(self):
         self._db = None
-        if self._dir:
+        if self._dir and not self._keep:
             shutil.rmtree(self._dir, ignore_errors=True)
 
     def __str__(self):

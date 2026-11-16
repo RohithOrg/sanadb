@@ -91,17 +91,23 @@ the row's recall. Raw CSVs: `benchmarks/ann-benchmarks/results/`.
 
 1,183,514 GloVe word vectors, dim 100, angular ground truth, their 10,000
 queries. The sanadb adapter maps `angular` to `Metric::Cosine`. This dataset
-is hard for every graph index; hnswlib reaches 0.98 only at ef = 800.
+is hard for every graph index; hnswlib reaches 0.98 only at ef = 800. All
+four libraries in this table were measured in one session on 16 November
+2026 (sanadb with beams up to 1,024); an earlier sanadb-only run on a
+fresher machine was about 10% faster at every point, and the in-RAM
+libraries did not move between the two runs, which is what a memory-mapped
+index under swap pressure looks like. The one-session numbers are the
+ones here.
 
 | recall@10 | hnswlib M=16 | hnswlib M=24 | faiss HNSW M=16 | faiss HNSW M=24 | usearch M=16 | usearch M=24 | sanadb R=32 PQ | sanadb R=32 no PQ | sanadb R=48 PQ |
 |---|---|---|---|---|---|---|---|---|---|
-| ~0.73 | 5,174 (0.728) |  | 9,619 (0.732) |  | 3,697 (0.729) |  |  | 5,186 (0.731) |  |
-| ~0.81 | 2,979 (0.811) |  | 5,505 (0.816) |  | 2,237 (0.811) |  |  | 2,986 (0.806) |  |
-| ~0.86 |  | 2,266 (0.853) | 3,873 (0.852) | 4,084 (0.859) |  | 1,667 (0.853) | 2,957 (0.858) | 1,762 (0.866) | 4,202 (0.860) |
-| ~0.89 | 1,401 (0.889) | 1,610 (0.887) | 2,435 (0.889) | 2,854 (0.893) | 1,024 (0.887) | 1,187 (0.887) | 2,113 (0.885) | 1,286 (0.891) | 3,110 (0.890) |
-| ~0.93 | 787 (0.933) | 1,047 (0.922) | 1,241 (0.930) | 1,807 (0.928) | 553 (0.932) | 764 (0.923) |  |  | 1,717 (0.929) |
-| ~0.95 | 553 (0.952) | 577 (0.960) | 810 (0.948) |  | 380 (0.951) | 410 (0.959) |  |  | 1,355 (0.941) |
-| build | 319 s | 434 s | 967 s* | 257 s | 388 s | 555 s | 293 s | 298 s | 576 s |
+| ~0.73 | 5,308 (0.730) |  | 9,333 (0.732) |  | 3,409 (0.728) |  |  | 4,456 (0.732) |  |
+| ~0.81 | 3,152 (0.811) |  | 5,335 (0.816) |  | 2,029 (0.810) |  |  | 2,722 (0.809) |  |
+| ~0.86 |  | 2,264 (0.853) | 3,768 (0.852) | 4,007 (0.859) |  | 1,707 (0.852) | 2,647 (0.856) | 1,600 (0.867) | 3,819 (0.860) |
+| ~0.89 | 1,473 (0.890) | 1,628 (0.887) | 2,375 (0.889) | 2,747 (0.893) | 1,057 (0.888) | 1,198 (0.887) | 1,871 (0.883) | 1,167 (0.892) | 2,739 (0.890) |
+| ~0.93 | 812 (0.933) | 1,046 (0.923) | 1,203 (0.930) | 1,749 (0.928) | 563 (0.931) | 769 (0.924) | 793 (0.932) | 660 (0.925) | 1,536 (0.929) |
+| ~0.95 | 565 (0.952) |  | 788 (0.948) |  | 387 (0.951) | 414 (0.959) |  |  | 843 (0.956) |
+| build | 290 s | 418 s | 1021 s | 266 s | 405 s | 562 s | 349 s | 349 s | 697 s |
 
 What the tables say:
 
@@ -114,16 +120,17 @@ What the tables say:
   be walk bookkeeping, fixed in 0.1.4. On an x86 server the gap between faiss
   and hnswlib is small in ann-benchmarks' published plots; expect these
   ratios to shift there.
-- sanadb is now ahead of hnswlib and usearch at every recall on both
-  datasets, and trades places with faiss: on SIFT faiss leads below recall
-  0.99 and sanadb R=48 leads above it; on GloVe sanadb R=48 leads from
-  recall 0.86 up (at 0.93, 1,717 against faiss's 1,807 is the one anchor
-  faiss keeps). It does this while holding 32 bytes of PQ codes per vector
-  in RAM instead of the whole index; the other three keep every vector and
-  every edge in memory. PQ costs about 0.005 recall per beam on these
-  100-dim vectors (25 subspaces of 4) and is worth it for throughput. The
-  sanadb columns were measured after the 0.1.4 walk rewrite; the other
-  columns are from the same day on the same machine.
+- sanadb is ahead of hnswlib and usearch at every recall on SIFT and from
+  recall 0.81 up on GloVe (at 0.73, hnswlib M=16 is 19% ahead of sanadb's
+  R=32 without PQ), and trades places with faiss: on SIFT faiss leads
+  below recall 0.99 and sanadb R=48 leads above it; on GloVe faiss M=24
+  leads at 0.86 and 0.93, the two tie at 0.89, and sanadb R=48 leads at
+  0.95 where faiss M=24 has no point. It does this while holding 32 bytes
+  of PQ codes per vector in RAM instead of the whole index; the other
+  three keep every vector and every edge in memory. PQ costs about 0.005
+  recall per beam on these 100-dim vectors (25 subspaces of 4) and is
+  worth it for throughput. R=32 reaches 0.933 at beam 1,024: the lower
+  degree is not a recall ceiling, it is a longer walk.
 - usearch was forced to f32 so that the four libraries hold the same data.
   Its default f16 and i8 modes are faster and are not measured here.
 - `*` faiss build times are not comparable between its two groups: the

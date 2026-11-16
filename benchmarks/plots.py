@@ -1,7 +1,7 @@
 """Charts for docs/benchmarks.md, regenerated from measured data so they
 cannot drift from the tables.
 
-    python benchmarks/plots.py <ann-benchmarks export.csv>
+    python benchmarks/plots.py benchmarks/ann-benchmarks/results/*.csv
 
 Writes SVGs into docs/img/. The ann-benchmarks curves come from the CSV
 that `data_export.py` writes; the filtered-search and cold-cache charts
@@ -53,8 +53,15 @@ def label(row):
     return None, None
 
 
-def ann_curves(path):
-    rows = list(csv.DictReader(open(path)))
+def ann_curves(paths):
+    rows = []
+    for path in paths:
+        # A harness export has a `dataset` column; the per-dataset CSVs in
+        # benchmarks/ann-benchmarks/results/ are named after their dataset.
+        name = re.sub(r"\.csv$", "", path.rsplit("/", 1)[-1])
+        for r in csv.DictReader(open(path)):
+            r.setdefault("dataset", name)
+            rows.append(r)
     for ds, title in [("sift-128-euclidean", "SIFT1M, L2"), ("glove-100-angular", "GloVe, 1.18M, cosine")]:
         series = defaultdict(list)
         for r in rows:
@@ -151,7 +158,7 @@ def cold():
 if __name__ == "__main__":
     style()
     if len(sys.argv) > 1:
-        ann_curves(sys.argv[1])
+        ann_curves(sys.argv[1:])
     filtered()
     cold()
     print("wrote", OUT)

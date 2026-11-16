@@ -46,8 +46,8 @@ shape, and read the limits below before depending on it.
 
 In rough order.
 
-1. **0.2.0 release.** The checklist is done except a quiet re-measurement
-   of the GloVe table and the cold int8 comparison at 5M.
+1. **0.2.0 release.** The checklist is done except the cold int8
+   comparison at 5M.
 2. **Hybrid search, the rest.** MaxScore for long posting lists, weighted
    fusion as an alternative to reciprocal rank, a BEIR number for sparse
    retrieval with a SPLADE encoding. Design note:

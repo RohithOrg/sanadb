@@ -91,8 +91,8 @@ in [docs/benchmarks.md](docs/benchmarks.md).
 - **SIFT1M, warm:** recall@10 0.966 at 146 µs per query (beam 64), 0.995 at
   405 µs (beam 256); build 75 s.
 - **ann-benchmarks, their harness:** ahead of hnswlib and usearch at every
-  recall on SIFT and GloVe, trading places with faiss HNSW, while holding
-  32 bytes per vector in RAM instead of the whole index.
+  recall on SIFT and from 0.81 up on GloVe, trading places with faiss HNSW,
+  while holding 32 bytes per vector in RAM instead of the whole index.
 - **Filtered, SIFT1M with labels:** recall 1.0 at 9 µs to 1.3 ms for
   filters matching 0.01% to 1% of the set; the YFCC filter track at 1M
   gets recall 1.0 where post-filtering gets 0.17 to 0.83.
