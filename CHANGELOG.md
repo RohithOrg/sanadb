@@ -54,6 +54,10 @@ so this is the first release 0.1.4 cannot read; see Upgrading below.
   `storage="int8"`; `insert_many` is now atomic.
 
 ### Added
+- `Db::backup(dir)`: a consistent point-in-time copy of the store (index
+  file, then the log's complete frames under the write lock) that `Db::open`
+  or `open_read_only` accepts at `dir/<file name>`. Works from a reader too.
+  Python: `backup(dir)`.
 - `Db::open_read_only`: open a store beside its writer, in the same or
   another process, with no lock. Reads see a prefix of the writer's history
   and refresh before each call (`Db::refresh` forces it); writes return

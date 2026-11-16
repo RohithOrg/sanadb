@@ -572,6 +572,39 @@ impl Db {
         Ok(())
     }
 
+    /// Copy the store into `dir` in a consistent state and return the path of
+    /// the copy's log; `Db::open` on that path opens the backup. The index
+    /// file is copied first (no checkpoint can replace it meanwhile: this
+    /// holds the checkpoint lock), then the log's complete frames are copied
+    /// under the write lock, so writers pause for the time the log tail
+    /// takes, not the index. Works from a read-only `Db` too. The result is
+    /// a point-in-time copy with the same guarantees as the original; ship
+    /// it anywhere, or open it read-only beside the original.
+    pub fn backup(&self, dir: impl AsRef<Path>) -> Result<PathBuf> {
+        let _no_checkpoint = self.checkpoint_lock.lock();
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let name = self.path.file_name().ok_or(Error::Corrupt("store path has no file name"))?;
+        let dest = dir.join(name);
+        let index = {
+            let i = self.inner.read();
+            i.graph.as_ref().map(|_| (index_path_for(&self.path, i.snapshot), index_path_for(&dest, i.snapshot)))
+        };
+        if let Some((src, dst)) = &index {
+            io_ctx(std::fs::copy(src, dst).map(|_| ()), "copy index", src)?;
+            io_ctx(std::fs::File::open(dst).and_then(|f| f.sync_all()), "sync index copy", dst)?;
+        }
+        {
+            let mut i = self.inner.write();
+            let mut out = std::io::BufWriter::new(io_ctx(std::fs::File::create(&dest), "create log copy", &dest)?);
+            i.wal.copy_prefix(&mut out)?;
+            use std::io::Write as _;
+            out.flush()?;
+            out.get_ref().sync_all()?;
+        }
+        Ok(dest)
+    }
+
     /// Path of the current index file, if a checkpoint has produced one.
     pub fn index_path(&self) -> Option<PathBuf> {
         let i = self.inner.read();

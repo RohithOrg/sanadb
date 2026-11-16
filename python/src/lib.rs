@@ -445,6 +445,12 @@ impl PyDb {
         ))
     }
 
+    /// Copy the store into `dir` in a consistent state; returns the copy's path.
+    fn backup(&self, py: Python<'_>, dir: String) -> PyResult<String> {
+        let db = self.inner.clone();
+        py.allow_threads(move || db.backup(dir)).map_err(err).map(|p| p.to_string_lossy().into_owned())
+    }
+
     /// Read-only stores: bring the view up to date with the writer now. Every
     /// read does this anyway; call it to pick up writes without reading.
     fn refresh(&self, py: Python<'_>) -> PyResult<()> {

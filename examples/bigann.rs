@@ -20,7 +20,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use sanadb::{Db, GraphParams, Options};
+use sanadb::{Db, GraphParams, Options, Storage};
+
+/// `SANADB_I8=1` stores the index with 8-bit codes (and names the store `.i8`).
+fn storage() -> Storage {
+    if std::env::var_os("SANADB_I8").is_some() { Storage::I8 } else { Storage::F32 }
+}
 
 const DIM: usize = 128;
 const K: usize = 10;
@@ -55,9 +60,10 @@ fn row(base: &[u8], i: usize) -> impl Iterator<Item = f32> + '_ {
 
 fn store_path(dir: &Path, n: usize, pq: bool) -> std::path::PathBuf {
     dir.join(format!(
-        "sift{}k.{}.sana",
+        "sift{}k.{}{}.sana",
         n / 1000,
-        if pq { "pq" } else { "nopq" }
+        if pq { "pq" } else { "nopq" },
+        if storage() == Storage::I8 { ".i8" } else { "" }
     ))
 }
 
@@ -84,6 +90,7 @@ fn main() {
                 &path,
                 Options::new(DIM as u32).graph(GraphParams {
                     use_pq: pq,
+                    storage: storage(),
                     ..GraphParams::default()
                 }),
             )
@@ -159,6 +166,7 @@ fn main() {
             let opts = Options::new(DIM as u32)
                 .graph(GraphParams {
                     use_pq: pq,
+                    storage: storage(),
                     ..GraphParams::default()
                 })
                 .search_beam(beam)

@@ -47,6 +47,18 @@ below are real and reproducible; the track record is not there yet.
   reliable on local filesystems, not on NFS, SMB or other network mounts,
   where two machines can both believe they hold it. Keep stores on local
   disks.
+- `backup(dir)` writes a consistent point-in-time copy (index file plus the
+  log's complete frames) that opens like any store, from a writer or a
+  read-only handle, while writes continue. Replication is file shipping:
+  back up, copy the directory, open it read-only or as a new writer. There
+  is no streaming replication and no second writer; one writer per store is
+  the model, as with SQLite.
+- No encryption inside the files. The index is memory-mapped and read in
+  place, which is what makes queries cheap; decrypting per block would need
+  a user-space cache and give up most of that. Use the platform's volume or
+  file encryption (FileVault, LUKS, BitLocker, EBS encryption), which covers
+  the store files like any others; the project will not ship a weaker
+  built-in alternative.
 - Search over records written since the last checkpoint is exact. Search over
   the graph is approximate; recall depends on `search_beam` and is measured
   below on public datasets.

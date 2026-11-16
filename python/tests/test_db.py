@@ -215,3 +215,15 @@ def test_insert_many_is_atomic_and_delete_many(tmp_path):
     assert len(db) == 3
     db.delete_many([1, 3, 99])
     assert len(db) == 1 and db.get(2) is not None
+
+
+def test_backup_opens_as_a_store(tmp_path):
+    db = sanadb.Db(str(tmp_path / "src.sana"), dim=4)
+    db.insert_many([1, 2, 3], np.eye(4, dtype=np.float32)[:3], [{"k": "a"}, None, None])
+    db.checkpoint()
+    db.insert(4, np.ones(4, dtype=np.float32))
+    copy = db.backup(str(tmp_path / "bak"))
+    db.delete(4)
+    b = sanadb.Db(copy, dim=4, read_only=True)
+    assert len(b) == 4 and b.get(1)[1] == {"k": "a"}
+    assert len(db) == 3

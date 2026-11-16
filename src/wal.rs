@@ -312,6 +312,21 @@ impl Wal {
     /// rename over it succeeds on every platform. Called before the log is
     /// replaced at checkpoint and on drop. The `Wal` is unusable afterwards
     /// and must be replaced (or reopened with `Wal::open`).
+    /// Write the log's good bytes (header and every complete frame) to `out`.
+    /// Flushes buffered frames first, so the copy is current as of the call.
+    pub fn copy_prefix(&mut self, out: &mut impl Write) -> Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush()?;
+        }
+        let len = self.len as usize;
+        match (&self.map, &self.buf) {
+            (Some(m), _) => out.write_all(&m[..len])?,
+            (None, Some(b)) => out.write_all(&b[..len.min(b.len())])?,
+            (None, None) => return Err(Error::Corrupt("log used after release")),
+        }
+        Ok(())
+    }
+
     pub fn release(&mut self) {
         self.map = None;
         if let Some(mut w) = self.writer.take() {

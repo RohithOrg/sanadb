@@ -2067,7 +2067,7 @@ fn random_operations_agree_with_a_model() {
         let mut m = Metadata::new();
         m.insert("g".into(), Value::from((i % 7) as i64));
         m.insert("s".into(), Value::from(["x", "y", "z"][(i % 3) as usize]));
-        if i % 5 == 0 {
+        if i.is_multiple_of(5) {
             m.insert("flag".into(), Value::from(true));
         }
         m
@@ -2206,4 +2206,45 @@ fn random_operations_agree_with_a_model() {
         next_id
     );
     assert!(model.len() > 200);
+}
+
+#[test]
+fn backup_is_a_consistent_point_in_time_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.sana");
+    let dim = 4usize;
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..3000u64 {
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "a")])).unwrap();
+    }
+    db.checkpoint().unwrap();
+    for i in 3000..3100u64 {
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "tail")])).unwrap();
+    }
+    db.delete(1).unwrap();
+    // Back up while the writer keeps going afterwards.
+    let copy = db.backup(dir.path().join("backup")).unwrap();
+    db.insert(9999, &vec_of(dim, 9999), HashMap::new()).unwrap();
+    db.delete(2).unwrap();
+    db.checkpoint().unwrap();
+    // The copy is the state at backup time, opens on its own, and is
+    // independent of what happened to the original since.
+    let b = Db::open(&copy, Options::new(dim as u32)).unwrap();
+    assert_eq!(b.len(), 3099);
+    assert!(b.get(1).is_none() && b.get(2).is_some() && b.get(9999).is_none());
+    assert_eq!(b.get(3050).unwrap().1["k"], "tail");
+    assert_eq!(b.search(&vec_of(dim, 77), 1).unwrap()[0].id, 77);
+    b.insert(5, &vec_of(dim, 5), meta(&[("k", "copy")])).unwrap();
+    b.checkpoint().unwrap();
+    assert_eq!(db.get(5).unwrap().1["k"], "a", "the original is untouched by writes to the copy");
+    assert_eq!(db.len(), 3099);
+    // A read-only handle can back up too.
+    let r = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
+    let copy2 = r.backup(dir.path().join("backup2")).unwrap();
+    let b2 = Db::open_read_only(&copy2, Options::new(dim as u32)).unwrap();
+    assert_eq!(b2.len(), db.len());
+    assert!(b2.get(9999).is_some() && b2.get(2).is_none());
+    // Only the referenced index file travels with the copy.
+    let files: Vec<String> = std::fs::read_dir(dir.path().join("backup")).unwrap().flatten().map(|e| e.file_name().to_str().unwrap().to_string()).collect();
+    assert!(files.iter().filter(|f| f.contains(".idx.")).count() <= 2, "{files:?}");
 }
