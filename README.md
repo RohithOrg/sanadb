@@ -329,7 +329,8 @@ the exact scan takes 3.8 ms and the graph 140 µs.
    are the next items in the profile. AVX2 kernels for x86, where the
    autovectoriser does less without `target-cpu`. Close the R=32 gap on
    cosine data. A VectorDBBench client.
-2. Typed metadata and filter-aware graph traversal.
+2. Typed metadata and filter-aware graph traversal:
+   [design note](docs/design/typed-metadata-and-filtered-search.md).
 3. Format freeze and 1.0.
 4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.
