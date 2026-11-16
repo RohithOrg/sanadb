@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "sanadb"
 version = "0.2.3"
 description = "Disk-first embedded vector + metadata store"
-readme = "../README.md"
+readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.20"]

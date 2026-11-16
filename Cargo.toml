@@ -9,10 +9,10 @@ rust-version = "1.89"
 description = "Disk-first embedded vector + metadata store: write-ahead log, memory-mapped DiskANN-style graph index, product quantization, metadata filters"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/RohithOrg/sanadb"
-readme = "README.md"
+readme = "docs/rust/README.md"
 keywords = ["vector", "database", "embedded", "ann", "search"]
 categories = ["database-implementations", "data-structures"]
-exclude = ["/python", "/studio", "/data", "/.github"]
+exclude = ["/python", "/studio", "/data", "/.github", "/docs/img", "/benchmarks"]
 
 [dependencies]
 crc32fast = "1"
@@ -42,3 +42,7 @@ harness = false
 
 [profile.release]
 debug = 1
+
+[[example]]
+name = "semantic_search"
+required-features = ["embed-http"]

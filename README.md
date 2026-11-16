@@ -74,11 +74,14 @@ db.add(["The borrow checker rejects aliasing", "asyncio runs coroutines on one t
 db.query(["how do I stop two parts mutating the same thing"], k=3)
 ```
 
-Scores are distances, lower is closer. Every feature in one walk:
-[docs/getting-started.md](docs/getting-started.md), with runnable tours in
-`examples/tour.rs` and `python/examples/tour.py`. The full API is on
-[docs.rs](https://docs.rs/sanadb) for Rust; the Python package ships type
-stubs.
+Scores are distances, lower is closer. The documentation is split by
+language so you read one at a time: [Python](docs/python/getting-started.md)
+(getting started, [API](docs/python/api.md), [examples](docs/python/examples.md),
+[recipes](docs/python/recipes.md)) and [Rust](docs/rust/getting-started.md)
+(getting started, [API map](docs/rust/api.md) with the full reference on
+[docs.rs](https://docs.rs/sanadb), [examples](docs/rust/examples.md),
+[recipes](docs/rust/recipes.md)). Everything below the API, the studio,
+the internals, operations, benchmarks and the file format, is shared.
 
 ## What it does
 
@@ -154,8 +157,8 @@ The detail behind each of these is in [docs/operations.md](docs/operations.md).
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): every feature in one walk.
-- [Examples](docs/examples.md): complete programs with their output, starting with semantic search over your text with a sentence-transformers model.
+- Python: [getting started](docs/python/getting-started.md), [API](docs/python/api.md), [examples](docs/python/examples.md) with output (semantic search with sentence-transformers first), [recipes](docs/python/recipes.md).
+- Rust: [getting started](docs/rust/getting-started.md), [API map](docs/rust/api.md), [examples](docs/rust/examples.md) with output (semantic search through an embedding endpoint first), [recipes](docs/rust/recipes.md).
 - [How it works](docs/architecture.md): log, graph, PQ, delta, checkpoint,
   filters, concurrency, keyword and sparse search.
 - [Operating a store](docs/operations.md): durability, processes, backup,

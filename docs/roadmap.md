@@ -33,7 +33,7 @@ shape, and read the limits below before depending on it.
 - Keyword search is term-at-a-time BM25 with no MaxScore skipping; fine at
   thousands of documents per term, unmeasured at millions.
 - Sparse vectors have no public-dataset quality number yet (dense
-  retrieval with a real model has one: SciFact, `docs/examples.md`).
+  retrieval with a real model has one: SciFact, `docs/python/examples.md`).
 - Single query thread per `search`; `search_many` uses all cores across
   queries. No GPU; none planned, the design is memory-bound and disk-first.
 - x86 has AVX2 kernels but no published numbers; everything measured so far

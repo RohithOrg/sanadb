@@ -22,8 +22,16 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_code_format
 nav:
   - Overview: index.md
-  - Getting started: getting-started.md
-  - Examples: examples.md
+  - Python:
+      - Getting started: python/getting-started.md
+      - API: python/api.md
+      - Examples: python/examples.md
+      - Recipes: python/recipes.md
+  - Rust:
+      - Getting started: rust/getting-started.md
+      - API: rust/api.md
+      - Examples: rust/examples.md
+      - Recipes: rust/recipes.md
   - Studio: studio.md
   - How it works: architecture.md
   - Operating a store: operations.md
@@ -35,3 +43,5 @@ nav:
       - Typed metadata and filtered search: design/typed-metadata-and-filtered-search.md
       - Hybrid search: design/hybrid-search.md
   - Changelog: CHANGELOG.md
+not_in_nav: |
+  rust/README.md

@@ -264,11 +264,15 @@ impl PyDb {
     /// (a quarter of the bytes per hop; exact re-ranking and get() use the
     /// dequantised vector). The log keeps f32 until the next checkpoint.
     ///
+    /// auto_checkpoint_delta=N checkpoints once N records sit in the tail
+    /// (and the tail is at least as large as the index); auto_checkpoint_garbage=N
+    /// once the log holds N more entries than live records. 0 (default) is off.
+    ///
     /// read_only=True opens an existing store beside its writer (any process):
     /// no lock is taken, reads follow the writer's appends and checkpoints,
     /// and writes raise PermissionError.
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None, embedding_function = None))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None, embedding_function = None, auto_checkpoint_delta = 0, auto_checkpoint_garbage = 0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -287,6 +291,8 @@ impl PyDb {
         storage: &str,
         text_field: Option<String>,
         embedding_function: Option<PyObject>,
+        auto_checkpoint_delta: usize,
+        auto_checkpoint_garbage: usize,
     ) -> PyResult<Self> {
         let text_key = text_field.clone().unwrap_or_else(|| "text".to_string());
         let metric = match metric {
@@ -314,6 +320,8 @@ impl PyDb {
             .max_search_beam(max_search_beam)
             .io_width(io_width)
             .sync_every_write(sync_every_write)
+            .auto_checkpoint_delta(auto_checkpoint_delta)
+            .auto_checkpoint_garbage(auto_checkpoint_garbage)
             .graph(GraphParams {
                 max_degree,
                 build_beam,

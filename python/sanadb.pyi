@@ -34,9 +34,14 @@ class Db:
         storage: str = "f32",
         text_field: Optional[str] = None,
         embedding_function: Optional[Callable[[list[str]], npt.ArrayLike]] = None,
+        auto_checkpoint_delta: int = 0,
+        auto_checkpoint_garbage: int = 0,
     ) -> None:
         """`embedding_function` maps a list of texts to an (n, dim) array; it
-        enables `add()` and `query()`, like Chroma's embedding functions."""
+        enables `add()` and `query()`, like Chroma's embedding functions.
+        `auto_checkpoint_delta` checkpoints once that many records sit in the
+        tail; `auto_checkpoint_garbage` once the log holds that many more
+        entries than live records. 0 is off."""
     @property
     def dim(self) -> int: ...
     @property

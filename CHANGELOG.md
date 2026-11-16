@@ -8,11 +8,22 @@ the new version migrates old stores on open.
 ## [Unreleased]
 
 ### Added
+- Python: `auto_checkpoint_delta=` and `auto_checkpoint_garbage=` on `Db`,
+  the same policy options the Rust `Options` had.
+- `examples/semantic_search.rs` (feature `embed-http`): semantic, filtered
+  and hybrid search over text through an OpenAI-compatible embedding
+  endpoint, with the same documents and output as the Python example.
+- Documentation split by language: `docs/python/` and `docs/rust/` each
+  hold getting started, API, examples and recipes (RAG indexing,
+  checkpoint policy, processes, backup, failure modes; moving from Chroma
+  in Python). PyPI and crates.io now show language-specific READMEs
+  (`python/README.md`, `docs/rust/README.md`); `scripts/pyi_to_md.py`
+  generates the Python API page from the shipped stubs.
 - `benchmarks/beir/scifact_dense.py`: end-to-end check with a real
   embedding model (all-MiniLM-L6-v2 on BEIR SciFact). Brute force over
   the model's vectors reproduces the published nDCG@10 of 0.645; sanadb's
   graph at the default beam returns 99.6% of brute force's top 10 and the
-  same 0.645. Documented in `docs/examples.md` and `docs/benchmarks.md`.
+  same 0.645. Documented in `docs/python/examples.md` and `docs/benchmarks.md`.
 - `python/examples/semantic_search.py` and `python/examples/embed_server.py`:
   a sentence-transformers walkthrough with its output, and the model as a
   local OpenAI-compatible endpoint for studio.
