@@ -23,6 +23,13 @@ sanadb studio, bring-your-own embedding model in Rust, Python and studio, and th
   graph walk expanded, in order. The index reader also accepts the
   32-byte footer that 0.2.0 development builds wrote, so stores built with
   them still open.
+- Store properties: `Db::set_property(key, value)`, `property(key)`,
+  `properties()` (Python the same) keep strings with the file, written as
+  a new log frame kind that older readers skip, visible to readers at
+  once, rewritten into the compacted log at every checkpoint. Studio
+  records `embedding_model` and `embedding_dim` when a model is attached,
+  shows the recorded model when none is, and warns when the attached
+  model differs from the recorded one.
 - Bring your own embedding model. Rust: the `Embedder` trait (implemented
   by any closure `Fn(&[&str]) -> Result<Vec<Vec<f32>>>`), `Db::add_text`
   and `Db::search_text_embedded`, and `OpenAiEmbedder` for any

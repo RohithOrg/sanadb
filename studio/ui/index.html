@@ -233,6 +233,9 @@ footer b{color:var(--ink);font:12px var(--mono);font-weight:500}
       <div class="pane" id="pane-keys">
         <div class="keys" id="keys"></div>
         <p class="empty" style="margin:10px 0 0">A key's type is fixed by the first value written under it. Columns in the index serve filters on these keys.</p>
+        <h2 style="margin-top:14px">Store properties</h2>
+        <div class="files" id="props"></div>
+        <p class="empty" style="margin:10px 0 0">Strings kept with the file, such as the embedding model that produced the vectors. Set them from Rust or Python with <code>set_property</code>.</p>
       </div>
       <div class="pane" id="pane-files">
         <div class="files" id="files"></div>
@@ -251,7 +254,7 @@ footer b{color:var(--ink);font:12px var(--mono);font-weight:500}
       <button id="playpause" title="play / pause">Pause</button>
       <button id="stepfwd" title="one expansion forward">Step</button>
       <button id="replay" title="from the start">Replay</button>
-      <select id="speed" title="animation speed"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
+      <select id="speed" title="animation speed; Instant draws the whole walk at once"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="instant">Instant</option></select>
     </div>
     <div class="hud empty" id="mapempty" hidden>Search from a record to see its neighbours and the path the graph walk took to reach them.</div>
     <div class="hud legend">
@@ -331,13 +334,17 @@ async function loadInfo() {
     (ix ? `<span>index ${count(ix.nodes)} nodes · ${ix.storage}${ix.pq_subspaces ? " · PQ " + ix.pq_subspaces : ""}${ix.tombstones ? " · " + human(ix.tombstones) + " tombstoned" : ""}</span>`
         : `<span>no index yet</span>`) +
     `<span class="tail">${count(info.delta_len)} in the tail</span>` +
-    (info.embed ? `<span title="${esc(info.embed.url || info.embed.command)}">model <b>${esc(info.embed.model || "command")}</b></span>` : "") +
+    (info.embed ? `<span title="${esc(info.embed.url || info.embed.command)}">model <b>${esc(info.embed.model || "command")}</b>${info.properties && info.properties.embedding_model && info.properties.embedding_model !== (info.embed.model || "command: " + info.embed.command) ? ` <span class="ro" title="the store's vectors were embedded with ${esc(info.properties.embedding_model)}">≠ store's ${esc(info.properties.embedding_model)}</span>` : ""}</span>`
+      : info.properties && info.properties.embedding_model ? `<span title="recorded in the store's properties; attach it with --embed-url or --embed-cmd to search by text">embedded with <b>${esc(info.properties.embedding_model)}</b></span>` : "") +
     (info.read_only ? `<span class="ro">read-only</span>` : "");
   $("embedq").hidden = !info.embed;
   $("noembed").hidden = !!info.embed;
   if (info.embed) $("embedname").textContent = info.embed.model ? `with ${info.embed.model}` : "with the attached command";
   $("addbtn").disabled = info.read_only;
   $("ckpt").disabled = info.read_only;
+  $("props").innerHTML = info.properties && Object.keys(info.properties).length
+    ? Object.entries(info.properties).map(([k, v]) => `<span class="role">${esc(k)}</span><span class="name" title="${esc(v)}">${esc(v)}</span><span></span>`).join("")
+    : "<span class='empty'>none</span>";
   $("keys").innerHTML = info.keys.length
     ? info.keys.map(k => `<span class="k"><code>${esc(k.name)}</code><span>${k.kind}</span></span>`).join("")
     : "<span>none written yet</span>";
@@ -429,6 +436,10 @@ async function inspect(id) {
     </div>
     <dl class="facts-list">${facts.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join("")}</dl>
     <details class="values"><summary>vector values</summary><div class="vec">${v.map(x => allInt ? String(x) : x.toFixed(4)).join(" ")}</div></details>
+    ${info.read_only ? "" : `<details class="values"><summary>replace the vector</summary>
+      ${info.embed ? `<label for="retext">Re-embed from text <span class="hint">also stored under <code>${esc(info.text_key)}</code></span></label><textarea id="retext" placeholder="new text for this record"></textarea>` : ""}
+      <label for="revec">Or paste ${info.dim} numbers</label><textarea id="revec" placeholder="[0.12, -0.03, …]"></textarea>
+      <div class="actions"><button class="small" id="resave">Save vector</button></div></details>`}
     <label for="metaedit">Metadata${info.read_only ? " <span class='hint'>read-only store</span>" : ""}</label>
     <textarea id="metaedit" style="min-height:130px" spellcheck="false" ${info.read_only ? "readonly" : ""}>${esc(JSON.stringify(r.meta, null, 2))}</textarea>
     ${info.read_only ? "" : `<div class="actions"><button class="primary" id="save">Save metadata</button><button class="danger" id="del">Delete record</button></div>`}
@@ -443,6 +454,25 @@ async function inspect(id) {
       $("metaedit").value = JSON.stringify(meta, null, 2);
       loadInfo(); loadList();
     } catch (e) { $("imsg").className = "msg err"; $("imsg").textContent = e.message; }
+  };
+  if ($("resave")) $("resave").onclick = async () => {
+    const body = {};
+    const vs = $("revec").value.trim();
+    if (vs) {
+      const nums = vs.replace(/[\[\]]/g, " ").split(/[\s,]+/).filter(Boolean).map(Number);
+      if (nums.some(isNaN)) { $("imsg").className = "msg err"; $("imsg").textContent = "Vector: numbers only."; return; }
+      body.vector = nums;
+    } else if ($("retext") && $("retext").value.trim()) {
+      body.text = $("retext").value.trim();
+    } else { $("imsg").className = "msg err"; $("imsg").textContent = "Give text to re-embed or a vector."; return; }
+    try { body.meta = JSON.parse($("metaedit").value); } catch (e) {}
+    $("resave").disabled = true;
+    try {
+      await api(`/api/record?id=${id}`, {method: "POST", body: JSON.stringify(body)});
+      $("imsg").className = "msg ok"; $("imsg").textContent = "Vector replaced: the record was rewritten under the same id.";
+      mapData = null; loadInfo(); loadMap(); setTimeout(() => inspect(id), 400);
+    } catch (e) { $("imsg").className = "msg err"; $("imsg").textContent = e.message; }
+    $("resave").disabled = false;
   };
   if ($("del")) $("del").onclick = async () => {
     if (!confirm(`Delete record ${id}? It leaves the log now and the index at the next checkpoint.`)) return;
@@ -614,29 +644,46 @@ function draw() {
     }
   }
   // walk: trail in expansion order up to the animation step, older segments dimmer
-  const n = result.walk.length ? anim.t : 0;
+  // anim.t is fractional: 3.4 means node 4 is reached and the segment
+  // toward node 5 is 40% drawn, with the head riding its tip.
+  const total = result.walk.length;
+  const whole = total ? Math.min(total, Math.floor(anim.t) + 1) : 0;   // nodes fully reached
+  const frac = total ? anim.t - Math.floor(anim.t) : 0;
+  const n = whole;
   if (n > 0) {
     let prev = null;
+    let head = null;
     ctx.lineCap = "round";
+    const arrow = (x0, y0, x1, y1, alpha) => {
+      ctx.strokeStyle = "#FF8A3D"; ctx.globalAlpha = alpha; ctx.lineWidth = 1.2 * dpr;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy);
+      if (len > 14 * dpr) {
+        const ux = dx / len, uy = dy / len, ax = x1 - ux * 5 * dpr, ay = y1 - uy * 5 * dpr, w = 3.2 * dpr;
+        ctx.fillStyle = "#FF8A3D";
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(ax - uy * w, ay + ux * w); ctx.lineTo(ax + uy * w, ay - ux * w); ctx.closePath(); ctx.fill();
+      }
+    };
     for (let i = 0; i < n; i++) {
       const p = result.walk[i]; if (p.x === undefined) continue;
       const [sx, sy] = toScreen(p.x, p.y);
       const age = (n - i) / Math.max(1, n);
       const alpha = 0.25 + 0.6 * (1 - age);
-      if (prev) {
-        // segment with an arrowhead pointing the way the walk went
-        ctx.strokeStyle = "#FF8A3D"; ctx.globalAlpha = alpha; ctx.lineWidth = 1.2 * dpr;
-        ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(sx, sy); ctx.stroke();
-        const dx = sx - prev[0], dy = sy - prev[1], len = Math.hypot(dx, dy);
-        if (len > 14 * dpr) {
-          const ux = dx / len, uy = dy / len, ax = sx - ux * 5 * dpr, ay = sy - uy * 5 * dpr, w = 3.2 * dpr;
-          ctx.fillStyle = "#FF8A3D";
-          ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ax - uy * w, ay + ux * w); ctx.lineTo(ax + uy * w, ay - ux * w); ctx.closePath(); ctx.fill();
-        }
-      }
+      if (prev) arrow(prev[0], prev[1], sx, sy, alpha);
       ctx.globalAlpha = alpha;
       ctx.fillStyle = "#FF8A3D"; ctx.beginPath(); ctx.arc(sx, sy, 2.6 * dpr, 0, Math.PI * 2); ctx.fill();
       prev = [sx, sy];
+      head = prev;
+    }
+    // the segment in progress toward the next node, grown to `frac`
+    if (prev && frac > 0 && n < total) {
+      const q = result.walk[n];
+      if (q && q.x !== undefined) {
+        const [tx, ty] = toScreen(q.x, q.y);
+        const hx = prev[0] + (tx - prev[0]) * frac, hy = prev[1] + (ty - prev[1]) * frac;
+        arrow(prev[0], prev[1], hx, hy, 0.85);
+        head = [hx, hy];
+      }
     }
     ctx.globalAlpha = 1;
     // the order of the first expansions, numbered, and the last one
@@ -650,12 +697,12 @@ function draw() {
     };
     for (let i = 0; i < Math.min(n, 12); i++) label(i);
     if (n > 12) label(n - 1);
-    if (prev) { // head
-      ctx.fillStyle = "rgba(255,138,61,.25)"; ctx.beginPath(); ctx.arc(prev[0], prev[1], 9 * dpr, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = "#FFB37A"; ctx.beginPath(); ctx.arc(prev[0], prev[1], 4 * dpr, 0, Math.PI * 2); ctx.fill();
+    if (head) { // the head rides the tip of the growing segment
+      ctx.fillStyle = "rgba(255,138,61,.25)"; ctx.beginPath(); ctx.arc(head[0], head[1], 9 * dpr, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#FFB37A"; ctx.beginPath(); ctx.arc(head[0], head[1], 4 * dpr, 0, Math.PI * 2); ctx.fill();
     }
   }
-  if (!anim.running || anim.t >= anim.total) for (const hh of result.hits) {
+  if (!anim.running || anim.t >= anim.total - 1) for (const hh of result.hits) {
     if (hh.x === undefined) continue;
     const [sx, sy] = toScreen(hh.x, hh.y);
     ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(sx, sy, 4.2 * dpr, 0, Math.PI * 2); ctx.fill();
@@ -676,22 +723,35 @@ function draw() {
 /* walk animation: `anim.t` expansions are drawn; play advances it at
    `speed` × 40 expansions per second, scrub and step set it directly. */
 function setT(t) {
-  anim.t = Math.max(0, Math.min(anim.total, Math.round(t)));
-  $("scrub").value = anim.t;
-  $("walkstep").textContent = `${anim.t} / ${anim.total}`;
+  anim.t = Math.max(0, Math.min(anim.total - 1, t));
+  $("scrub").value = Math.round(anim.t * 100);
+  $("walkstep").textContent = `${Math.min(anim.total, Math.floor(anim.t) + 1)} / ${anim.total}`;
   draw();
+}
+// Screen length of the segment that starts at node i, in map units.
+function segLen(i) {
+  const a = result.walk[i], b = result.walk[i + 1];
+  if (!a || !b || a.x === undefined || b.x === undefined) return 0.02;
+  return Math.hypot(b.x - a.x, b.y - a.y);
 }
 function play() {
   if (anim.total === 0) return;
-  if (anim.t >= anim.total) anim.t = 0;
+  if (anim.t >= anim.total - 1) anim.t = 0;
   anim.running = true; $("playpause").textContent = "Pause";
-  let last = performance.now(), acc = anim.t;
+  let last = performance.now();
   function tick(now) {
     if (!anim.running) return;
-    const rate = 40 * (+$("speed").value || 1);
-    acc += (now - last) / 1000 * rate; last = now;
-    setT(acc);
-    if (anim.t >= anim.total) { anim.running = false; $("playpause").textContent = "Play"; draw(); return; }
+    const speed = $("speed").value === "instant" ? 1e9 : (+$("speed").value || 1);
+    // a hop of 0.05 map units takes 60 ms at 1×; longer jumps take longer, with a floor
+    let dt = (now - last) / 1000 * speed; last = now;
+    let t = anim.t;
+    while (dt > 0 && t < anim.total - 1) {
+      const i = Math.floor(t), secs = Math.max(0.05, segLen(i) / 0.05 * 0.06);
+      const left = (1 - (t - i)) * secs;
+      if (dt >= left) { dt -= left; t = i + 1; } else { t += dt / secs; dt = 0; }
+    }
+    setT(t);
+    if (anim.t >= anim.total - 1) { anim.running = false; $("playpause").textContent = "Play"; draw(); return; }
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
@@ -699,20 +759,25 @@ function play() {
 function pause() { anim.running = false; $("playpause").textContent = "Play"; draw(); }
 function startAnim() {
   anim = {t: 0, total: result.walk.length, running: false};
-  $("scrub").max = anim.total; setT(0);
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) { setT(anim.total); $("playpause").textContent = "Play"; return; }
+  $("scrub").max = Math.max(0, (anim.total - 1) * 100); setT(0);
+  if ($("speed").value === "instant" || matchMedia("(prefers-reduced-motion: reduce)").matches) { setT(anim.total - 1); $("playpause").textContent = "Play"; return; }
   play();
 }
+(function () { try { const v = localStorage.getItem("sanadb-studio-walk-speed"); if (v) $("speed").value = v; } catch (e) {} })();
 $("replay").onclick = startAnim;
 $("playpause").onclick = () => anim.running ? pause() : play();
-$("stepfwd").onclick = () => { pause(); setT(anim.t + 1); };
-$("scrub").oninput = (e) => { pause(); setT(+e.target.value); };
-$("speed").onchange = () => { if (anim.running) { pause(); play(); } };
+$("stepfwd").onclick = () => { pause(); setT(Math.floor(anim.t) + 1); };
+$("scrub").oninput = (e) => { pause(); setT(+e.target.value / 100); };
+$("speed").onchange = () => {
+  try { localStorage.setItem("sanadb-studio-walk-speed", $("speed").value); } catch (e) {}
+  if ($("speed").value === "instant") { pause(); setT(anim.total - 1); return; }
+  if (anim.running) { pause(); play(); }
+};
 window.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT" || !result.walk.length) return;
   if (e.key === " ") { e.preventDefault(); anim.running ? pause() : play(); }
-  if (e.key === "ArrowRight") { pause(); setT(anim.t + 1); }
-  if (e.key === "ArrowLeft") { pause(); setT(anim.t - 1); }
+  if (e.key === "ArrowRight") { pause(); setT(Math.floor(anim.t) + 1); }
+  if (e.key === "ArrowLeft") { pause(); setT(Math.ceil(anim.t) - 1); }
 });
 canvas.addEventListener("wheel", e => { e.preventDefault(); view.z *= Math.exp(-e.deltaY * 0.0015); view.z = Math.min(60, Math.max(0.3, view.z)); draw(); }, {passive: false});
 let drag = null;

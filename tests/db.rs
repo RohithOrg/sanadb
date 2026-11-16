@@ -3316,3 +3316,41 @@ fn embedder_trait_adds_and_searches_by_text() {
     assert_eq!(hits[0].id, 2);
     assert_eq!(db.search_text("aliasing", 1, None).unwrap()[0].id, 3);
 }
+
+#[test]
+fn store_properties_survive_checkpoints_reopen_and_reach_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("props.sana");
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert!(db.properties().is_empty());
+    db.set_property("embedding_model", "nomic-embed-text")
+        .unwrap();
+    db.set_property("owner", "rohith").unwrap();
+    let reader = Db::open_read_only(&path, Options::new(4)).unwrap();
+    assert_eq!(
+        reader.property("embedding_model").as_deref(),
+        Some("nomic-embed-text")
+    );
+    for i in 0..50u64 {
+        db.insert(i, &vec_of(4, i), HashMap::new()).unwrap();
+    }
+    db.set_property("embedding_model", "bge-m3").unwrap(); // last write wins
+    db.set_property("owner", "").unwrap(); // empty removes
+    db.checkpoint().unwrap();
+    assert_eq!(db.properties().len(), 1);
+    assert_eq!(db.property("embedding_model").as_deref(), Some("bge-m3"));
+    assert_eq!(
+        reader.property("embedding_model").as_deref(),
+        Some("bge-m3")
+    );
+    assert!(reader.property("owner").is_none());
+    drop(db);
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(db.property("embedding_model").as_deref(), Some("bge-m3"));
+    assert_eq!(db.len(), 50);
+    // The compacted log carries the property after the snapshot frame.
+    let log = std::fs::read(&path).unwrap();
+    assert_eq!(log[16 + 8], 4, "first frame is the snapshot");
+    let second = 16 + 8 + u32::from_le_bytes(log[16..20].try_into().unwrap()) as usize;
+    assert_eq!(log[second + 8], 7, "then the property frame");
+}

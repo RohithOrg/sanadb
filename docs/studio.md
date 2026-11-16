@@ -42,7 +42,10 @@ sanadb-studio docs.sana --embed-cmd "python embed.py"
 ```
 
 The model's dimension has to match the store's; a mismatch is reported
-on the first query. The header shows which model is attached, the query
+on the first query. Studio writes the model's name into the store's
+properties (`embedding_model`, `embedding_dim`) the first time one is
+attached; later, the header shows which model the vectors came from even
+with no model attached, and warns in red when a different one is. The header shows which model is attached, the query
 panel gains a "Text to embed" box, and the **Add record** button in the
 header takes text, optional metadata and an optional id, embeds the text,
 keeps it under the text field (or `text`), and writes the record. Nothing
@@ -109,6 +112,8 @@ the latest one is marked, and older segments fade. The transport bar
 under the map title plays the walk at ¼× to 4×, pauses it, steps one
 expansion at a time, replays from the start, and has a scrubber you can
 drag; space, left and right arrow do the same from the keyboard. The
+speed setting "Instant" draws the whole walk at once for people who do
+not want the animation; the choice is remembered. The
 blue-ringed points are the results. Scroll to zoom, drag to
 pan, hover a point for its id, click a point to inspect it. Searches are
 projected onto the same plane as the map, so a walk that heads across the
@@ -124,7 +129,9 @@ the record's name when its metadata has one (the first of `title`,
 string), otherwise "Record" and its id; the id is always shown beneath,
 labelled. Below: the vector's dimensions, non-zero count and L2 norm, its
 score against the current query, the map cluster it fell in, the full
-values on demand, and the metadata as JSON you can edit. **Save metadata** writes a new version of the record
+values on demand, and the metadata as JSON you can edit. "Replace the vector" takes new text to re-embed (with
+a model attached) or pasted numbers and rewrites the record under the
+same id. **Save metadata** writes a new version of the record
 to the log; it is visible to every reader at once and reaches the index
 columns at the next checkpoint, like any write. **Delete** asks first.
 **Search from this record** puts its id in the query and runs.

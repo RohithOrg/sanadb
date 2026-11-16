@@ -74,6 +74,9 @@ ids = db.add(["Rust borrow checker explained", "asyncio event loop internals"],
 hits = db.query(["how does borrowing work"], k=5, filter={"lang": "rust"})[0]
 ```
 
+Record which model the vectors came from, so the file still says so in
+a year: `db.set_property("embedding_model", "all-MiniLM-L6-v2")`;
+`db.properties()` reads them back, and studio shows and checks them.
 `embedding_function` is any callable from a list of strings to an
 `(n, dim)` array: a sentence-transformers model, an OpenAI or Ollama
 client, your own. `add` keeps each document's text under the text field

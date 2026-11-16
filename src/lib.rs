@@ -30,7 +30,7 @@ pub use embed::Embedder;
 pub use filter::Filter;
 pub use graph::Storage;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -506,6 +506,10 @@ struct Inner {
     /// for the unnumbered `<path>.idx` of stores last checkpointed before
     /// 0.2.0, or for a store that has no index yet.
     snapshot: Option<u64>,
+    /// Store-level properties (`Db::set_property`): what model embedded the
+    /// vectors, who owns the store, anything the user wants kept with the
+    /// file. Rewritten into the compacted log at every checkpoint.
+    properties: BTreeMap<String, String>,
 }
 
 pub struct Db {
@@ -620,6 +624,7 @@ impl Db {
             log_entries: entries.len(),
             pending: None,
             snapshot,
+            properties: BTreeMap::new(),
         };
         if let Some(g) = &inner.graph {
             for (k, kind) in g.attr_kinds() {
@@ -880,6 +885,43 @@ impl Db {
         present(self.header.metric, &mut hits);
         present(self.header.metric, &mut walk);
         Ok((hits, walk))
+    }
+
+    /// Set a store-level property, a string kept with the file: which
+    /// embedding model produced the vectors, for instance. Written to the
+    /// log like a record, visible to readers at once, kept across
+    /// checkpoints. An empty value removes the key.
+    pub fn set_property(&self, key: impl Into<String>, value: impl Into<String>) -> Result<()> {
+        let (key, value) = (key.into(), value.into());
+        if key.len() > u16::MAX as usize || value.len() > u16::MAX as usize {
+            return Err(Error::MetaTooLarge);
+        }
+        let mut i = self.write()?;
+        i.append(
+            &Entry::Property {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            self.opts.sync_every_write,
+        )?;
+        if value.is_empty() {
+            i.properties.remove(&key);
+        } else {
+            i.properties.insert(key, value);
+        }
+        Ok(())
+    }
+
+    /// One store-level property.
+    pub fn property(&self, key: &str) -> Option<String> {
+        let _ = self.refresh();
+        self.inner.read().properties.get(key).cloned()
+    }
+
+    /// Every store-level property, sorted by key.
+    pub fn properties(&self) -> BTreeMap<String, String> {
+        let _ = self.refresh();
+        self.inner.read().properties.clone()
     }
 
     /// Operation counters since open; see [`Stats`].
@@ -1612,9 +1654,20 @@ impl Db {
         // lives in that index's columns, so the rest is the survivors and
         // the deletes.
         let names = std::iter::once(Entry::Snapshot { id: snap_id });
+        let props: Vec<Entry> = i
+            .properties
+            .iter()
+            .map(|(k, v)| Entry::Property {
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect();
         let deletes = dead.iter().map(|&id| Entry::Delete { id });
-        let new_offs =
-            wal::write_snapshot(&log_tmp, self.header, names.chain(inserts).chain(deletes))?;
+        let new_offs = wal::write_snapshot(
+            &log_tmp,
+            self.header,
+            names.chain(props).chain(inserts).chain(deletes),
+        )?;
         // Same Windows rule for the log: close the old one before replacing
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.
@@ -1654,7 +1707,7 @@ impl Db {
         i.delta = delta;
         i.delta_seq = delta_seq;
         i.meta.retain(|id, _| survivor_ids.contains(id));
-        i.log_entries = survivors.len() + dead.len() + 1;
+        i.log_entries = survivors.len() + dead.len() + 1 + i.properties.len();
         drop(i);
         // The previous index is unreferenced now. A reader elsewhere may
         // still map it; then the delete fails here (Windows) and the next
@@ -1716,6 +1769,13 @@ impl Inner {
                 self.meta.insert(id, Arc::new(meta));
             }
             Replayed::Snapshot { id } => self.snapshot = Some(id),
+            Replayed::Property { key, value } => {
+                if value.is_empty() {
+                    self.properties.remove(&key);
+                } else {
+                    self.properties.insert(key, value);
+                }
+            }
         }
     }
 

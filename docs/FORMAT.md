@@ -56,6 +56,7 @@ padding to a multiple of 4.
 | 4 | Snapshot | `id` u64: the index file this log pairs with is `<path>.idx.<id as 16 hex digits>`. First frame of a compacted log. A log without one pairs with the unnumbered `<path>.idx` (0.1.x) or has no index. |
 | 5 | Begin | none. Opens an atomic batch. |
 | 6 | Commit | none. Closes it: the frames between take effect together. A `Begin` with no `Commit` before the end of the log is a crashed batch; its frames are dropped and the writer truncates them. |
+| 7 | Property | `key` (length u16, bytes) and `value` (length u16, bytes): a store-level property such as the embedding model's name. The last frame for a key wins; an empty value removes the key. |
 
 Readers skip a frame whose kind they do not know (the CRC still has to
 match), which is how a kind can be added without a level change.
@@ -83,9 +84,9 @@ frame are the records written since (the "tail").
 ### Compacted log
 
 A checkpoint rewrites the log as: header, one `Snapshot` frame, one
-`Insert` frame per record written while the checkpoint was building, one
-`Delete` frame per record deleted while it was building whose slot is in
-the new index. Metadata of indexed records lives in the index's attribute
+`Property` frame per store property, one `Insert` frame per record
+written while the checkpoint was building, one `Delete` frame per record
+deleted while it was building whose slot is in the new index. Metadata of indexed records lives in the index's attribute
 columns, so a quiet store's log is 36 bytes after a checkpoint.
 
 ### Reader level
@@ -99,7 +100,7 @@ changes (new frame kinds) do not raise it. Levels so far:
 | (`SANADB01`) | 0.1.1 | no padding after `kind`, bodies not padded to 4. Migrated on open. |
 | 1 | 0.1.2, 0.1.3 | metadata values are bare strings (no kind byte). Migrated on open. |
 | 2 | 0.1.4 | typed values; Meta frames for indexed records. Opened as is. |
-| 3 | 0.2.0 | Snapshot, Begin, Commit frames; no Meta frames written. |
+| 3 | 0.2.0 | Snapshot, Begin, Commit frames; no Meta frames written. 0.2.1 adds the Property frame without raising the level: a 0.2.0 reader skips it. |
 
 ## Index
 

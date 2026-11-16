@@ -55,6 +55,10 @@ const KIND_SNAPSHOT: u8 = 4;
 /// of the log is a crashed batch and is dropped (the writer truncates it).
 const KIND_BEGIN: u8 = 5;
 const KIND_COMMIT: u8 = 6;
+/// A store-level property: `key` and `value` strings. The last frame for a
+/// key wins; a checkpoint rewrites the current set after the Snapshot
+/// frame. Additive: readers that do not know the kind skip it.
+const KIND_PROPERTY: u8 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
@@ -82,6 +86,10 @@ pub(crate) enum Entry {
     },
     Begin,
     Commit,
+    Property {
+        key: String,
+        value: String,
+    },
 }
 
 /// What replay yields. Insert carries the vector's byte offset in the file
@@ -107,6 +115,10 @@ pub(crate) enum Replayed {
     Meta {
         id: u64,
         meta: Metadata,
+    },
+    Property {
+        key: String,
+        value: String,
     },
 }
 
@@ -465,6 +477,7 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
             Replayed::Snapshot { id } => Entry::Snapshot { id },
             Replayed::Begin { .. } => Entry::Begin,
             Replayed::Commit => Entry::Commit,
+            Replayed::Property { key, value } => Entry::Property { key, value },
         });
     }
     let tmp = path.with_extension("migrate.tmp");
@@ -625,6 +638,11 @@ fn encode(entry: &Entry, out: &mut Vec<u8>) {
             out.extend_from_slice(&[KIND_SNAPSHOT, 0, 0, 0]);
             out.extend_from_slice(&id.to_le_bytes());
         }
+        Entry::Property { key, value } => {
+            out.extend_from_slice(&[KIND_PROPERTY, 0, 0, 0]);
+            put_str(out, key);
+            put_str(out, value);
+        }
         Entry::Begin => out.extend_from_slice(&[KIND_BEGIN, 0, 0, 0]),
         Entry::Commit => out.extend_from_slice(&[KIND_COMMIT, 0, 0, 0]),
     }
@@ -701,6 +719,10 @@ fn decode_known(body: &[u8], dim: u32, body_off: u64, tagged: bool) -> Option<Op
                 meta: c.meta()?,
             }
         }
+        KIND_PROPERTY => Replayed::Property {
+            key: c.str()?,
+            value: c.str()?,
+        },
         _ => return Some(None),
     };
     // Only zero padding may follow.

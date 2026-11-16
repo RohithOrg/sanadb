@@ -420,6 +420,26 @@ impl PyDb {
         .map_err(err)
     }
 
+    /// Set a store-level property (a string kept with the file, such as the
+    /// embedding model's name). An empty value removes it.
+    fn set_property(&self, py: Python<'_>, key: String, value: String) -> PyResult<()> {
+        let db = self.inner.clone();
+        py.allow_threads(move || db.set_property(key, value))
+            .map_err(err)
+    }
+
+    fn property(&self, key: String) -> Option<String> {
+        self.inner.property(&key)
+    }
+
+    fn properties<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        for (k, v) in self.inner.properties() {
+            d.set_item(k, v)?;
+        }
+        Ok(d)
+    }
+
     fn delete(&self, py: Python<'_>, id: u64) -> PyResult<bool> {
         let db = self.inner.clone();
         py.allow_threads(move || db.delete(id)).map_err(err)

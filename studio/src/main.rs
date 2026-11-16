@@ -33,6 +33,13 @@ enum Embedder {
 }
 
 impl Embedder {
+    fn name(&self) -> String {
+        match self {
+            Embedder::Http { model, .. } => model.clone(),
+            Embedder::Cmd(c) => format!("command: {c}"),
+        }
+    }
+
     fn describe(&self) -> J {
         match self {
             Embedder::Http { url, model, .. } => {
@@ -247,6 +254,18 @@ fn main() {
             }
         }
     };
+    // Attaching a model does not claim the store's vectors came from it;
+    // the name is recorded the first time this model writes a record. But
+    // say so when the store names a different one: vectors from two
+    // models do not compare.
+    if let (Some(e), Some(have)) = (&embed, db.property("embedding_model"))
+        && have != e.name()
+    {
+        eprintln!(
+            "warning: this store's vectors were embedded with {have:?}; the attached model is {:?}. Queries and new records will not be comparable.",
+            e.name()
+        );
+    }
     let app = Arc::new(App {
         db,
         path: path.clone(),
@@ -349,6 +368,7 @@ fn info(app: &App) -> J {
         "metric": metric_name(app.metric),
         "read_only": app.read_only,
         "embed": app.embed.as_ref().map(|e| e.describe()),
+        "properties": app.db.properties(),
         "text_key": app.text_key,
         "len": app.db.len(),
         "delta_len": app.db.delta_len(),
@@ -471,9 +491,42 @@ fn update(app: &App, q: &HashMap<String, String>, body: &str) -> Result<J, Strin
         .and_then(|s| s.parse().ok())
         .ok_or("id required")?;
     let j: J = serde_json::from_str(body).map_err(|e| e.to_string())?;
-    let (v, _) = app.db.get(id).ok_or("no such record")?;
-    let meta = json_meta(&j["meta"])?;
+    let (old_v, old_m) = app.db.get(id).ok_or("no such record")?;
+    // New metadata, and optionally a new vector: numbers, or text to
+    // re-embed with the attached model.
+    let mut meta = if j["meta"].is_null() {
+        old_m
+    } else {
+        json_meta(&j["meta"])?
+    };
+    let v = if let Some(arr) = j["vector"].as_array() {
+        arr.iter()
+            .map(|x| {
+                x.as_f64()
+                    .map(|x| x as f32)
+                    .ok_or("vector values must be numbers")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else if let Some(t) = j["text"].as_str().filter(|t| !t.trim().is_empty()) {
+        let e = app
+            .embed
+            .as_ref()
+            .ok_or("no embedding model attached: start studio with --embed-url or --embed-cmd")?;
+        meta.insert(app.text_key.clone(), Value::Str(t.to_string()));
+        note_model(app, e);
+        e.embed(std::slice::from_ref(&t.to_string()))?.remove(0)
+    } else {
+        old_v
+    };
+    if v.len() != app.dim {
+        return Err(format!(
+            "{} dimensions given, the store has {}",
+            v.len(),
+            app.dim
+        ));
+    }
     app.db.insert(id, &v, meta).map_err(|e| e.to_string())?;
+    *app.map.lock().unwrap() = None;
     record(app, q)
 }
 
@@ -725,6 +778,7 @@ fn add(app: &App, body: &str) -> Result<J, String> {
             )?;
             meta.entry(app.text_key.clone())
                 .or_insert_with(|| Value::Str(t.clone()));
+            note_model(app, e);
             e.embed(std::slice::from_ref(t))?.remove(0)
         }
         _ => return Err("give text to embed or a vector".into()),
@@ -751,6 +805,14 @@ fn add(app: &App, body: &str) -> Result<J, String> {
     *app.map.lock().unwrap() = None;
     let (v, m) = app.db.get(id).ok_or("inserted record not readable")?;
     Ok(json!({"id": id, "vector_len": v.len(), "meta": meta_json(&m)}))
+}
+
+/// Record the model's name in the store the first time it writes a vector.
+fn note_model(app: &App, e: &Embedder) {
+    if app.db.property("embedding_model").is_none() {
+        let _ = app.db.set_property("embedding_model", e.name());
+        let _ = app.db.set_property("embedding_dim", app.dim.to_string());
+    }
 }
 
 fn project(s: &MapState, v: &[f32]) -> (f32, f32) {
