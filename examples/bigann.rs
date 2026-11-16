@@ -71,7 +71,11 @@ fn main() {
             let pq = a.get(4).is_none_or(|s| s != "pq:off");
             let path = store_path(dir, n, pq);
             let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(format!("{}.idx", path.display()));
+            for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with(&format!("{}.idx", path.file_name().unwrap().to_string_lossy())) {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
             let b = base(dir, n);
             let db = Db::open(
                 &path,
@@ -92,9 +96,7 @@ fn main() {
             let t = Instant::now();
             db.checkpoint().unwrap();
             let s = db.index_stats().unwrap();
-            let idx = fs::metadata(format!("{}.idx", path.display()))
-                .unwrap()
-                .len();
+            let idx = fs::metadata(db.index_path().unwrap()).unwrap().len();
             let log = fs::metadata(&path).unwrap().len();
             println!(
                 "build: {:.1?} nodes={} pq_subspaces={} index={:.2} GB log={:.0} MB",

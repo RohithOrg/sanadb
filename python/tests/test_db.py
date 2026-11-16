@@ -188,3 +188,18 @@ def test_filter_dict_operators(tmp_path):
         db.search(q, k=5, filter={"year": {"$between": [1, 2]}})
     ids, _ = db.search_many(vecs[:3], k=5, filter={"rare": True})
     assert ids.shape == (3, 5) and all(metas[i].get("rare") is True for i in ids.ravel() if i >= 0)
+
+
+def test_read_only_follows_writer(tmp_path):
+    p = str(tmp_path / "ro.sana")
+    w = sanadb.Db(p, dim=4)
+    w.insert(1, np.ones(4, dtype=np.float32), {"k": "a"})
+    r = sanadb.Db(p, dim=4, read_only=True)
+    assert len(r) == 1 if hasattr(r, "__len__") else r.get(1) is not None
+    w.insert(2, np.zeros(4, dtype=np.float32), {"k": "b"})
+    r.refresh()
+    assert r.get(2)[1] == {"k": "b"}
+    w.checkpoint()
+    assert [i for i, _ in r.search(np.zeros(4, dtype=np.float32), k=1)] == [2]
+    with pytest.raises(PermissionError):
+        r.insert(3, np.ones(4, dtype=np.float32))

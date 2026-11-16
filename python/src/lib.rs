@@ -17,6 +17,7 @@ fn err(e: sanadb_core::Error) -> PyErr {
         | sanadb_core::Error::HeaderMismatch { .. }
         | sanadb_core::Error::InvalidVector => PyValueError::new_err(e.to_string()),
         sanadb_core::Error::TypeMismatch { .. } => PyTypeError::new_err(e.to_string()),
+        sanadb_core::Error::ReadOnly => pyo3::exceptions::PyPermissionError::new_err(e.to_string()),
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -177,8 +178,12 @@ impl PyDb {
     /// metric: "l2" (squared Euclidean), "dot" (negative inner product, vectors
     /// stored as given) or "cosine" (negative cosine similarity; vectors are
     /// normalised on insert and query).
+    ///
+    /// read_only=True opens an existing store beside its writer (any process):
+    /// no lock is taken, reads follow the writer's appends and checkpoints,
+    /// and writes raise PermissionError.
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -193,6 +198,7 @@ impl PyDb {
         max_degree: u32,
         build_beam: u32,
         alpha: f32,
+        read_only: bool,
     ) -> PyResult<Self> {
         let metric = match metric {
             "l2" => Metric::L2,
@@ -218,7 +224,7 @@ impl PyDb {
                 ..GraphParams::default()
             });
         let db = py
-            .allow_threads(|| sanadb_core::Db::open(path, opts))
+            .allow_threads(|| if read_only { sanadb_core::Db::open_read_only(path, opts) } else { sanadb_core::Db::open(path, opts) })
             .map_err(err)?;
         Ok(PyDb {
             inner: Arc::new(db),
@@ -404,6 +410,13 @@ impl PyDb {
             PyArray1::from_vec(py, ids).reshape([n, k])?,
             PyArray1::from_vec(py, scores).reshape([n, k])?,
         ))
+    }
+
+    /// Read-only stores: bring the view up to date with the writer now. Every
+    /// read does this anyway; call it to pick up writes without reading.
+    fn refresh(&self, py: Python<'_>) -> PyResult<()> {
+        let db = self.inner.clone();
+        py.allow_threads(move || db.refresh()).map_err(err)
     }
 
     /// fsync the log so acknowledged writes survive power loss.

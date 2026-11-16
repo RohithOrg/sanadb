@@ -15,7 +15,7 @@ See `docs/design/snapshot-and-tail.md`.
   the in-RAM map holds only records written since the last checkpoint (and,
   for an index built before 0.1.4, everything until the next checkpoint).
   The compacted log no longer carries Meta frames, so after a checkpoint it
-  is 16 bytes. Log reader level 3: 0.1.4 refuses such a log with
+  is 36 bytes: the header and the frame naming its index. Log reader level 3: 0.1.4 refuses such a log with
   `NeedsNewerVersion`; level-2 logs open unchanged, level 1 and SANADB01
   are migrated as before.
 - The index file ends in a footer that names the attribute table and a new
@@ -29,10 +29,25 @@ See `docs/design/snapshot-and-tail.md`.
   |---|---|---|
   | open | 949 ms | 4.8 ms |
   | resident memory after open | 864 MB | 63 MB |
-  | log size after checkpoint | 66 MB | 16 B |
+  | log size after checkpoint | 66 MB | 36 B |
   | 1000 warm queries | 85 ms | 75 ms |
 
   The 63 MB is the PQ codes (32 MB) plus whatever pages the queries touch.
+
+### Added
+- `Db::open_read_only`: open a store beside its writer, in the same or
+  another process, with no lock. Reads see a prefix of the writer's history
+  and refresh before each call (`Db::refresh` forces it); writes return
+  `Error::ReadOnly`. Python: `sanadb.Db(path, dim, read_only=True)`,
+  `refresh()`, writes raise `PermissionError`. A test spawns a reader process
+  that queries through 1,500 ms of inserts, deletes and checkpoints.
+- Each checkpoint writes its index to a new file, `<path>.idx.<id>`, and the
+  compacted log's first frame names it (frame kind 4). Nothing is renamed
+  over an index any more, which is what made checkpoints fail on Windows
+  while a file was mapped. The old index is deleted after the swap; if a
+  reader still maps it (Windows refuses the delete) the next writer open
+  collects it. `Db::index_path()` returns the current file. Stores whose
+  index is still the unnumbered `<path>.idx` open as before.
 
 ## [0.1.4] - 2026-11-16
 

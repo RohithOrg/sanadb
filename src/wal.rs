@@ -46,6 +46,10 @@ const KIND_INSERT: u8 = 1;
 const KIND_DELETE: u8 = 2;
 /// Metadata only; the vector lives in the graph index sidecar.
 const KIND_META: u8 = 3;
+/// First frame of a compacted log: names the index file this log pairs
+/// with (`<path>.idx.<id as 16 hex digits>`). A log without one pairs with
+/// the unnumbered `<path>.idx` or with no index.
+const KIND_SNAPSHOT: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
@@ -68,6 +72,9 @@ pub(crate) enum Entry {
         id: u64,
         meta: Metadata,
     },
+    Snapshot {
+        id: u64,
+    },
 }
 
 /// What replay yields. Insert carries the vector's byte offset in the file
@@ -78,6 +85,9 @@ pub(crate) enum Replayed {
         id: u64,
         vector_off: u64,
         meta: Metadata,
+    },
+    Snapshot {
+        id: u64,
     },
     Delete {
         id: u64,
@@ -98,9 +108,97 @@ pub(crate) struct Wal {
     /// the mapping is dropped around `set_len` and before a rename.
     map: Option<Mmap>,
     dim: usize,
+    /// Read-only mode: the log's bytes copied into RAM instead of a mapping
+    /// (so another process may rename over the file on Windows), extended by
+    /// `refresh`. Offsets handed out are file offsets, as in the mapped mode.
+    buf: Option<Vec<u8>>,
+    /// Identity of the file `buf` was read from, to notice a replacement.
+    ident: Option<FileIdent>,
+}
+
+/// What tells one log file from the one that replaced it at the same path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdent {
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileIdent {
+    fn of(m: &std::fs::Metadata) -> FileIdent {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            FileIdent { ino: m.ino() }
+        }
+        #[cfg(not(unix))]
+        {
+            FileIdent { created: m.created().ok() }
+        }
+    }
+}
+
+/// Outcome of a read-only refresh.
+pub(crate) enum Refresh {
+    /// New frames since the last refresh (possibly none).
+    Appended(Vec<Replayed>),
+    /// The file at the path is a different file (compaction) or shrank:
+    /// everything must be re-read from scratch.
+    Replaced,
 }
 
 impl Wal {
+    /// Open an existing log without taking a writer's place: nothing is
+    /// written, created, resized or mapped. Returns the header and entries.
+    pub fn open_read_only(path: &Path, wanted: Header) -> Result<(Self, Vec<Replayed>)> {
+        let mut file = File::open(path)?;
+        let ident = FileIdent::of(&file.metadata()?);
+        let header = read_header(&mut file)?;
+        if header != wanted {
+            return Err(Error::HeaderMismatch {
+                on_disk: (header.dim, header.metric),
+                requested: (wanted.dim, wanted.metric),
+            });
+        }
+        let mut buf = Vec::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_end(&mut buf)?;
+        let (entries, len) = parse_frames(&buf, HEADER_LEN as usize, header.dim);
+        buf.truncate(len as usize);
+        let wal = Wal {
+            writer: None,
+            len,
+            map: None,
+            dim: wanted.dim as usize,
+            buf: Some(buf),
+            ident: Some(ident),
+        };
+        Ok((wal, entries))
+    }
+
+    /// Read-only mode: pick up frames appended since the last read, or report
+    /// that the file was replaced.
+    pub fn refresh(&mut self, path: &Path) -> Result<Refresh> {
+        let mut file = File::open(path)?;
+        let m = file.metadata()?;
+        if Some(FileIdent::of(&m)) != self.ident || m.len() < self.len {
+            return Ok(Refresh::Replaced);
+        }
+        if m.len() == self.len {
+            return Ok(Refresh::Appended(Vec::new()));
+        }
+        let buf = self.buf.as_mut().expect("refresh on a writable log");
+        file.seek(SeekFrom::Start(self.len))?;
+        let mut tail = Vec::with_capacity((m.len() - self.len) as usize);
+        file.read_to_end(&mut tail)?;
+        buf.extend_from_slice(&tail);
+        let (entries, len) = parse_frames(buf, self.len as usize, self.dim as u32);
+        buf.truncate(len as usize);
+        self.len = len;
+        Ok(Refresh::Appended(entries))
+    }
+
     /// Open or create the log. Returns the header and every intact entry.
     pub fn open(path: &Path, wanted: Header) -> Result<(Self, Vec<Replayed>)> {
         let exists = path.exists() && std::fs::metadata(path)?.len() > 0;
@@ -141,6 +239,8 @@ impl Wal {
                 len,
                 map: Some(map),
                 dim: wanted.dim as usize,
+                buf: None,
+                ident: None,
             },
             entries,
         ))
@@ -198,7 +298,12 @@ impl Wal {
     /// The vector stored at an offset returned by `append` or replay.
     pub fn vector_at(&self, off: u64) -> &[f32] {
         let o = off as usize;
-        bytemuck::cast_slice(&self.map.as_ref().expect("log mapping released")[o..o + self.dim * 4])
+        let bytes: &[u8] = match (&self.map, &self.buf) {
+            (Some(m), _) => &m[o..o + self.dim * 4],
+            (None, Some(b)) => &b[o..o + self.dim * 4],
+            (None, None) => panic!("log mapping released"),
+        };
+        bytemuck::cast_slice(bytes)
     }
 
     /// Push buffered frames to the OS. Data survives a process crash, not a power loss.
@@ -313,6 +418,7 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
             }
             Replayed::Delete { id } => Entry::Delete { id },
             Replayed::Meta { id, meta } => Entry::Meta { id, meta },
+            Replayed::Snapshot { id } => Entry::Snapshot { id },
         });
     }
     let tmp = path.with_extension("migrate.tmp");
@@ -352,6 +458,32 @@ fn read_header(file: &mut File) -> Result<Header> {
     let dim = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let metric = Metric::from_u8(buf[12]).ok_or(Error::Corrupt("unknown metric"))?;
     Ok(Header { dim, metric })
+}
+
+/// Parse the frames in `bytes` starting at `from`, stopping at the first
+/// torn or damaged one. Returns entries and the offset just past the last
+/// good frame. Unknown kinds are skipped.
+fn parse_frames(bytes: &[u8], from: usize, dim: u32) -> (Vec<Replayed>, u64) {
+    let mut pos = from;
+    let mut out = Vec::new();
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+        if len == 0 || !len.is_multiple_of(4) {
+            break;
+        }
+        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else { break };
+        if crc32fast::hash(body) != crc {
+            break;
+        }
+        match decode(body, dim, pos as u64 + 8, true) {
+            Decoded::Entry(e) => out.push(e),
+            Decoded::Unknown => {}
+            Decoded::Bad => break,
+        }
+        pos += 8 + len;
+    }
+    (out, pos as u64)
 }
 
 /// Parse frames until EOF or the first damaged frame. Returns entries and the
@@ -423,6 +555,10 @@ fn encode(entry: &Entry, out: &mut Vec<u8>) {
             out.extend_from_slice(&id.to_le_bytes());
             put_meta(out, meta);
         }
+        Entry::Snapshot { id } => {
+            out.extend_from_slice(&[KIND_SNAPSHOT, 0, 0, 0]);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
     }
     while !out.len().is_multiple_of(4) {
         out.push(0);
@@ -480,6 +616,7 @@ fn decode_known(body: &[u8], dim: u32, body_off: u64, tagged: bool) -> Option<Op
             }
         }
         KIND_DELETE => Replayed::Delete { id: c.u64()? },
+        KIND_SNAPSHOT => Replayed::Snapshot { id: c.u64()? },
         KIND_META => {
             let id = c.u64()?;
             Replayed::Meta {

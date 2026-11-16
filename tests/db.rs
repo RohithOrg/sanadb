@@ -212,7 +212,11 @@ fn graph_survives_reopen_upsert_delete_and_recheckpoint() {
         log_bytes < n * dim as u64 * 4 * 3 / 5,
         "log is {log_bytes} bytes"
     );
-    assert!(path.with_file_name("v.sana.idx").exists());
+    {
+        let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+        let idx = db.index_path().expect("index exists after checkpoint");
+        assert!(idx.exists() && idx.file_name().unwrap().to_str().unwrap().starts_with("v.sana.idx."), "{idx:?}");
+    }
 
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(db.len(), n as usize);
@@ -926,7 +930,11 @@ fn corrupted_logs_never_panic() {
             bytes.truncate(cut);
         }
         std::fs::write(&path, &bytes).unwrap();
-        let _ = std::fs::remove_file(dir.path().join("fuzz.sana.idx"));
+        for e in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            if e.file_name().to_str().unwrap().starts_with("fuzz.sana.idx") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
         match Db::open(&path, Options::new(4)) {
             Ok(db) => {
                 // Whatever survived must be internally consistent.
@@ -1400,10 +1408,10 @@ fn metadata_lives_in_columns_after_checkpoint() {
     }
     db.checkpoint().unwrap();
     drop(db);
-    // The compacted log describes nothing but the header: every record's
-    // metadata is in the index columns now.
+    // The compacted log holds the header and the frame naming its index,
+    // nothing else: every record's metadata is in the index columns now.
     let log_bytes = std::fs::metadata(&path).unwrap().len();
-    assert_eq!(log_bytes, 16, "log is {log_bytes} bytes");
+    assert_eq!(log_bytes, 16 + 8 + 12, "log is {log_bytes} bytes");
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(db.len(), n as usize);
     for i in [0u64, 1, 2, 1500, n - 1] {
@@ -1444,4 +1452,159 @@ fn metadata_lives_in_columns_after_checkpoint() {
     assert!(db.get(2).is_none());
     assert_eq!(db.get(3).unwrap().1["i"], Value::Int(-3));
     assert_eq!(db.index_stats().unwrap().tombstones, 0);
+}
+
+#[test]
+fn reader_in_the_same_process_follows_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.sana");
+    let dim = 8usize;
+    let w = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..500u64 {
+        w.insert(i, &vec_of(dim, i), meta(&[("k", "a")])).unwrap();
+    }
+    // A reader opens beside the writer: no lock conflict either way.
+    let r = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(r.len(), 500);
+    assert!(matches!(r.insert(9, &vec_of(dim, 9), HashMap::new()), Err(sanadb::Error::ReadOnly)));
+    assert!(matches!(r.delete(9), Err(sanadb::Error::ReadOnly)));
+    assert!(matches!(r.checkpoint(), Err(sanadb::Error::ReadOnly)));
+    // Appended frames are visible on the reader's next read.
+    w.insert(500, &vec_of(dim, 500), meta(&[("k", "b")])).unwrap();
+    w.delete(3).unwrap();
+    assert_eq!(r.len(), 500);
+    assert_eq!(r.get(500).unwrap().1["k"], "b");
+    assert!(r.get(3).is_none());
+    // A checkpoint replaces both files under the reader; it reloads and
+    // keeps answering from the new index.
+    w.checkpoint().unwrap();
+    assert_eq!(r.len(), 500);
+    assert_eq!(r.get(500).unwrap().1["k"], "b");
+    assert!(r.get(3).is_none());
+    assert_eq!(r.search(&vec_of(dim, 77), 1).unwrap()[0].id, 77);
+    assert_eq!(r.index_stats().unwrap().nodes, 500);
+    // Writes after the checkpoint, then a second checkpoint while the reader
+    // holds the first new index mapped.
+    for i in 1000..1100u64 {
+        w.insert(i, &vec_of(dim, i), HashMap::new()).unwrap();
+    }
+    assert_eq!(r.len(), 600);
+    w.checkpoint().unwrap();
+    assert_eq!(r.len(), 600);
+    assert_eq!(r.search(&vec_of(dim, 1050), 1).unwrap()[0].id, 1050);
+    // Only the current index file remains.
+    let idx_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_str().unwrap().starts_with("shared.sana.idx"))
+        .collect();
+    assert_eq!(idx_files.len(), 1, "{idx_files:?}");
+    assert_eq!(idx_files[0].path(), w.index_path().unwrap());
+    // The writer closes; the reader goes on.
+    drop(w);
+    assert_eq!(r.len(), 600);
+    assert_eq!(r.get(500).unwrap().1["k"], "b");
+    // A second writer opens while the reader is attached.
+    let w2 = Db::open(&path, Options::new(dim as u32)).unwrap();
+    w2.insert(7, &vec_of(dim, 7), meta(&[("k", "z")])).unwrap();
+    assert_eq!(r.get(7).unwrap().1["k"], "z");
+}
+
+#[test]
+fn orphan_index_files_are_collected_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gc.sana");
+    let dim = 4usize;
+    {
+        let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+        db.insert(1, &vec_of(dim, 1), HashMap::new()).unwrap();
+        db.checkpoint().unwrap();
+    }
+    // Leftovers a crash could produce: an index nobody names, a snapshot temp file.
+    std::fs::write(dir.path().join("gc.sana.idx.00000000deadbeef"), b"junk").unwrap();
+    std::fs::write(dir.path().join("gc.sana.idx"), b"junk").unwrap();
+    std::fs::write(dir.path().join("gc.sana.vec.tmp"), b"junk").unwrap();
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.get(1).unwrap().0, vec_of(dim, 1));
+    let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_str().unwrap().to_string()).collect();
+    assert!(!names.iter().any(|n| n.ends_with("deadbeef") || n == "gc.sana.idx" || n.ends_with(".vec.tmp")), "{names:?}");
+    assert!(names.contains(&db.index_path().unwrap().file_name().unwrap().to_str().unwrap().to_string()));
+}
+
+/// Child half of the cross-process reader test: read until the parent's
+/// stop file appears, checking every answer for internal consistency.
+#[test]
+fn reader_child_reads_until_told_to_stop() {
+    let Ok(path) = std::env::var("SANADB_READER_CHILD") else { return };
+    let path = std::path::PathBuf::from(path);
+    let stop = path.with_extension("stop");
+    let dim = 8usize;
+    let r = loop {
+        match Db::open_read_only(&path, Options::new(dim as u32)) {
+            Ok(r) => break r,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    let mut rounds = 0u64;
+    let mut max_len = 0usize;
+    while !stop.exists() {
+        let n = r.len();
+        assert!(n >= max_len, "len went backwards: {n} < {max_len}");
+        max_len = n;
+        let hits = r.search(&vec_of(dim, rounds % 300), 5).unwrap();
+        for h in &hits {
+            // A record may be deleted between the search and the get; what
+            // is there must be the right vector with the right metadata.
+            if let Some((v, m)) = r.get(h.id) {
+                assert_eq!(v, vec_of(dim, h.id));
+                assert_eq!(m["i"], Value::Int(h.id as i64));
+            }
+        }
+        rounds += 1;
+    }
+    eprintln!("reader child: {rounds} rounds, final len {max_len}");
+    assert!(rounds > 10);
+    std::fs::write(path.with_extension("rounds"), rounds.to_string()).unwrap();
+}
+
+#[test]
+fn reader_in_another_process_survives_writes_and_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("xp.sana");
+    let dim = 8usize;
+    let w = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..300u64 {
+        w.insert(i, &vec_of(dim, i), HashMap::from([("i".to_string(), Value::from(i as i64))])).unwrap();
+    }
+    w.checkpoint().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let mut child = std::process::Command::new(&exe)
+        .args(["reader_child_reads_until_told_to_stop", "--exact", "--nocapture", "--test-threads=1"])
+        .env("SANADB_READER_CHILD", &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .unwrap();
+    // Write, delete and checkpoint under the reader for a while.
+    let t = std::time::Instant::now();
+    let mut next = 300u64;
+    let mut round = 0;
+    while t.elapsed() < std::time::Duration::from_millis(1500) {
+        for _ in 0..50 {
+            w.insert(next, &vec_of(dim, next), HashMap::from([("i".to_string(), Value::from(next as i64))])).unwrap();
+            next += 1;
+        }
+        w.delete(round * 7 % 300).unwrap_or(false);
+        if round % 3 == 2 {
+            w.checkpoint().unwrap();
+        }
+        round += 1;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::write(path.with_extension("stop"), b"").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "reader child failed: {status}");
+    let rounds: u64 = std::fs::read_to_string(path.with_extension("rounds")).unwrap().parse().unwrap();
+    eprintln!("writer: {round} rounds, {} records; reader: {rounds} rounds", w.len());
+    assert!(rounds > 10);
 }

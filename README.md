@@ -40,10 +40,13 @@ below are real and reproducible; the track record is not there yet.
   only after `sync()` or with `sync_every_write`.
 - A checkpoint either completes or leaves the previous files untouched.
 - Readers never see a partially written record or index.
-- One open `Db` per store. A second open, from any process, fails with
-  `Error::Locked`. The lock is an advisory `flock` on `<path>.lock`: reliable
-  on local filesystems, not on NFS, SMB or other network mounts, where two
-  machines can both believe they hold it. Keep stores on local disks.
+- One writer per store, any number of readers, in any processes. A second
+  `Db::open` fails with `Error::Locked`; `Db::open_read_only` takes no lock
+  and follows the writer's inserts, deletes and checkpoints, seeing a prefix
+  of its history. The writer lock is an advisory `flock` on `<path>.lock`:
+  reliable on local filesystems, not on NFS, SMB or other network mounts,
+  where two machines can both believe they hold it. Keep stores on local
+  disks.
 - Search over records written since the last checkpoint is exact. Search over
   the graph is approximate; recall depends on `search_beam` and is measured
   below on public datasets.
@@ -99,8 +102,10 @@ lower is closer. For cosine they are the negative cosine similarity, in
 
 ## How it works
 
-A store is three files: `<path>` is the write-ahead log, `<path>.idx` the graph
-index, `<path>.lock` an empty file that is `flock`ed while the store is open.
+A store is three files: `<path>` is the write-ahead log, `<path>.idx.<id>` the
+graph index named by the log's first frame (a new file per checkpoint, so an
+index is never overwritten while a reader maps it), `<path>.lock` an empty
+file that is `flock`ed while a writer has the store open.
 
 **Log.** CRC-framed records: insert (id, vector, metadata), delete (id), and
 meta (id, metadata only; the vector lives in the index). Opening replays the
@@ -157,7 +162,12 @@ beam doubled until `k` pass, up to `max_search_beam`.
 
 **Concurrency.** A `RwLock` guards the in-memory state: reads share it, writes
 take it, checkpoints serialise on a separate mutex and hold neither during
-the build.
+the build. A read-only `Db` keeps the log tail in RAM instead of a mapping
+and, before each read, checks the log's size and identity: appended frames
+are replayed, a replaced log (checkpoint) means reload. A writer process
+flushes every write, so readers see it as soon as `insert` returns. The
+in-RAM state of any `Db` is the tail since the last checkpoint and the
+tombstones; metadata of indexed records is read from the index columns.
 
 ## Numbers
 

@@ -62,6 +62,8 @@ pub enum Error {
     InvalidVector,
     /// Another `Db` (in this or another process) has the store open.
     Locked,
+    /// The store was opened with `open_read_only`.
+    ReadOnly,
     /// The file was written by a newer sanadb whose layout this build cannot
     /// read. Upgrade sanadb; the data is intact.
     NeedsNewerVersion {
@@ -115,6 +117,7 @@ impl std::fmt::Display for Error {
                 "vector contains NaN or infinity, or is all zeros under the cosine metric"
             ),
             Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
+            Error::ReadOnly => write!(f, "store is open read-only"),
             Error::NeedsNewerVersion {
                 file_level,
                 supported,
@@ -325,27 +328,32 @@ struct Inner {
     deletes_since_snapshot: Option<HashSet<u64>>,
     /// Log entries since the last checkpoint. Drives automatic compaction.
     log_entries: usize,
+    /// Id of the index file this log pairs with (`<path>.idx.<id>`); `None`
+    /// for the unnumbered `<path>.idx` of stores last checkpointed before
+    /// 0.2.0, or for a store that has no index yet.
+    snapshot: Option<u64>,
 }
 
 pub struct Db {
     path: PathBuf,
-    idx_path: PathBuf,
     header: Header,
     opts: Options,
     inner: RwLock<Inner>,
     /// Serialises checkpoints; held for the whole build.
     checkpoint_lock: Mutex<()>,
-    /// `<path>.lock`, exclusively flock'ed for as long as this `Db` lives.
-    /// A separate file because the log and index are replaced by rename.
-    _file_lock: std::fs::File,
+    /// `<path>.lock`, exclusively flock'ed for as long as a writer lives.
+    /// A separate file because the log is replaced by rename. Readers
+    /// (`open_read_only`) hold no lock at all.
+    _file_lock: Option<std::fs::File>,
+    read_only: bool,
 }
 
 impl Db {
-    /// Open or create a store. Fails with `Error::Locked` if another `Db`
-    /// has the same path open, in this process or any other.
+    /// Open or create a store for reading and writing. Fails with
+    /// `Error::Locked` if another writer has the same path open, in this
+    /// process or any other. Readers (`open_read_only`) do not conflict.
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let path = path.as_ref().to_path_buf();
-        let idx_path = sidecar(&path, ".idx");
         let file_lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -371,19 +379,68 @@ impl Db {
             dim: opts.dim,
             metric: opts.metric,
         };
-        let graph = GraphIndex::open(&idx_path, opts.dim, opts.metric)?.map(Arc::new);
-        let (wal, entries) = Wal::open(&path, header)?;
+        let inner = Self::load(&path, header, false)?;
+        // Index files no longer referenced: left by a crash between writing
+        // a new index and swapping the log, or by a checkpoint whose delete
+        // of the old index failed because a reader still mapped it.
+        Self::collect_orphans(&path, inner.snapshot);
+        Ok(Db {
+            path,
+            header,
+            opts,
+            inner: RwLock::new(inner),
+            checkpoint_lock: Mutex::new(()),
+            _file_lock: Some(file_lock),
+            read_only: false,
+        })
+    }
+
+    /// Open an existing store for reading while another process (or this
+    /// one) writes it. Takes no lock and writes no file. The view is a
+    /// prefix of the writer's history, brought up to date at the start of
+    /// every read (`refresh` forces it); writes fail with `Error::ReadOnly`.
+    pub fn open_read_only(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
+        let path = path.as_ref().to_path_buf();
+        let header = Header {
+            dim: opts.dim,
+            metric: opts.metric,
+        };
+        let inner = Self::load(&path, header, true)?;
+        Ok(Db {
+            path,
+            header,
+            opts,
+            inner: RwLock::new(inner),
+            checkpoint_lock: Mutex::new(()),
+            _file_lock: None,
+            read_only: true,
+        })
+    }
+
+    /// Read the log, find the index it names, replay the tail.
+    fn load(path: &Path, header: Header, read_only: bool) -> Result<Inner> {
+        let (wal, entries) = if read_only {
+            Wal::open_read_only(path, header)?
+        } else {
+            Wal::open(path, header)?
+        };
+        let snapshot = entries.iter().find_map(|e| match e {
+            Replayed::Snapshot { id } => Some(*id),
+            _ => None,
+        });
+        let graph = GraphIndex::open(&index_path_for(path, snapshot), header.dim, header.metric)?.map(Arc::new);
         let mut inner = Inner {
             wal,
             graph,
             tombstones: HashSet::new(),
-            delta: Flat::new(opts.metric),
+            delta: Flat::new(header.metric),
             delta_seq: HashMap::new(),
             meta: HashMap::new(),
             types: HashMap::new(),
             write_seq: 0,
             deletes_since_snapshot: None,
             log_entries: entries.len(),
+            snapshot,
         };
         if let Some(g) = &inner.graph {
             for (k, kind) in g.attr_kinds() {
@@ -391,18 +448,7 @@ impl Db {
             }
         }
         for e in entries {
-            match e {
-                Replayed::Insert {
-                    id,
-                    vector_off,
-                    meta,
-                } => inner.apply_insert(id, vector_off, meta),
-                Replayed::Delete { id } => inner.apply_delete(id),
-                Replayed::Meta { id, meta } => {
-                    inner.note_types(&meta);
-                    inner.meta.insert(id, Arc::new(meta));
-                }
-            }
+            inner.replay(e);
         }
         // Every live record must have a vector somewhere.
         for &id in inner.meta.keys() {
@@ -414,15 +460,57 @@ impl Db {
                 ));
             }
         }
-        Ok(Db {
-            path,
-            idx_path,
-            header,
-            opts,
-            inner: RwLock::new(inner),
-            checkpoint_lock: Mutex::new(()),
-            _file_lock: file_lock,
-        })
+        Ok(inner)
+    }
+
+    /// Delete index files other than the current one. Errors are ignored: a
+    /// reader in another process may still have one mapped (Windows refuses
+    /// the delete then), and the next writer open tries again.
+    fn collect_orphans(path: &Path, current: Option<u64>) {
+        let keep = index_path_for(path, current);
+        let Some(dir) = path.parent() else { return };
+        let Some(stem) = path.file_name().and_then(|n| n.to_str()) else { return };
+        let prefix = format!("{stem}.idx");
+        let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }) else { return };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let is_index = name == prefix || (name.starts_with(&prefix) && name[prefix.len()..].starts_with('.'));
+            if is_index && e.path() != keep {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        let _ = std::fs::remove_file(sidecar(path, ".vec.tmp"));
+    }
+
+    /// Bring a read-only view up to date with the writer: pick up appended
+    /// frames, or reload entirely after a checkpoint replaced the files.
+    /// Called by every read; a no-op for a writer.
+    pub fn refresh(&self) -> Result<()> {
+        if !self.read_only {
+            return Ok(());
+        }
+        let mut i = self.inner.write();
+        match i.wal.refresh(&self.path)? {
+            wal::Refresh::Appended(entries) => {
+                i.log_entries += entries.len();
+                for e in entries {
+                    i.replay(e);
+                }
+            }
+            wal::Refresh::Replaced => {
+                // The writer swaps the index before the log, so the log we
+                // see now names an index that exists.
+                *i = Self::load(&self.path, self.header, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Path of the current index file, if a checkpoint has produced one.
+    pub fn index_path(&self) -> Option<PathBuf> {
+        let i = self.inner.read();
+        i.graph.as_ref().map(|_| index_path_for(&self.path, i.snapshot))
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, Inner>> {
@@ -430,10 +518,14 @@ impl Db {
     }
 
     fn write(&self) -> Result<RwLockWriteGuard<'_, Inner>> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         Ok(self.inner.write())
     }
 
     pub fn len(&self) -> usize {
+        let _ = self.refresh();
         self.inner.read().len()
     }
 
@@ -447,11 +539,13 @@ impl Db {
 
     /// Number of records served from the in-RAM delta rather than the graph.
     pub fn delta_len(&self) -> usize {
+        let _ = self.refresh();
         self.inner.read().delta.len()
     }
 
     /// Shape of the on-disk graph index, or `None` before the first checkpoint.
     pub fn index_stats(&self) -> Option<IndexStats> {
+        let _ = self.refresh();
         let i = self.inner.read();
         i.graph.as_ref().map(|g| IndexStats {
             nodes: g.len(),
@@ -510,6 +604,7 @@ impl Db {
     }
 
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Metadata)> {
+        let _ = self.refresh();
         let i = self.inner.read();
         if let Some(off) = i.delta.offset(id) {
             let meta = i.meta.get(&id).map(|m| (**m).clone()).unwrap_or_default();
@@ -605,6 +700,7 @@ impl Db {
             });
         }
         let query = &*prepare(self.header.metric, query)?;
+        self.refresh()?;
         let i = self.read()?;
         // Without a filter the metadata map is never consulted: that lookup
         // ran once per visited node and was 6% of a warm query.
@@ -693,14 +789,22 @@ impl Db {
     /// never references a vector the index lacks. Only one checkpoint runs at
     /// a time; a second caller waits for the first.
     pub fn checkpoint(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         let _one_at_a_time = self.checkpoint_lock.lock();
         let dim = self.header.dim as usize;
+        // The new index gets its own file name; nothing is ever renamed over
+        // an index, so readers in other processes can keep the old one
+        // mapped (Windows refuses to replace a mapped file).
+        let snap_id = new_snapshot_id();
+        let idx_new = index_path_for(&self.path, Some(snap_id));
 
         // 1. Snapshot under a brief exclusive lock. For a rebuild, every live
         //    vector is written to a temp file; for an update, only the delta.
         //    The temp file is memory-mapped, so the build's working set, not
         //    the dataset, has to fit in RAM.
-        let vec_tmp = self.idx_path.with_extension("vec.tmp");
+        let vec_tmp = sidecar(&self.path, ".vec.tmp");
         let (ids, snap_seq, base, metas, old_graph) = {
             let mut i = self.write()?;
             i.wal.sync()?;
@@ -753,7 +857,6 @@ impl Db {
         };
 
         // 2. Build outside the lock. This is the slow part.
-        let idx_tmp = self.idx_path.with_extension("idx.tmp");
         let built = (|| -> Result<()> {
             // An empty snapshot is not mapped: Windows refuses to map a
             // zero-length file.
@@ -771,7 +874,7 @@ impl Db {
             let vectors: &[f32] = mmap.as_ref().map_or(&[], |m| bytemuck::cast_slice(m));
             match &base {
                 Some((graph, dead)) => graph::update_and_write(
-                    &idx_tmp,
+                    &idx_new,
                     graph,
                     dead,
                     &ids,
@@ -780,7 +883,7 @@ impl Db {
                     &meta_of,
                 ),
                 None => graph::build_and_write(
-                    &idx_tmp,
+                    &idx_new,
                     dim,
                     self.header.metric,
                     &ids,
@@ -794,34 +897,22 @@ impl Db {
         drop(old_graph);
         let _ = std::fs::remove_file(&vec_tmp);
         if let Err(e) = built {
-            let _ = std::fs::remove_file(&idx_tmp);
+            let _ = std::fs::remove_file(&idx_new);
             self.inner.write().deletes_since_snapshot = None;
             return Err(e);
         }
 
-        // 3. Swap files and reconcile with writes that happened meanwhile.
+        // 3. Swap the log and reconcile with writes that happened meanwhile.
         let mut i = self.write()?;
-        // Windows cannot replace a file that is still mapped, so the old
-        // index mapping goes first. We hold the write lock, so no reader has
-        // a reference, and `base` was dropped above. If the rename fails the
-        // old file is still there; reopen it so the store stays usable.
-        i.graph = None;
-        if let Err(e) = io_ctx(
-            std::fs::rename(&idx_tmp, &self.idx_path),
-            "replace index",
-            &self.idx_path,
-        ) {
-            i.graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)
-                .ok()
-                .flatten()
-                .map(Arc::new);
-            let _ = std::fs::remove_file(&idx_tmp);
-            return Err(e);
-        }
-        // Map the new file before the log swap so the log we write only names
-        // vectors the new index holds.
-        let graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)?
-            .ok_or(Error::Corrupt("index vanished after rename"))?;
+        let graph = match GraphIndex::open(&idx_new, self.header.dim, self.header.metric) {
+            Ok(Some(g)) => g,
+            Ok(None) => return Err(Error::Corrupt("index vanished after build")),
+            Err(e) => {
+                let _ = std::fs::remove_file(&idx_new);
+                return Err(e);
+            }
+        };
+        let old_index = index_path_for(&self.path, i.snapshot);
 
         let deleted = i.deletes_since_snapshot.take().unwrap_or_default();
         // Records written during the build survive in the delta; they are
@@ -851,17 +942,19 @@ impl Db {
             tombstones.insert(graph.slot(*id).unwrap());
         }
 
-        let log_tmp = self.path.with_extension("tmp");
+        let log_tmp = sidecar(&self.path, ".tmp");
         let survivor_ids: HashSet<u64> = survivors.iter().map(|(id, _)| *id).collect();
         let inserts = survivors.iter().map(|&(id, off)| Entry::Insert {
             id,
             vector: i.wal.vector_at(off).to_vec(),
             meta: (*i.meta[&id]).clone(),
         });
-        // Graph records' metadata lives in the new index's columns, so the
-        // compacted log holds only the survivors and the deletes.
+        // The compacted log names its index first; graph records' metadata
+        // lives in that index's columns, so the rest is the survivors and
+        // the deletes.
+        let names = std::iter::once(Entry::Snapshot { id: snap_id });
         let deletes = dead.iter().map(|&id| Entry::Delete { id });
-        let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(deletes))?;
+        let new_offs = wal::write_snapshot(&log_tmp, self.header, names.chain(inserts).chain(deletes))?;
         // Same Windows rule for the log: close the old one before replacing
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.
@@ -872,8 +965,8 @@ impl Db {
             &self.path,
         ) {
             let _ = std::fs::remove_file(&log_tmp);
+            let _ = std::fs::remove_file(&idx_new);
             i.wal = Wal::open(&self.path, self.header)?.0;
-            i.graph = Some(Arc::new(graph));
             return Err(e);
         }
         // Durability of the renames themselves. Directory fsync is a Unix
@@ -896,11 +989,19 @@ impl Db {
         }
         i.wal = wal;
         i.graph = Some(Arc::new(graph));
+        i.snapshot = Some(snap_id);
         i.tombstones = tombstones;
         i.delta = delta;
         i.delta_seq = delta_seq;
         i.meta.retain(|id, _| survivor_ids.contains(id));
-        i.log_entries = survivors.len() + dead.len();
+        i.log_entries = survivors.len() + dead.len() + 1;
+        drop(i);
+        // The previous index is unreferenced now. A reader elsewhere may
+        // still map it; then the delete fails here (Windows) and the next
+        // writer open collects it.
+        if old_index != idx_new {
+            let _ = std::fs::remove_file(&old_index);
+        }
         Ok(())
     }
 
@@ -926,6 +1027,23 @@ impl Db {
 }
 
 impl Inner {
+    /// Apply one replayed log frame.
+    fn replay(&mut self, e: Replayed) {
+        match e {
+            Replayed::Insert {
+                id,
+                vector_off,
+                meta,
+            } => self.apply_insert(id, vector_off, meta),
+            Replayed::Delete { id } => self.apply_delete(id),
+            Replayed::Meta { id, meta } => {
+                self.note_types(&meta);
+                self.meta.insert(id, Arc::new(meta));
+            }
+            Replayed::Snapshot { id } => self.snapshot = Some(id),
+        }
+    }
+
     /// Live records: graph slots not superseded, plus the delta.
     fn len(&self) -> usize {
         self.graph.as_ref().map_or(0, |g| g.len() - self.tombstones.len()) + self.delta.len()
@@ -1025,6 +1143,27 @@ impl Inner {
             indexed,
         )
     }
+}
+
+/// `<path>.idx.<16 hex digits>` for a numbered snapshot, `<path>.idx` otherwise.
+fn index_path_for(path: &Path, snapshot: Option<u64>) -> PathBuf {
+    match snapshot {
+        Some(id) => sidecar(path, &format!(".idx.{id:016x}")),
+        None => sidecar(path, ".idx"),
+    }
+}
+
+/// A fresh, non-zero snapshot id: time, pid and a counter, so two
+/// checkpoints never reuse a file name even within one nanosecond.
+fn new_snapshot_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mixed = (t ^ (u64::from(std::process::id()) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ c;
+    mixed.max(1)
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {

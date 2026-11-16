@@ -91,9 +91,7 @@ fn main() {
         db.checkpoint().unwrap();
         let build = t.elapsed();
         let stats = db.index_stats().unwrap();
-        let idx_bytes = fs::metadata(format!("{}.idx", path.display()))
-            .unwrap()
-            .len();
+        let idx_bytes = fs::metadata(db.index_path().unwrap()).unwrap().len();
         println!(
             "build: {build:.1?}  nodes={} pq_subspaces={} index={:.0} MB",
             stats.nodes,
