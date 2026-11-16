@@ -10,9 +10,9 @@ leaves the machine.
 ## Install and open
 
 ```bash
-cargo install sanadb-studio        # or a prebuilt binary from the GitHub release
-sanadb-studio data/vectors.sana
-# sanadb studio 0.2.2: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
+pip install "sanadb[studio]"       # the binary as a console script; or cargo install sanadb-studio,
+sanadb-studio data/vectors.sana    # or a prebuilt binary from the GitHub release
+# sanadb studio 0.2.3: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
 ```
 
 ```

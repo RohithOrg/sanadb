@@ -22,8 +22,9 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           crate=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           py=$(grep -m1 '^version' python/pyproject.toml | sed 's/.*"\(.*\)"/\1/')
-          echo "tag=$tag crate=$crate python=$py"
-          test "$tag" = "$crate" && test "$tag" = "$py"
+          st=$(grep -m1 '^version' studio/pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "tag=$tag crate=$crate python=$py studio=$st"
+          test "$tag" = "$crate" && test "$tag" = "$py" && test "$tag" = "$st"
 
   crate:
     name: crates.io
@@ -118,6 +119,18 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'native' }}
           path: python/dist
+      # The studio binary as its own wheel (`pip install "sanadb[studio]"`).
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: studio
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-studio-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'native' }}
+          path: studio/dist
 
   sdist:
     name: sdist

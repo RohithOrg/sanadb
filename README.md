@@ -13,6 +13,7 @@ search beside the vectors. One dependency, a few files, no server.
 ```bash
 cargo add sanadb      # Rust
 pip install sanadb    # Python: wheels for Linux (glibc, musl), macOS, Windows
+pip install "sanadb[studio]"   # plus the studio binary on your PATH
 ```
 
 ## What it is

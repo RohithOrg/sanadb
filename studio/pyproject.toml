@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sanadb-studio"
+version = "0.2.3"
+description = "Local web UI for a sanadb store: the sanadb-studio binary, installed as a console script"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Rust",
+  "Topic :: Database",
+]
+
+[project.urls]
+Repository = "https://github.com/RohithOrg/sanadb"
+Documentation = "https://rohithorg.github.io/sanadb/studio/"
+
+[tool.maturin]
+# The wheel is the `sanadb-studio` executable, nothing else: pip puts it on
+# the PATH like any console script.
+bindings = "bin"

@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/). Before 1.0,
 minor versions may change on-disk formats; when they do, this file says so and
 the new version migrates old stores on open.
 
+## [0.2.3] - 2026-11-16
+
+### Added
+- `pip install "sanadb[studio]"` installs the studio binary as a console
+  script: a second PyPI package, `sanadb-studio`, holds only the
+  executable (built by maturin from the binary crate, one wheel per
+  platform), and the `studio` extra of `sanadb` pins it to the same
+  version. `pip install sanadb` alone stays the library only.
+
 ## [0.2.2] - 2026-11-16
 
 Store properties, and the studio polish that followed 0.2.1. No format
