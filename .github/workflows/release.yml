@@ -6,9 +6,16 @@ name: Release
 # 0.2.2; from 0.2.3 PyPI refused the minted token for `sanadb`, so the
 # upload uses a token.
 #
-# "Run workflow" with an existing tag re-runs a release from this file as it
-# is on master, against the code at that tag: crates already on crates.io
-# are skipped, so a publish that failed half-way can be finished.
+# A tag push releases everything. "Run workflow" takes an existing tag and
+# four switches, so one part can be released or re-released on its own:
+# crates (sanadb and sanadb-studio on crates.io), python (wheels, sdist,
+# the two PyPI packages), studio (the prebuilt binaries and the GitHub
+# release that carries them), docs (the site). It runs this file as it is
+# on master against the code at that tag; crates and files already
+# published are skipped, so a publish that failed half-way can be
+# finished. The three version numbers always move together (the studio
+# crate and the Python extra pin the core version), so a partial release
+# still carries the tag's version.
 
 on:
   push:
@@ -18,6 +25,22 @@ on:
       tag:
         description: "existing tag to (re)publish, e.g. v0.2.4"
         required: true
+      crates:
+        description: "publish sanadb and sanadb-studio to crates.io"
+        type: boolean
+        default: true
+      python:
+        description: "build wheels and sdist, publish both packages to PyPI"
+        type: boolean
+        default: true
+      studio:
+        description: "build the studio binaries and create the GitHub release"
+        type: boolean
+        default: true
+      docs:
+        description: "deploy the documentation site"
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,6 +66,7 @@ jobs:
   crate:
     name: crates.io
     needs: check
+    if: github.event_name == 'push' || inputs.crates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +86,7 @@ jobs:
   studio-crate:
     name: crates.io (studio)
     needs: crate
+    if: github.event_name == 'push' || inputs.crates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +110,7 @@ jobs:
   studio-binaries:
     name: studio ${{ matrix.target }}
     needs: check
+    if: github.event_name == 'push' || inputs.studio
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -121,6 +147,7 @@ jobs:
   wheels:
     name: wheel ${{ matrix.os }} ${{ matrix.target }}
     needs: check
+    if: github.event_name == 'push' || inputs.python
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -169,6 +196,7 @@ jobs:
   sdist:
     name: sdist
     needs: check
+    if: github.event_name == 'push' || inputs.python
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -187,6 +215,7 @@ jobs:
   pypi:
     name: PyPI
     needs: [wheels, sdist]
+    if: github.event_name == 'push' || inputs.python
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -222,6 +251,9 @@ jobs:
   github-release:
     name: GitHub release
     needs: [crate, pypi, studio-binaries]
+    # Runs when the studio part is on and nothing that did run failed;
+    # skipped parts (crates or python off) do not hold it back.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (github.event_name == 'push' || inputs.studio) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -250,5 +282,19 @@ jobs:
           else
             gh release create "$TAG" --title "sanadb $TAG" --notes-file notes.md bins/*
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  docs:
+    name: Docs
+    needs: check
+    if: github.event_name == 'push' || inputs.docs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      # The site is built by docs.yml from master (README, CHANGELOG and
+      # docs/ as they are now); this just asks for a deploy.
+      - run: gh workflow run Docs --repo "$GITHUB_REPOSITORY" --ref master
         env:
           GH_TOKEN: ${{ github.token }}

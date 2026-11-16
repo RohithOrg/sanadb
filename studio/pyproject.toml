@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sanadb-studio"
-version = "0.2.4"
+version = "0.2.5"
 description = "Local web UI for a sanadb store: the sanadb-studio binary, installed as a console script"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

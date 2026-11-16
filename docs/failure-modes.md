@@ -3,7 +3,7 @@
 What goes wrong, what the library says, and what to do. Everything on
 this page was produced by running
 [`python/examples/failure_modes.py`](https://github.com/RohithOrg/sanadb/blob/master/python/examples/failure_modes.py)
-against a throwaway store on 16 November 2026 with sanadb 0.2.4; the
+against a throwaway store on 16 November 2026 with sanadb 0.2.5; the
 Rust errors are the same cases under their `Error` variant names. The
 guarantees these cases rest on are in [operating a store](operations.md).
 

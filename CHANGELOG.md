@@ -7,7 +7,15 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-16
+
+Studio grows a 3D map and graph exploration; the release workflow can
+release one part at a time.
+
 ### Changed
+- Release workflow: "Run workflow" takes switches for crates, python,
+  studio and docs, so one part can be released or re-released alone; a
+  tag push still releases everything.
 - Release workflow: PyPI uploads use an API token (`PYPI_API_TOKEN`)
   after trusted publishing refused the `sanadb` project from 0.2.3 on; the
   workflow can be run by hand for an existing tag, skipping crates already

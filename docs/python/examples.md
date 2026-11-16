@@ -1,7 +1,7 @@
 # Python examples
 
 Complete programs with the output they printed, run on 16 November 2026
-with sanadb 0.2.4. Every file is in the repository under
+with sanadb 0.2.5. Every file is in the repository under
 `python/examples/` and `benchmarks/`; copy one and change the data.
 
 ## Semantic search with a sentence-transformers model
