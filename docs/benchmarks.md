@@ -69,6 +69,8 @@ best of 2 runs. Queries per second at the nearest measured recall, higher is
 better; a blank cell means that configuration has no point within 0.01 of
 the row's recall. Raw CSVs: `benchmarks/ann-benchmarks/results/`.
 
+![recall against queries per second on SIFT1M](img/annb-sift-128-euclidean.svg)
+
 ### sift-128-euclidean
 
 1,000,000 SIFT vectors, dim 128, L2, their 10,000 queries.
@@ -82,6 +84,8 @@ the row's recall. Raw CSVs: `benchmarks/ann-benchmarks/results/`.
 | ~0.996 | 1,639 (0.997) | 2,011 (0.996) | 2,796 (0.998) | 3,849 (0.996) | 1,357 (0.997) | 1,642 (0.995) | 2,955 (0.996) | 1,716 (0.997) | 3,936 (0.997) |
 | ~0.999 | 922 (1.000) | 1,323 (0.999) | 1,425 (1.000) | 2,424 (0.999) | 749 (0.999) | 1,073 (0.999) | 1,689 (0.999) | 1,073 (0.999) | 2,353 (0.999) |
 | build | 209 s | 266 s | 132 s | 764 s* | 252 s | 311 s | 122 s | 118 s | 206 s |
+
+![recall against queries per second on GloVe](img/annb-glove-100-angular.svg)
 
 ### glove-100-angular
 
@@ -138,6 +142,8 @@ What the tables say:
 
 ## Filtered search
 
+![filtered search recall and latency by selectivity](img/filtered-sift1m.svg)
+
 `examples/filtered.rs`: every record gets four string labels with 10, 100,
 1,000 and 10,000 distinct values, so an equality filter on each passes 10%,
 1%, 0.1% and 0.01% of the set. 500 published queries, k=10, beam 64, warm;
@@ -169,6 +175,8 @@ passing nodes before it can stop; the beam is the knob, measured at 10%:
 
 The post-filter closure path never passes 0.80 at any beam on this filter.
 
+![YFCC filter track recall by match count](img/filtered-yfcc.svg)
+
 Real label sets: the big-ann-benchmarks filter track (YFCC100M, CLIP
 embeddings as uint8, dim 192, 8.8 labels per record, queries asking for one
 or two labels). `examples/yfcc.rs` on the first 1,000,000 records, 500
@@ -193,6 +201,8 @@ for wider vectors. The full 10M set is not run here: its ground truth is
 published, but building it takes an hour on this laptop.
 
 ## Cold cache, 5M vectors from SIFT1B
+
+![cold latency by configuration](img/cold-5m.svg)
 
 First 5,000,000 vectors of big-ann-benchmarks "bigann" (uint8, dim 128, L2),
 the first 1000 public queries, ground truth by brute force. The 3.5 GB index

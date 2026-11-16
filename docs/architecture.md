@@ -5,6 +5,22 @@ graph index named by the log's first frame (a new file per checkpoint, so an
 index is never overwritten while a reader maps it), `<path>.lock` an empty
 file that is `flock`ed while a writer has the store open.
 
+```mermaid
+flowchart LR
+    W[writer process] -- append frame --> LOG["&lt;path&gt;<br/>write-ahead log"]
+    LOG -. names .-> IDX["&lt;path&gt;.idx.&lt;id&gt;<br/>graph index, mmap"]
+    W -- checkpoint --> NEW["&lt;path&gt;.idx.&lt;new id&gt;"]
+    NEW -- "rename log → names new id" --> LOG
+    IDX -- "deleted after the swap" --> X((" "))
+    R1[reader process] -. mmap .-> IDX
+    R1 -. tails .-> LOG
+    style X fill:none,stroke:none
+```
+
+A checkpoint never writes into a file a reader may be mapping: the new
+index gets a new name, the compacted log replaces the old one by rename,
+and the previous index is deleted once nothing names it.
+
 ## Log
 
 CRC-framed records: insert (id, vector, metadata), delete (id), and
@@ -34,6 +50,20 @@ The walk expands several candidates per step and
 asks the kernel to prefetch all their blocks first (`madvise(WILLNEED)`), so a
 cold query overlaps its disk reads instead of taking one page fault at a time.
 `Options::io_width`, default 4.
+
+## Search path
+
+```mermaid
+flowchart TD
+    Q[query vector] --> G[graph walk<br/>mmap blocks, PQ codes in RAM]
+    Q --> D[delta scan<br/>records since the last checkpoint,<br/>vectors read from the mapped log]
+    G --> T{tombstoned?}
+    T -- no --> M[merge by distance]
+    T -- yes --> drop(( ))
+    D --> M
+    M --> K[top k]
+    style drop fill:none,stroke:none
+```
 
 ## Delta and tombstones
 
@@ -71,6 +101,15 @@ expanded for navigation but only passing nodes take result slots, so a 1%
 filter costs a longer walk rather than repeated widened walks. Closure
 filters cannot be inspected and keep the old path: applied to visited nodes,
 beam doubled until `k` pass, up to `max_search_beam`.
+
+```mermaid
+flowchart TD
+    F[Filter expression] --> P[predicate on the index columns<br/>posting lists give a match estimate]
+    P --> E{estimate ≤ exact_filter_scan?}
+    E -- "yes: rare filter" --> S[read every matching block,<br/>rank exactly, recall 1.0]
+    E -- "no: common filter" --> W[graph walk steered by the filter:<br/>rejected nodes navigate, passing nodes fill the result]
+    C[closure filter] --> V[plain walk, filter applied to visited nodes,<br/>beam doubled until k pass]
+```
 
 ## Concurrency
 

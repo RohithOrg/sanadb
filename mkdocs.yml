@@ -10,7 +10,14 @@ theme:
     - scheme: slate
       toggle: { icon: material/brightness-4, name: Light }
   features: [navigation.sections, content.code.copy]
-markdown_extensions: [tables, fenced_code, toc]
+markdown_extensions:
+  - tables
+  - toc
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
 nav:
   - Overview: index.md
   - How it works: architecture.md

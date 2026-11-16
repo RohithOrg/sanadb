@@ -43,6 +43,23 @@ On Windows a reader that still maps the previous index keeps the writer
 from deleting it; the next writer open removes index files the log no
 longer names.
 
+How a read-only handle keeps up, checked before every read:
+
+```mermaid
+sequenceDiagram
+    participant W as writer
+    participant L as log file
+    participant R as reader
+    W->>L: append insert / delete frames
+    R->>L: size and identity unchanged?
+    L-->>R: grew by N bytes
+    R->>R: replay the new frames into its tail
+    W->>L: checkpoint: new index, log replaced by rename
+    R->>L: size and identity unchanged?
+    L-->>R: different file (new inode)
+    R->>R: reload: map the new index, re-read the log
+```
+
 ## Backup and replication
 
 `backup(dir)` writes a consistent point-in-time copy (the index file plus
