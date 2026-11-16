@@ -2040,3 +2040,139 @@ fn int8_storage_keeps_recall_and_shrinks_the_index() {
                 .ends_with(".f32.tmp"))
     );
 }
+
+/// Random operations against an in-memory model: inserts, overwrites,
+/// deletes, atomic batches, checkpoints, reopens, and a read-only reader
+/// that must agree with the writer after every step. Exact reads (`get`,
+/// `len`, filtered exact scans) must match the model exactly; the
+/// approximate search must never return a record the model does not hold.
+#[test]
+fn random_operations_agree_with_a_model() {
+    use sanadb::{Batch, Filter};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.sana");
+    let dim = 6usize;
+    let mut model: HashMap<u64, (Vec<f32>, Metadata)> = HashMap::new();
+    let mut rng = 0xA11CEu64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut db = Db::open(&path, Options::new(dim as u32).exact_filter_scan(100_000)).unwrap();
+    let reader = Db::open_read_only(&path, Options::new(dim as u32).exact_filter_scan(100_000)).unwrap();
+    let mk_meta = |i: u64| -> Metadata {
+        let mut m = Metadata::new();
+        m.insert("g".into(), Value::from((i % 7) as i64));
+        m.insert("s".into(), Value::from(["x", "y", "z"][(i % 3) as usize]));
+        if i % 5 == 0 {
+            m.insert("flag".into(), Value::from(true));
+        }
+        m
+    };
+    let check = |db: &Db, model: &HashMap<u64, (Vec<f32>, Metadata)>, step: usize, who: &str| {
+        assert_eq!(db.len(), model.len(), "{who} step {step}: len");
+        for (&id, (v, m)) in model.iter().take(40) {
+            let (gv, gm) = db.get(id).unwrap_or_else(|| panic!("{who} step {step}: {id} missing"));
+            assert_eq!(&gv, v, "{who} step {step}: vector of {id}");
+            assert_eq!(&gm, m, "{who} step {step}: metadata of {id}");
+        }
+        for id in [1u64, 7, 99, 100_000, 5_000_000] {
+            assert_eq!(db.get(id).is_some(), model.contains_key(&id), "{who} step {step}: presence of {id}");
+        }
+        // Exact filtered search over a group: the result set must equal the
+        // model's k nearest within that group (scan regime, cap raised).
+        let q = vec_of(dim, 42 + step as u64);
+        let g = (step % 7) as i64;
+        let want: Vec<u64> = {
+            let mut d: Vec<(f32, u64)> = model
+                .iter()
+                .filter(|(_, (_, m))| m["g"] == Value::Int(g))
+                .map(|(&id, (v, _))| (q.iter().zip(v).map(|(a, b)| (a - b) * (a - b)).sum(), id))
+                .collect();
+            d.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            d.into_iter().take(5).map(|e| e.1).collect()
+        };
+        let got: Vec<u64> = db.search_where(&q, 5, &Filter::eq("g", g)).unwrap().iter().map(|h| h.id).collect();
+        if db.index_stats().is_some() {
+            assert_eq!(got, want, "{who} step {step}: exact filtered search for g={g}");
+        }
+        for h in db.search(&q, 10).unwrap() {
+            assert!(model.contains_key(&h.id), "{who} step {step}: search returned deleted {}", h.id);
+        }
+    };
+    let mut next_id = 0u64;
+    for step in 0..120 {
+        match next() % 10 {
+            0..=3 => {
+                // Fresh inserts.
+                for _ in 0..1 + next() % 40 {
+                    let id = next_id;
+                    next_id += 1;
+                    let v = vec_of(dim, id);
+                    db.insert(id, &v, mk_meta(id)).unwrap();
+                    model.insert(id, (v, mk_meta(id)));
+                }
+            }
+            4 => {
+                // Overwrite existing ids with new vectors and metadata.
+                let ids: Vec<u64> = model.keys().copied().take(10).collect();
+                for id in ids {
+                    let v = vec_of(dim, id + 1_000_000);
+                    let mut m = mk_meta(id);
+                    m.insert("s".into(), Value::from("w"));
+                    db.insert(id, &v, m.clone()).unwrap();
+                    model.insert(id, (v, m));
+                }
+            }
+            5 => {
+                let ids: Vec<u64> = model.keys().copied().take(7).collect();
+                for id in ids {
+                    assert!(db.delete(id).unwrap());
+                    model.remove(&id);
+                }
+                assert!(!db.delete(777_777).unwrap());
+            }
+            6 => {
+                // One atomic batch mixing all three.
+                let mut b = Batch::new();
+                let del: Vec<u64> = model.keys().copied().take(3).collect();
+                for &id in &del {
+                    b = b.delete(id);
+                }
+                for _ in 0..5 {
+                    let id = next_id;
+                    next_id += 1;
+                    b = b.insert(id, &vec_of(dim, id), mk_meta(id));
+                }
+                db.write_batch(b).unwrap();
+                for id in del {
+                    model.remove(&id);
+                }
+                for id in next_id - 5..next_id {
+                    model.insert(id, (vec_of(dim, id), mk_meta(id)));
+                }
+            }
+            7 => {
+                db.checkpoint().unwrap();
+            }
+            8 => {
+                // Reopen the writer; the reader stays attached throughout.
+                drop(db);
+                db = Db::open(&path, Options::new(dim as u32).exact_filter_scan(100_000)).unwrap();
+            }
+            _ => {
+                // A batch that must fail leaves everything untouched.
+                let id = next_id + 10;
+                let r = db.write_batch(Batch::new().insert(id, &vec_of(dim, id), mk_meta(id)).insert(id + 1, &[1.0; 6], HashMap::from([("g".to_string(), Value::from("bad type"))])));
+                assert!(matches!(r, Err(sanadb::Error::TypeMismatch { .. })));
+                assert!(db.get(id).is_none());
+            }
+        }
+        check(&db, &model, step, "writer");
+        check(&reader, &model, step, "reader");
+    }
+    eprintln!("model test: {} live records after 120 steps, {} ids allocated", model.len(), next_id);
+    assert!(model.len() > 200);
+}
