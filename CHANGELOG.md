@@ -7,6 +7,14 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Added
+- studio: a 3D map. The server computes a third principal component and
+  the share of variance each axis carries; the page has a 2D / 3D switch,
+  orbit by drag, zoom, shift-drag pan, a slow idle rotation that stops on
+  touch and is off under reduced motion, and draws the walk, results,
+  query, labels and hover in space. `/api/map` points gain a `z`,
+  `/api/search` returns `query_xyz`, `/api/labels` a `z` per cluster.
+
 ## [0.2.4] - 2026-11-16
 
 The release that reaches PyPI: 0.2.3 published to crates.io but its PyPI

@@ -152,18 +152,18 @@ struct App {
     embed: Option<Embedder>,
     /// Where `add` stores the text it embedded: the text field, else `text`.
     text_key: String,
-    /// PCA basis of the last map: mean, two components, and the sampled
-    /// points, so later searches can be projected onto the same plane.
+    /// PCA basis of the last map: mean, three components, and the sampled
+    /// points, so later searches can be projected onto the same axes.
     map: Mutex<Option<MapState>>,
 }
 
 struct MapState {
     mean: Vec<f32>,
-    axes: [Vec<f32>; 2],
+    axes: [Vec<f32>; 3],
     scale: f32,
     points: J,
-    /// The sampled records' metadata and cluster, for labelling clusters.
-    sampled: Vec<(sanadb::Metadata, usize, f32, f32)>,
+    /// The sampled records' metadata, cluster and position, for labelling clusters.
+    sampled: Vec<(sanadb::Metadata, usize, [f32; 3])>,
 }
 
 fn main() {
@@ -628,9 +628,10 @@ fn hits_json(app: &App, hits: &[Hit], with_meta: bool) -> Vec<J> {
                     o["meta"] = meta_json(&m);
                 }
                 if let Some(s) = st.as_ref() {
-                    let (x, y) = project(s, &v);
+                    let [x, y, z] = project(s, &v);
                     o["x"] = json!(x);
                     o["y"] = json!(y);
+                    o["z"] = json!(z);
                 }
             }
             o
@@ -745,7 +746,7 @@ fn search(app: &App, body: &str) -> Result<J, String> {
         "micros": micros,
         "hits": hits_json(app, &hits, true),
         "walk": hits_json(app, &walk, false),
-        "query_xy": vector.as_ref().and_then(|v| app.map.lock().unwrap().as_ref().map(|s| project(s, v))),
+        "query_xyz": vector.as_ref().and_then(|v| app.map.lock().unwrap().as_ref().map(|s| project(s, v))),
     }))
 }
 
@@ -815,20 +816,20 @@ fn note_model(app: &App, e: &Embedder) {
     }
 }
 
-fn project(s: &MapState, v: &[f32]) -> (f32, f32) {
-    let mut x = 0.0;
-    let mut y = 0.0;
+fn project(s: &MapState, v: &[f32]) -> [f32; 3] {
+    let mut out = [0f32; 3];
     for (i, &c) in v.iter().enumerate() {
         let d = c - s.mean[i];
-        x += d * s.axes[0][i];
-        y += d * s.axes[1][i];
+        for (o, axis) in out.iter_mut().zip(&s.axes) {
+            *o += d * axis[i];
+        }
     }
-    (x / s.scale, y / s.scale)
+    out.map(|c| c / s.scale)
 }
 
-/// A sample of up to `n` records: PCA to two dimensions (power iteration
-/// on the sample covariance) and k-means colours. Cached until the next
-/// call with a different `n`.
+/// A sample of up to `n` records: PCA to three dimensions (power iteration
+/// on the sample covariance; the page draws two or all three) and k-means
+/// colours on the first two. Cached until the next call with a different `n`.
 fn map(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
     let n: usize = q
         .get("n")
@@ -886,31 +887,40 @@ fn map(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
         .iter()
         .map(|v| v.iter().zip(&mean).map(|(a, b)| a - b).collect())
         .collect();
-    let axes = [
-        pca_axis(&centred, None),
-        pca_axis(&centred, Some(&pca_axis(&centred, None))),
-    ];
-    let coords: Vec<(f32, f32)> = centred
+    let a0 = pca_axis(&centred, &[]);
+    let a1 = pca_axis(&centred, std::slice::from_ref(&a0));
+    let a2 = pca_axis(&centred, &[a0.clone(), a1.clone()]);
+    let axes = [a0, a1, a2];
+    let coords: Vec<[f32; 3]> = centred
         .iter()
-        .map(|v| (dot(v, &axes[0]), dot(v, &axes[1])))
+        .map(|v| [dot(v, &axes[0]), dot(v, &axes[1]), dot(v, &axes[2])])
         .collect();
+    // The share of the sample's variance each axis carries: how much of
+    // the data the picture shows.
+    let total_var: f32 = centred.iter().map(|v| dot(v, v)).sum::<f32>() / m;
+    let variance: Vec<f32> = (0..3)
+        .map(|k| coords.iter().map(|c| c[k] * c[k]).sum::<f32>() / m / total_var.max(1e-12))
+        .collect();
+    // The scale comes from the first two axes so the 2-D view is unchanged
+    // by the third; z is on the same scale.
     let scale = coords
         .iter()
-        .map(|(x, y)| x.abs().max(y.abs()))
+        .map(|c| c[0].abs().max(c[1].abs()))
         .fold(1e-6f32, f32::max);
-    let labels = kmeans(&coords, clusters);
+    let flat: Vec<(f32, f32)> = coords.iter().map(|c| (c[0], c[1])).collect();
+    let labels = kmeans(&flat, clusters);
     let points: Vec<J> = kept
         .iter()
         .zip(&coords)
         .zip(&labels)
-        .map(|((id, (x, y)), c)| json!([id, x / scale, y / scale, c]))
+        .map(|((id, c), k)| json!([id, c[0] / scale, c[1] / scale, c[2] / scale, k]))
         .collect();
-    let out = json!({"n": n, "clusters": clusters, "sampled": kept.len(), "total": all.len(), "points": points});
+    let out = json!({"n": n, "clusters": clusters, "sampled": kept.len(), "total": all.len(), "variance": variance, "points": points});
     let sampled = metas
         .into_iter()
         .zip(&coords)
         .zip(&labels)
-        .map(|((m, (x, y)), c)| (m, *c, x / scale, y / scale))
+        .map(|((m, c), k)| (m, *k, c.map(|x| x / scale)))
         .collect();
     *app.map.lock().unwrap() = Some(MapState {
         mean,
@@ -932,14 +942,15 @@ fn labels(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
     let mut out = Vec::new();
     for c in 0..clusters {
         let mut counts: HashMap<String, usize> = HashMap::new();
-        let (mut n, mut sx, mut sy) = (0usize, 0f32, 0f32);
-        for (m, mc, x, y) in &st.sampled {
+        let (mut n, mut sx, mut sy, mut sz) = (0usize, 0f32, 0f32, 0f32);
+        for (m, mc, [x, y, z]) in &st.sampled {
             if *mc != c {
                 continue;
             }
             n += 1;
             sx += x;
             sy += y;
+            sz += z;
             if let Some(v) = m.get(key.as_str()) {
                 let text = match v {
                     Value::Sparse(p) => format!("sparse[{}]", p.len()),
@@ -953,7 +964,7 @@ fn labels(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
         }
         let best = counts.into_iter().max_by_key(|(_, k)| *k);
         out.push(json!({
-            "cluster": c, "size": n, "x": sx / n as f32, "y": sy / n as f32,
+            "cluster": c, "size": n, "x": sx / n as f32, "y": sy / n as f32, "z": sz / n as f32,
             "value": best.as_ref().map(|(v, _)| v.clone()),
             "share": best.as_ref().map_or(0.0, |(_, k)| *k as f64 / n as f64),
         }));
@@ -1007,19 +1018,22 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Leading eigenvector of the sample covariance by power iteration,
-/// orthogonal to `against` when given.
-fn pca_axis(rows: &[Vec<f32>], against: Option<&Vec<f32>>) -> Vec<f32> {
+/// orthogonal to every axis in `against`.
+fn pca_axis(rows: &[Vec<f32>], against: &[Vec<f32>]) -> Vec<f32> {
     let dim = rows[0].len();
     let mut v: Vec<f32> = (0..dim)
         .map(|i| ((i * 7919) % 13) as f32 / 13.0 - 0.5)
         .collect();
-    for _ in 0..30 {
-        if let Some(o) = against {
-            let p = dot(&v, o);
+    let deflate = |v: &mut Vec<f32>| {
+        for o in against {
+            let p = dot(v, o);
             for (a, b) in v.iter_mut().zip(o) {
                 *a -= p * b;
             }
         }
+    };
+    for _ in 0..30 {
+        deflate(&mut v);
         let mut next = vec![0f32; dim];
         for r in rows {
             let p = dot(r, &v);
@@ -1033,11 +1047,8 @@ fn pca_axis(rows: &[Vec<f32>], against: Option<&Vec<f32>>) -> Vec<f32> {
         }
         v = next;
     }
-    if let Some(o) = against {
-        let p = dot(&v, o);
-        for (a, b) in v.iter_mut().zip(o) {
-            *a -= p * b;
-        }
+    if !against.is_empty() {
+        deflate(&mut v);
         let norm = dot(&v, &v).sqrt().max(1e-12);
         for a in v.iter_mut() {
             *a /= norm;

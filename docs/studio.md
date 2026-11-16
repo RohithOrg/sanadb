@@ -121,6 +121,25 @@ pan, hover a point for its id, click a point to inspect it. Searches are
 projected onto the same plane as the map, so a walk that heads across the
 map before settling is a real property of the graph, not of the drawing.
 
+### In three dimensions
+
+![the same walk in three dimensions](img/studio-9-3d.png)
+
+The 2D / 3D switch at the top right of the map adds the third principal
+component and turns the map into a cloud you can orbit by dragging and
+zoom with the wheel (shift-drag pans). The walk, the results, the query
+ring, cluster labels, hover and click all work the same way in space,
+and the transport bar drives the same animation. Left alone, the cloud
+turns slowly so the depth reads on a still screen; it stops when you
+touch it and never starts under a reduced-motion setting. The map title
+says how much of the sample's variance the shown components carry.
+
+What 3D does not change: three components of a 128- or 768-dimensional
+vector are still a projection, and two points that look close on screen
+can be far apart in the store. Use the view to see which regions exist,
+where a query landed and how a walk moved between them, not to judge
+distances; the score column is the distance.
+
 ## 4. Inspect and edit a record
 
 ![results table and the record panel](img/studio-4-results-record.png)
