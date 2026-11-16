@@ -65,6 +65,17 @@ fn main() {
     println!("checkpoint (build) of {n}: {:.2?}", t.elapsed());
 
     let queries: Vec<f32> = (0..1000 * dim).map(|_| rnd()).collect();
+    // Warm the page cache: right after a build the index's pages may have
+    // been written back and evicted, and the first queries would pay for
+    // page faults, not the walk. The README numbers are warm.
+    let idx = db.index_path().unwrap();
+    let t = Instant::now();
+    let bytes = std::fs::read(&idx).unwrap().len();
+    println!(
+        "warm the index: {} MB read in {:.2?}",
+        bytes / 1_000_000,
+        t.elapsed()
+    );
     let t = Instant::now();
     for q in queries.chunks(dim) {
         db.search(q, 10).unwrap();

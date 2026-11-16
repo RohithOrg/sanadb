@@ -100,6 +100,30 @@ subspaces, tombstones, storage. The Cargo feature `tracing` emits events on
 target `sanadb` for checkpoints, failed checkpoints, reader reloads and
 orphan index files removed at open.
 
+## Throughput
+
+`examples/throughput.rs` on 1,000,000 random 128-dim vectors with one
+`Int` metadata key, same laptop, fsync off (the default), index warm:
+
+| | |
+|---|---|
+| insert one by one | 512,000 records/s |
+| insert in atomic batches of 10,000 | 907,000 records/s |
+| checkpoint (graph build, all cores) | 101 s |
+| `search`, one query at a time | 208 µs |
+| `search_many`, 1,000 queries on all cores | 25,800 queries/s |
+| read-only handle, `search` (refresh check included) | 244 µs |
+| read-only handle, `get` | 10.5 µs |
+| writer handle, `get` | 0.19 µs |
+
+Random vectors are the hard case for the graph (there is no structure to
+walk), so the per-query figures are above SIFT's; the point of the table
+is the write rates, the cost of a batch against single frames, and what a
+reader's per-read refresh check costs beside the writer's direct access.
+A `get` on a reader is slower because it reads the metadata from the
+index's columns and checks the log for changes; the writer answers from
+its map.
+
 ## Knobs
 
 | option | default | effect |
