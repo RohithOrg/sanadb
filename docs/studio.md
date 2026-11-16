@@ -103,9 +103,13 @@ score; both are ranks more than distances.
 ![the map with the walk of one search](img/studio-3-walk.png)
 
 The white ring is the query. The amber trail is every node the graph walk
-expanded, in the order it expanded them, older segments dimmer; the
-counter at the top right shows how far the replay is and Replay runs it
-again. The blue-ringed points are the results. Scroll to zoom, drag to
+expanded, in the order it expanded them: each segment carries an arrowhead
+in the direction the walk went, the first twelve expansions are numbered,
+the latest one is marked, and older segments fade. The transport bar
+under the map title plays the walk at ¼× to 4×, pauses it, steps one
+expansion at a time, replays from the start, and has a scrubber you can
+drag; space, left and right arrow do the same from the keyboard. The
+blue-ringed points are the results. Scroll to zoom, drag to
 pan, hover a point for its id, click a point to inspect it. Searches are
 projected onto the same plane as the map, so a walk that heads across the
 map before settling is a real property of the graph, not of the drawing.

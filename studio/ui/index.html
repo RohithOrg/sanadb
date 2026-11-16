@@ -107,10 +107,13 @@ main{position:relative;background:var(--stage);overflow:hidden;min-height:0}
 canvas{display:block;width:100%;height:100%;cursor:crosshair}
 .hud{position:absolute;font-size:12px;color:var(--stage-ink);background:rgba(12,19,34,.78);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.09);border-radius:var(--r);padding:5px 9px}
 .hud b{color:#fff;font:12px var(--mono);font-weight:500}
-.hud.title{left:12px;top:10px;white-space:nowrap;max-width:calc(100% - 300px);overflow:hidden;text-overflow:ellipsis}
-.hud.walk{right:12px;top:10px;display:flex;align-items:center;gap:10px}
+.hud.title{left:12px;top:10px;white-space:nowrap;max-width:calc(100% - 24px);overflow:hidden;text-overflow:ellipsis}
+.hud.walk{left:12px;top:42px;display:flex;align-items:center;gap:8px}
 .hud.walk[hidden]{display:none}
 .hud.walk .step{font:12px var(--mono);color:var(--walk);min-width:7.5em;text-align:right}
+.hud.walk input[type=range]{width:150px;accent-color:var(--walk);margin:0 2px}
+.hud.walk select{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.22);border-radius:var(--r);font:12px var(--sans);padding:2px 4px;height:24px}
+.hud.walk select option{color:#0B1220}
 .hud.walk button{height:24px;padding:0 8px;font-size:12px;background:transparent;color:var(--stage-ink);border-color:rgba(255,255,255,.22)}
 .hud.walk button:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.4)}
 .hud.legend{left:12px;bottom:10px;display:flex;gap:14px;align-items:center;color:var(--stage-muted);white-space:nowrap}
@@ -242,7 +245,13 @@ footer b{color:var(--ink);font:12px var(--mono);font-weight:500}
     <canvas id="map"></canvas>
     <div class="hud title" id="maptitle">Building the map…</div>
     <div class="hud walk" id="walkctl" hidden>
-      <span>walk</span><span class="step" id="walkstep"></span><button id="replay">Replay</button>
+      <span>walk</span>
+      <input type="range" id="scrub" min="0" max="1" value="0" step="1" aria-label="walk position">
+      <span class="step" id="walkstep"></span>
+      <button id="playpause" title="play / pause">Pause</button>
+      <button id="stepfwd" title="one expansion forward">Step</button>
+      <button id="replay" title="from the start">Replay</button>
+      <select id="speed" title="animation speed"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
     </div>
     <div class="hud empty" id="mapempty" hidden>Search from a record to see its neighbours and the path the graph walk took to reach them.</div>
     <div class="hud legend">
@@ -605,25 +614,48 @@ function draw() {
     }
   }
   // walk: trail in expansion order up to the animation step, older segments dimmer
-  const n = anim.running ? anim.t : result.walk.length;
+  const n = result.walk.length ? anim.t : 0;
   if (n > 0) {
     let prev = null;
+    ctx.lineCap = "round";
     for (let i = 0; i < n; i++) {
       const p = result.walk[i]; if (p.x === undefined) continue;
       const [sx, sy] = toScreen(p.x, p.y);
       const age = (n - i) / Math.max(1, n);
-      if (prev) { ctx.strokeStyle = "#FF8A3D"; ctx.globalAlpha = 0.18 + 0.5 * (1 - age); ctx.lineWidth = 1.1 * dpr; ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(sx, sy); ctx.stroke(); }
-      ctx.globalAlpha = 0.45 + 0.55 * (1 - age);
+      const alpha = 0.25 + 0.6 * (1 - age);
+      if (prev) {
+        // segment with an arrowhead pointing the way the walk went
+        ctx.strokeStyle = "#FF8A3D"; ctx.globalAlpha = alpha; ctx.lineWidth = 1.2 * dpr;
+        ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(sx, sy); ctx.stroke();
+        const dx = sx - prev[0], dy = sy - prev[1], len = Math.hypot(dx, dy);
+        if (len > 14 * dpr) {
+          const ux = dx / len, uy = dy / len, ax = sx - ux * 5 * dpr, ay = sy - uy * 5 * dpr, w = 3.2 * dpr;
+          ctx.fillStyle = "#FF8A3D";
+          ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ax - uy * w, ay + ux * w); ctx.lineTo(ax + uy * w, ay - ux * w); ctx.closePath(); ctx.fill();
+        }
+      }
+      ctx.globalAlpha = alpha;
       ctx.fillStyle = "#FF8A3D"; ctx.beginPath(); ctx.arc(sx, sy, 2.6 * dpr, 0, Math.PI * 2); ctx.fill();
       prev = [sx, sy];
     }
     ctx.globalAlpha = 1;
-    if (anim.running && prev) { // head
+    // the order of the first expansions, numbered, and the last one
+    ctx.font = `${10.5 * dpr}px "IBM Plex Mono", ui-monospace, monospace`; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    const label = (i) => {
+      const p = result.walk[i]; if (!p || p.x === undefined) return;
+      const [sx, sy] = toScreen(p.x, p.y);
+      const t = String(i + 1), w = ctx.measureText(t).width + 6 * dpr;
+      ctx.fillStyle = "rgba(12,19,34,.85)"; ctx.beginPath(); ctx.roundRect(sx + 5 * dpr, sy - 7 * dpr, w, 14 * dpr, 3 * dpr); ctx.fill();
+      ctx.fillStyle = "#FFB37A"; ctx.fillText(t, sx + 8 * dpr, sy);
+    };
+    for (let i = 0; i < Math.min(n, 12); i++) label(i);
+    if (n > 12) label(n - 1);
+    if (prev) { // head
       ctx.fillStyle = "rgba(255,138,61,.25)"; ctx.beginPath(); ctx.arc(prev[0], prev[1], 9 * dpr, 0, Math.PI * 2); ctx.fill();
       ctx.fillStyle = "#FFB37A"; ctx.beginPath(); ctx.arc(prev[0], prev[1], 4 * dpr, 0, Math.PI * 2); ctx.fill();
     }
   }
-  if (!anim.running) for (const hh of result.hits) {
+  if (!anim.running || anim.t >= anim.total) for (const hh of result.hits) {
     if (hh.x === undefined) continue;
     const [sx, sy] = toScreen(hh.x, hh.y);
     ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(sx, sy, 4.2 * dpr, 0, Math.PI * 2); ctx.fill();
@@ -641,21 +673,47 @@ function draw() {
     if (p) { const [x, y] = Array.isArray(p) ? [p[1], p[2]] : [p.x, p.y]; if (x !== undefined) { const [sx, sy] = toScreen(x, y); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5 * dpr; ctx.setLineDash([3 * dpr, 3 * dpr]); ctx.beginPath(); ctx.arc(sx, sy, 10 * dpr, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); } }
   }
 }
-function startAnim() {
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) { anim = {t: result.walk.length, total: result.walk.length, running: false}; $("walkstep").textContent = `${anim.total} / ${anim.total}`; draw(); return; }
-  anim = {t: 0, total: result.walk.length, running: true};
-  const frames = 110, start = performance.now();
+/* walk animation: `anim.t` expansions are drawn; play advances it at
+   `speed` × 40 expansions per second, scrub and step set it directly. */
+function setT(t) {
+  anim.t = Math.max(0, Math.min(anim.total, Math.round(t)));
+  $("scrub").value = anim.t;
+  $("walkstep").textContent = `${anim.t} / ${anim.total}`;
+  draw();
+}
+function play() {
+  if (anim.total === 0) return;
+  if (anim.t >= anim.total) anim.t = 0;
+  anim.running = true; $("playpause").textContent = "Pause";
+  let last = performance.now(), acc = anim.t;
   function tick(now) {
-    const u = Math.min(1, (now - start) / (frames * 16.7));
-    const eased = 1 - Math.pow(1 - u, 2.2);
-    anim.t = Math.max(1, Math.round(eased * anim.total));
-    $("walkstep").textContent = `${anim.t} / ${anim.total}`;
-    draw();
-    if (u < 1) requestAnimationFrame(tick); else { anim.running = false; draw(); }
+    if (!anim.running) return;
+    const rate = 40 * (+$("speed").value || 1);
+    acc += (now - last) / 1000 * rate; last = now;
+    setT(acc);
+    if (anim.t >= anim.total) { anim.running = false; $("playpause").textContent = "Play"; draw(); return; }
+    requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
 }
+function pause() { anim.running = false; $("playpause").textContent = "Play"; draw(); }
+function startAnim() {
+  anim = {t: 0, total: result.walk.length, running: false};
+  $("scrub").max = anim.total; setT(0);
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) { setT(anim.total); $("playpause").textContent = "Play"; return; }
+  play();
+}
 $("replay").onclick = startAnim;
+$("playpause").onclick = () => anim.running ? pause() : play();
+$("stepfwd").onclick = () => { pause(); setT(anim.t + 1); };
+$("scrub").oninput = (e) => { pause(); setT(+e.target.value); };
+$("speed").onchange = () => { if (anim.running) { pause(); play(); } };
+window.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT" || !result.walk.length) return;
+  if (e.key === " ") { e.preventDefault(); anim.running ? pause() : play(); }
+  if (e.key === "ArrowRight") { pause(); setT(anim.t + 1); }
+  if (e.key === "ArrowLeft") { pause(); setT(anim.t - 1); }
+});
 canvas.addEventListener("wheel", e => { e.preventDefault(); view.z *= Math.exp(-e.deltaY * 0.0015); view.z = Math.min(60, Math.max(0.3, view.z)); draw(); }, {passive: false});
 let drag = null;
 canvas.addEventListener("mousedown", e => { drag = {x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false}; });
