@@ -7,8 +7,12 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
-Towards 0.2.0: the store holds nothing in RAM that scales with the index.
-See `docs/design/snapshot-and-tail.md`.
+## [0.2.0] - 2026-11-16
+
+The store holds nothing in RAM that scales with the index, readers can
+open it from other processes, and writes can be batched atomically. See
+`docs/design/snapshot-and-tail.md`. The log format moves to reader level 3,
+so this is the first release 0.1.4 cannot read; see Upgrading below.
 
 ### Changed
 - Metadata of indexed records is read from the index's attribute columns;
@@ -33,6 +37,21 @@ See `docs/design/snapshot-and-tail.md`.
   | 1000 warm queries | 85 ms | 75 ms |
 
   The 63 MB is the PQ codes (32 MB) plus whatever pages the queries touch.
+
+### Upgrading from 0.1.x
+- Open the store once with 0.2.0: a 0.1.1 or 0.1.2/0.1.3 log is rewritten
+  as before, a 0.1.4 log is read as-is. The first checkpoint writes the
+  index under its new name (`<path>.idx.<id>`), moves metadata into its
+  columns and compacts the log to reader level 3. Until that checkpoint the
+  store still opens with 0.1.4; after it, 0.1.4 refuses the log with
+  `NeedsNewerVersion`. No downgrade.
+- Rust API: `Metadata` and `Filter` are unchanged from 0.1.4. New:
+  `Db::open_read_only`, `Db::refresh`, `Db::write_batch` with `Batch`,
+  `Db::index_path`, `Options::storage` with `Storage`, `Error::ReadOnly`,
+  `IndexStats::storage`. `GraphParams` gained a `storage` field, so code
+  that builds it without `..Default::default()` adds one.
+- Python: `Db(path, dim, read_only=True)`, `refresh()`, `delete_many`,
+  `storage="int8"`; `insert_many` is now atomic.
 
 ### Added
 - `Db::open_read_only`: open a store beside its writer, in the same or
@@ -305,7 +324,8 @@ published.
 - One process per store. No replication, encryption, typed metadata or range
   filters. Formats may change before 1.0 (with migration).
 
-[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/RohithOrg/sanadb/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/RohithOrg/sanadb/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/RohithOrg/sanadb/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/RohithOrg/sanadb/compare/v0.1.1...v0.1.2
