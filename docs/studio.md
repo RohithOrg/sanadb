@@ -42,7 +42,9 @@ sanadb-studio docs.sana --embed-cmd "python embed.py"
 ```
 
 The model's dimension has to match the store's; a mismatch is reported
-on the first query. Studio writes the model's name into the store's
+on the first query. For a sentence-transformers model,
+`python/examples/embed_server.py` in the repository serves it as such an
+endpoint on localhost with one command. Studio writes the model's name into the store's
 properties (`embedding_model`, `embedding_dim`) the first time one is
 attached; later, the header shows which model the vectors came from even
 with no model attached, and warns in red when a different one is. The header shows which model is attached, the query

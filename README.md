@@ -63,6 +63,17 @@ hits = db.search(query, k=10, text="tokio select cancellation")   # hybrid: vect
 db.checkpoint()
 ```
 
+With your own embedding model, the same in three lines:
+
+```python
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("all-MiniLM-L6-v2")
+db = sanadb.Db("docs.sana", dim=384, metric="cosine", text_field="body",
+               embedding_function=lambda t: model.encode(t, normalize_embeddings=True))
+db.add(["The borrow checker rejects aliasing", "asyncio runs coroutines on one thread"], metas=[{"lang": "rust"}, {"lang": "python"}])
+db.query(["how do I stop two parts mutating the same thing"], k=3)
+```
+
 Scores are distances, lower is closer. Every feature in one walk:
 [docs/getting-started.md](docs/getting-started.md), with runnable tours in
 `examples/tour.rs` and `python/examples/tour.py`. The full API is on
@@ -144,6 +155,7 @@ The detail behind each of these is in [docs/operations.md](docs/operations.md).
 ## Documentation
 
 - [Getting started](docs/getting-started.md): every feature in one walk.
+- [Examples](docs/examples.md): complete programs with their output, starting with semantic search over your text with a sentence-transformers model.
 - [How it works](docs/architecture.md): log, graph, PQ, delta, checkpoint,
   filters, concurrency, keyword and sparse search.
 - [Operating a store](docs/operations.md): durability, processes, backup,

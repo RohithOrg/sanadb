@@ -13,6 +13,8 @@ theme:
 markdown_extensions:
   - tables
   - toc
+  - pymdownx.tabbed:
+      alternate_style: true
   - pymdownx.superfences:
       custom_fences:
         - name: mermaid
@@ -21,6 +23,7 @@ markdown_extensions:
 nav:
   - Overview: index.md
   - Getting started: getting-started.md
+  - Examples: examples.md
   - Studio: studio.md
   - How it works: architecture.md
   - Operating a store: operations.md
