@@ -1215,7 +1215,7 @@ fn opens_and_migrates_a_level_1_log() {
     drop(db);
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"SANADB02");
-    assert_eq!(bytes[13], 2, "header now at reader level 2");
+    assert!(bytes[13] >= 2, "header now at the current reader level, got {}", bytes[13]);
     let db = Db::open(&path, Options::new(4)).unwrap();
     assert_eq!(db.len(), 2);
 }
@@ -1380,4 +1380,68 @@ fn search_where_uses_columns_scan_and_filtered_walk() {
             db.search_where(q, k, &Filter::eq("tag", "rare")).unwrap()
         );
     }
+}
+
+#[test]
+fn metadata_lives_in_columns_after_checkpoint() {
+    use sanadb::Filter;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cols.sana");
+    let (dim, n) = (8usize, 3000u64);
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    for i in 0..n {
+        let mut m = Metadata::new();
+        m.insert("i".into(), Value::from(i as i64));
+        m.insert("lang".into(), Value::from(["en", "de"][(i % 2) as usize]));
+        if i % 3 == 0 {
+            m.insert("flag".into(), Value::from(true));
+        }
+        db.insert(i, &vec_of(dim, i), m).unwrap();
+    }
+    db.checkpoint().unwrap();
+    drop(db);
+    // The compacted log describes nothing but the header: every record's
+    // metadata is in the index columns now.
+    let log_bytes = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(log_bytes, 16, "log is {log_bytes} bytes");
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), n as usize);
+    for i in [0u64, 1, 2, 1500, n - 1] {
+        let (v, m) = db.get(i).unwrap();
+        assert_eq!(v, vec_of(dim, i));
+        assert_eq!(m["i"], Value::Int(i as i64));
+        assert_eq!(m["lang"], ["en", "de"][(i % 2) as usize]);
+        assert_eq!(m.contains_key("flag"), i % 3 == 0, "{i}");
+    }
+    // Types are known from the columns alone: no log entry mentions them.
+    assert!(matches!(
+        db.insert(n, &vec_of(dim, n), HashMap::from([("i".to_string(), Value::from("x"))])),
+        Err(sanadb::Error::TypeMismatch { .. })
+    ));
+    // Deleting and overwriting graph records, then reading back.
+    assert!(db.delete(2).unwrap());
+    assert!(!db.delete(2).unwrap());
+    assert!(db.get(2).is_none());
+    db.insert(3, &vec_of(dim, 3), HashMap::from([("i".to_string(), Value::from(-3i64))])).unwrap();
+    assert_eq!(db.get(3).unwrap().1["i"], Value::Int(-3));
+    assert_eq!(db.len(), n as usize - 1);
+    // Closure filters read the columns; expression filters use them directly.
+    let q = vec_of(dim, 7_000_000);
+    let a: Vec<u64> = db.search_filtered(&q, 5, |m| m.get("flag").is_some()).unwrap().iter().map(|h| h.id).collect();
+    assert!(a.iter().all(|&i| i % 3 == 0));
+    let b: Vec<u64> = db.search_where(&q, 5, &Filter::eq("flag", true)).unwrap().iter().map(|h| h.id).collect();
+    assert!(b.iter().all(|&i| i % 3 == 0) && b.len() == 5);
+    assert!(db.search(&q, 10).unwrap().iter().all(|h| h.id != 2));
+    drop(db);
+    // Reopen: the delete and the overwrite come from the small log tail.
+    let db = Db::open(&path, Options::new(dim as u32)).unwrap();
+    assert_eq!(db.len(), n as usize - 1);
+    assert!(db.get(2).is_none());
+    assert_eq!(db.get(3).unwrap().1["i"], Value::Int(-3));
+    assert_eq!(db.get(5).unwrap().1["i"], Value::Int(5));
+    db.checkpoint().unwrap();
+    assert_eq!(db.len(), n as usize - 1);
+    assert!(db.get(2).is_none());
+    assert_eq!(db.get(3).unwrap().1["i"], Value::Int(-3));
+    assert_eq!(db.index_stats().unwrap().tombstones, 0);
 }

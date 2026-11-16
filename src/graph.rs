@@ -277,10 +277,6 @@ impl GraphIndex {
         bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])
     }
 
-    pub fn vector_of(&self, id: u64) -> Option<&[f32]> {
-        self.slot(id).map(|s| self.vector(s))
-    }
-
     fn neighbors(&self, slot: u32) -> &[u32] {
         let o = self.blocks_off + slot as usize * self.block + self.dim * 4;
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
@@ -395,6 +391,16 @@ impl GraphIndex {
     }
     pub fn candidates(&self, p: &Pred) -> Option<Vec<u32>> {
         self.attrs.as_ref()?.candidates(&self.mmap, p)
+    }
+
+    /// A slot's metadata decoded from the columns; `None` without columns.
+    pub fn metadata(&self, slot: u32) -> Option<Metadata> {
+        self.attrs.as_ref().map(|a| a.record(&self.mmap, slot))
+    }
+
+    /// Every metadata key the columns hold, with its type.
+    pub fn attr_kinds(&self) -> impl Iterator<Item = (&str, crate::Kind)> {
+        self.attrs.iter().flat_map(|a| a.kinds())
     }
 }
 

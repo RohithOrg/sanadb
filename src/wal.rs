@@ -28,7 +28,11 @@ const MAGIC: &[u8; 8] = b"SANADB02";
 /// it; this build reads levels up to `READER_LEVEL`. Additive changes (new
 /// frame kinds, which old readers skip) leave it alone; only a change that
 /// an old reader would misread raises it.
-pub(crate) const READER_LEVEL: u8 = 2;
+pub(crate) const READER_LEVEL: u8 = 3;
+/// Lowest level this build reads without rewriting: level 2 logs (0.1.4)
+/// differ from level 3 only in carrying Meta frames for graph records, which
+/// a level-3 reader simply replays into its map. Levels below are migrated.
+const MIN_LEVEL: u8 = 2;
 /// Level 1 (0.1.2 and 0.1.3) wrote metadata values as bare strings; level 2
 /// prefixes each value with a type tag. Converted on open.
 /// Format of 0.1.1: same frames without the 4-byte padding or the pad bytes
@@ -260,7 +264,7 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
         return Ok(()); // too short to be either; `read_header` reports it
     }
     let v1 = &head[..8] == MAGIC_V1;
-    if !v1 && (&head[..8] != MAGIC || head[13] >= READER_LEVEL) {
+    if !v1 && (&head[..8] != MAGIC || head[13] >= MIN_LEVEL) {
         return Ok(());
     }
     let dim = u32::from_le_bytes(head[8..12].try_into().unwrap());
@@ -339,7 +343,7 @@ fn read_header(file: &mut File) -> Result<Header> {
             supported: READER_LEVEL,
         });
     }
-    if buf[13] < READER_LEVEL {
+    if buf[13] < MIN_LEVEL {
         // `migrate` runs before this and rewrites lower levels.
         return Err(Error::Corrupt(
             "log at an old reader level was not migrated",

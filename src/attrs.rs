@@ -349,6 +349,29 @@ impl Attrs {
         Ok(Attrs { n, attrs, by_name })
     }
 
+    /// Every key with its type.
+    pub(crate) fn kinds(&self) -> impl Iterator<Item = (&str, Kind)> {
+        self.attrs.iter().map(|a| (a.name.as_str(), a.kind))
+    }
+
+    /// The metadata of one slot, decoded from the columns.
+    pub(crate) fn record(&self, b: &[u8], slot: u32) -> Metadata {
+        let mut m = Metadata::new();
+        for (a, attr) in self.attrs.iter().enumerate() {
+            if !self.present(b, a, slot) {
+                continue;
+            }
+            let v = match attr.kind {
+                Kind::Str => Value::Str(self.dict_str(b, a, self.code_at(b, a, slot)).to_string()),
+                Kind::Int => Value::Int(self.int_at(b, a, slot)),
+                Kind::Float => Value::Float(self.float_at(b, a, slot)),
+                Kind::Bool => Value::Bool(self.bool_at(b, a, slot)),
+            };
+            m.insert(attr.name.clone(), v);
+        }
+        m
+    }
+
     fn present(&self, b: &[u8], a: usize, slot: u32) -> bool {
         let s = slot as usize;
         let w = u64::from_le_bytes(

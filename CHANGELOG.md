@@ -7,6 +7,33 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+Towards 0.2.0: the store holds nothing in RAM that scales with the index.
+See `docs/design/snapshot-and-tail.md`.
+
+### Changed
+- Metadata of indexed records is read from the index's attribute columns;
+  the in-RAM map holds only records written since the last checkpoint (and,
+  for an index built before 0.1.4, everything until the next checkpoint).
+  The compacted log no longer carries Meta frames, so after a checkpoint it
+  is 16 bytes. Log reader level 3: 0.1.4 refuses such a log with
+  `NeedsNewerVersion`; level-2 logs open unchanged, level 1 and SANADB01
+  are migrated as before.
+- The index file ends in a footer that names the attribute table and a new
+  sorted id table; `slot(id)` is a binary search on the mapping and the
+  per-record id vector and hash map are gone. 0.1.4 indexes (trailer, no id
+  table) still open and build the map until the next checkpoint.
+- Measured on the labelled SIFT1M store (1M records, four string attributes),
+  `examples/opentime.rs`, after one checkpoint in the new layout:
+
+  | | 0.1.4 | now |
+  |---|---|---|
+  | open | 949 ms | 4.8 ms |
+  | resident memory after open | 864 MB | 63 MB |
+  | log size after checkpoint | 66 MB | 16 B |
+  | 1000 warm queries | 85 ms | 75 ms |
+
+  The 63 MB is the PQ codes (32 MB) plus whatever pages the queries touch.
+
 ## [0.1.4] - 2026-11-16
 
 This release changes the Rust `Metadata` type and the log format (reader

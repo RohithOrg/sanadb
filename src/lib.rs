@@ -311,6 +311,10 @@ struct Inner {
     delta: Flat,
     /// Sequence number of the write that produced each delta record.
     delta_seq: HashMap<u64, u64>,
+    /// Metadata of records whose only copy is in the log: everything in the
+    /// delta, plus graph records of an index without columns (built before
+    /// 0.1.4) until the next checkpoint. Graph records otherwise read their
+    /// metadata from the index's attribute columns, so this map is small.
     meta: HashMap<u64, Arc<Metadata>>,
     /// Type fixed for each metadata key by the first value written under it.
     types: HashMap<String, Kind>,
@@ -381,6 +385,11 @@ impl Db {
             deletes_since_snapshot: None,
             log_entries: entries.len(),
         };
+        if let Some(g) = &inner.graph {
+            for (k, kind) in g.attr_kinds() {
+                inner.types.entry(k.to_string()).or_insert(kind);
+            }
+        }
         for e in entries {
             match e {
                 Replayed::Insert {
@@ -425,7 +434,7 @@ impl Db {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().meta.len()
+        self.inner.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -489,7 +498,7 @@ impl Db {
     pub fn delete(&self, id: u64) -> Result<bool> {
         let garbage = {
             let mut i = self.write()?;
-            if !i.meta.contains_key(&id) {
+            if !i.is_live(id) {
                 return Ok(false);
             }
             i.append(&Entry::Delete { id }, self.opts.sync_every_write)?;
@@ -502,13 +511,14 @@ impl Db {
 
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Metadata)> {
         let i = self.inner.read();
-        let meta = i.meta.get(&id)?;
-        let vector = i
-            .delta
-            .offset(id)
-            .map(|o| i.wal.vector_at(o))
-            .or_else(|| i.graph.as_ref()?.vector_of(id))?;
-        Some((vector.to_vec(), (**meta).clone()))
+        if let Some(off) = i.delta.offset(id) {
+            let meta = i.meta.get(&id).map(|m| (**m).clone()).unwrap_or_default();
+            return Some((i.wal.vector_at(off).to_vec(), meta));
+        }
+        let g = i.graph.as_ref()?;
+        let slot = g.slot(id).filter(|s| !i.tombstones.contains(s))?;
+        let meta = i.meta.get(&id).map(|m| (**m).clone()).or_else(|| g.metadata(slot))?;
+        Some((g.vector(slot).to_vec(), meta))
     }
 
     /// k-nearest-neighbour search. Exact over records written since the last
@@ -603,8 +613,9 @@ impl Db {
             Spec::Closure(f) => f(m),
             Spec::Expr(f) => f.eval(m),
         };
-        let passes =
-            |id: u64| matches!(spec, Spec::All) || i.meta.get(&id).is_some_and(|m| passes_meta(m));
+        let passes = |id: u64| {
+            matches!(spec, Spec::All) || i.metadata_of(id).is_some_and(|m| passes_meta(&m))
+        };
         let mut hits = i
             .delta
             .search(query, k, passes, &|off| i.wal.vector_at(off));
@@ -690,7 +701,7 @@ impl Db {
         //    The temp file is memory-mapped, so the build's working set, not
         //    the dataset, has to fit in RAM.
         let vec_tmp = self.idx_path.with_extension("vec.tmp");
-        let (ids, snap_seq, base, metas) = {
+        let (ids, snap_seq, base, metas, old_graph) = {
             let mut i = self.write()?;
             i.wal.sync()?;
             let live_in_graph = i.graph.as_ref().map_or(0, |g| g.len() - i.tombstones.len());
@@ -703,11 +714,7 @@ impl Db {
                     // until a rebuild adds them.
                     && (g.pq_subspaces() > 0 || !self.opts.graph.use_pq || total < pq::MIN_N)
             });
-            let mut ids: Vec<u64> = Vec::with_capacity(if incremental {
-                i.delta.len()
-            } else {
-                i.meta.len()
-            });
+            let mut ids: Vec<u64> = Vec::with_capacity(if incremental { i.delta.len() } else { i.len() });
             let mut w = std::io::BufWriter::new(io_ctx(
                 std::fs::File::create(&vec_tmp),
                 "create snapshot",
@@ -729,13 +736,21 @@ impl Db {
             w.flush()?;
             i.deletes_since_snapshot = Some(HashSet::new());
             let base = incremental.then(|| (i.graph.clone().unwrap(), i.tombstones.clone()));
-            // Metadata for the attribute columns: a map of `Arc`s, so this is
-            // one pointer per live record and the encoding runs outside the lock.
+            // Metadata for the new index's columns comes from the log-held map
+            // (delta records, and everything if the old index has no columns)
+            // and otherwise from the old index's columns, which are immutable,
+            // so both reads happen outside the lock.
             let metas: HashMap<u64, Arc<Metadata>> =
                 i.meta.iter().map(|(&id, m)| (id, m.clone())).collect();
-            (ids, i.write_seq, base, metas)
+            let old_graph = i.graph.clone();
+            (ids, i.write_seq, base, metas, old_graph)
         };
-        let meta_of = |id: u64| metas.get(&id).cloned();
+        let meta_of = |id: u64| {
+            metas.get(&id).cloned().or_else(|| {
+                let g = old_graph.as_ref()?;
+                g.metadata(g.slot(id)?).map(Arc::new)
+            })
+        };
 
         // 2. Build outside the lock. This is the slow part.
         let idx_tmp = self.idx_path.with_extension("idx.tmp");
@@ -776,6 +791,7 @@ impl Db {
             }
         })();
         drop(base);
+        drop(old_graph);
         let _ = std::fs::remove_file(&vec_tmp);
         if let Err(e) = built {
             let _ = std::fs::remove_file(&idx_tmp);
@@ -828,7 +844,7 @@ impl Db {
         // tombstone instead of serving the stale graph node.
         let dead: Vec<u64> = deleted
             .into_iter()
-            .filter(|id| !i.meta.contains_key(id))
+            .filter(|id| i.delta.offset(*id).is_none())
             .filter(|id| graph.slot(*id).is_some())
             .collect();
         for id in &dead {
@@ -842,17 +858,10 @@ impl Db {
             vector: i.wal.vector_at(off).to_vec(),
             meta: (*i.meta[&id]).clone(),
         });
-        let metas = i
-            .meta
-            .iter()
-            .filter(|(id, _)| !survivor_ids.contains(id))
-            .map(|(&id, m)| Entry::Meta {
-                id,
-                meta: (**m).clone(),
-            });
+        // Graph records' metadata lives in the new index's columns, so the
+        // compacted log holds only the survivors and the deletes.
         let deletes = dead.iter().map(|&id| Entry::Delete { id });
-        let new_offs =
-            wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas).chain(deletes))?;
+        let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(deletes))?;
         // Same Windows rule for the log: close the old one before replacing
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.
@@ -890,7 +899,8 @@ impl Db {
         i.tombstones = tombstones;
         i.delta = delta;
         i.delta_seq = delta_seq;
-        i.log_entries = i.meta.len();
+        i.meta.retain(|id, _| survivor_ids.contains(id));
+        i.log_entries = survivors.len() + dead.len();
         Ok(())
     }
 
@@ -916,6 +926,31 @@ impl Db {
 }
 
 impl Inner {
+    /// Live records: graph slots not superseded, plus the delta.
+    fn len(&self) -> usize {
+        self.graph.as_ref().map_or(0, |g| g.len() - self.tombstones.len()) + self.delta.len()
+    }
+
+    fn is_live(&self, id: u64) -> bool {
+        self.delta.offset(id).is_some()
+            || self
+                .graph
+                .as_ref()
+                .and_then(|g| g.slot(id))
+                .is_some_and(|s| !self.tombstones.contains(&s))
+    }
+
+    /// A live record's metadata: from the log-held map, else decoded from
+    /// the index columns. Allocates; the `Filter` path avoids this.
+    fn metadata_of(&self, id: u64) -> Option<Metadata> {
+        if let Some(m) = self.meta.get(&id) {
+            return Some((**m).clone());
+        }
+        let g = self.graph.as_ref()?;
+        let slot = g.slot(id).filter(|s| !self.tombstones.contains(s))?;
+        g.metadata(slot)
+    }
+
     /// `Error::TypeMismatch` if any value's type differs from the one its
     /// key already has in this store.
     fn check_types(&self, meta: &Metadata) -> Result<()> {
@@ -985,7 +1020,7 @@ impl Inner {
             .as_ref()
             .map_or(0, |g| g.len() - self.tombstones.len());
         (
-            self.log_entries.saturating_sub(self.meta.len()),
+            self.log_entries.saturating_sub(self.delta.len()),
             self.delta.len(),
             indexed,
         )
