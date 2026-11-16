@@ -57,8 +57,18 @@ million records and is cached until the next checkpoint.
   from an id only).
 
 The results header names the mode that ran (`nearest`, `filtered`,
-`keyword`, `hybrid`, `sparse`, `walk`) and the time the search took
-inside the engine.
+`keyword`, `hybrid`, `sparse`, `walk`), the time the search took inside
+the engine, and what the score column means for this store's metric.
+Scores are the engine's own values, lower is closer:
+
+| metric | score | identical vectors |
+|---|---|---|
+| `l2` | squared L2 distance | 0 |
+| `cosine` | negative cosine similarity; vectors are normalised on insert and on query | −1 (1 is opposite) |
+| `dot` | negative dot product of the vectors as stored | the most negative value |
+
+Keyword results carry negated BM25, hybrid results the negated fused rank
+score; both are ranks more than distances.
 
 ## 3. Watch the walk
 
@@ -76,9 +86,13 @@ map before settling is a real property of the graph, not of the drawing.
 
 ![results table and the record panel](img/studio-4-results-record.png)
 
-Click a result, a record in the list, or a point. The panel shows the
-vector (a sparkline, its range and first values) and the metadata as
-JSON you can edit. **Save metadata** writes a new version of the record
+Click a result, a record in the list, or a point. The panel's headline is
+the record's name when its metadata has one (the first of `title`,
+`name`, `doc`, `path`, `file`, `url`, `label`, `text`, `body` holding a
+string), otherwise "Record" and its id; the id is always shown beneath,
+labelled. Below: the vector's dimensions, non-zero count and L2 norm, its
+score against the current query, the map cluster it fell in, the full
+values on demand, and the metadata as JSON you can edit. **Save metadata** writes a new version of the record
 to the log; it is visible to every reader at once and reaches the index
 columns at the next checkpoint, like any write. **Delete** asks first.
 **Search from this record** puts its id in the query and runs.
