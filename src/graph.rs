@@ -467,21 +467,24 @@ impl GraphIndex {
     /// Compile a filter against this index's attribute columns; `None` when
     /// the file has none (built before 0.1.4), so the caller falls back to
     /// the metadata map.
-    pub fn prepare(&self, f: &Filter) -> Option<Pred> {
-        self.attrs.as_ref().map(|a| a.prepare(&self.mmap, f))
+    pub fn prepare(&self, f: &Filter, text_field: Option<&str>) -> Option<Pred> {
+        let tx = self.text.as_ref().zip(text_field);
+        self.attrs.as_ref().map(|a| a.prepare(&self.mmap, f, tx))
     }
     pub fn pass(&self, p: &Pred, slot: u32) -> bool {
         self.attrs
             .as_ref()
-            .is_some_and(|a| a.pass(&self.mmap, p, slot))
+            .is_some_and(|a| a.pass(&self.mmap, p, slot, self.text.as_ref()))
     }
     pub fn estimate(&self, p: &Pred) -> usize {
         self.attrs
             .as_ref()
-            .map_or(self.n, |a| a.estimate(&self.mmap, p))
+            .map_or(self.n, |a| a.estimate(&self.mmap, p, self.text.as_ref()))
     }
     pub fn candidates(&self, p: &Pred) -> Option<Vec<u32>> {
-        self.attrs.as_ref()?.candidates(&self.mmap, p)
+        self.attrs
+            .as_ref()?
+            .candidates(&self.mmap, p, self.text.as_ref())
     }
 
     /// A slot's metadata decoded from the columns; `None` without columns.

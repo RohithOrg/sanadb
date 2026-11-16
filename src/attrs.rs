@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
+use crate::text::TextIndex;
 use crate::{Error, Filter, Kind, Metadata, Result, Value};
 
 /// Trailer written by 0.1.4 right after the table; read for compatibility.
@@ -495,7 +496,7 @@ impl Attrs {
     /// Compile a filter against this table. Keys the table lacks never match
     /// (`Eq`, ranges) or always fail `Exists`; values of the wrong type never
     /// match, as `Filter::eval` does.
-    pub(crate) fn prepare(&self, b: &[u8], f: &Filter) -> Pred {
+    pub(crate) fn prepare(&self, b: &[u8], f: &Filter, text: Option<(&TextIndex, &str)>) -> Pred {
         let attr = |k: &str| self.by_name.get(k).copied();
         match f {
             Filter::Eq(k, v) => attr(k).map_or(Pred::False, |a| self.eq_pred(b, a, v)),
@@ -543,10 +544,22 @@ impl Attrs {
                 }
                 Pred::CodeRange(a, lo, hi)
             }),
+            Filter::Contains(k, tok) => {
+                let toks = crate::text::tokenize(tok);
+                let Some(t) = toks.first() else {
+                    return Pred::False;
+                };
+                match text {
+                    Some((_, field)) if field == k => Pred::TextHas(t.clone()),
+                    _ => attr(k)
+                        .filter(|&a| self.attrs[a].kind == Kind::Str)
+                        .map_or(Pred::False, |a| Pred::StrTok(a, t.clone())),
+                }
+            }
             Filter::Exists(k) => attr(k).map_or(Pred::False, Pred::Exists),
-            Filter::And(fs) => Pred::And(fs.iter().map(|f| self.prepare(b, f)).collect()),
-            Filter::Or(fs) => Pred::Or(fs.iter().map(|f| self.prepare(b, f)).collect()),
-            Filter::Not(f) => Pred::Not(Box::new(self.prepare(b, f))),
+            Filter::And(fs) => Pred::And(fs.iter().map(|f| self.prepare(b, f, text)).collect()),
+            Filter::Or(fs) => Pred::Or(fs.iter().map(|f| self.prepare(b, f, text)).collect()),
+            Filter::Not(f) => Pred::Not(Box::new(self.prepare(b, f, text))),
         }
     }
 
@@ -646,8 +659,15 @@ impl Attrs {
     }
 
     /// Does `slot` pass? One or two array reads per leaf.
-    pub(crate) fn pass(&self, b: &[u8], p: &Pred, slot: u32) -> bool {
+    pub(crate) fn pass(&self, b: &[u8], p: &Pred, slot: u32, tx: Option<&TextIndex>) -> bool {
         match p {
+            Pred::TextHas(t) => tx.is_some_and(|x| x.has(b, t, slot)),
+            Pred::StrTok(a, t) => {
+                self.present(b, *a, slot)
+                    && crate::text::tokenize(self.dict_str(b, *a, self.code_at(b, *a, slot)))
+                        .iter()
+                        .any(|w| w == t)
+            }
             Pred::False => false,
             Pred::Exists(a) => self.present(b, *a, slot),
             Pred::Code(a, c) => self.present(b, *a, slot) && self.code_of(b, *a, slot) == *c,
@@ -670,9 +690,9 @@ impl Attrs {
                         && (if *hi_inc { v <= *hi } else { v < *hi })
                 }
             }
-            Pred::And(ps) => ps.iter().all(|p| self.pass(b, p, slot)),
-            Pred::Or(ps) => ps.iter().any(|p| self.pass(b, p, slot)),
-            Pred::Not(p) => !self.pass(b, p, slot),
+            Pred::And(ps) => ps.iter().all(|p| self.pass(b, p, slot, tx)),
+            Pred::Or(ps) => ps.iter().any(|p| self.pass(b, p, slot, tx)),
+            Pred::Not(p) => !self.pass(b, p, slot, tx),
         }
     }
 
@@ -692,9 +712,10 @@ impl Attrs {
     /// Estimated number of slots that pass, for choosing a strategy. Exact
     /// for posting-backed leaves, sampled for the rest; `And` takes the
     /// smallest child, `Or` the sum.
-    pub(crate) fn estimate(&self, b: &[u8], p: &Pred) -> usize {
+    pub(crate) fn estimate(&self, b: &[u8], p: &Pred, tx: Option<&TextIndex>) -> usize {
         let n = self.n;
         match p {
+            Pred::TextHas(t) => tx.map_or(0, |x| x.df(b, t)),
             Pred::False => 0,
             Pred::Code(a, c) if self.attrs[*a].postings.is_some() => self.postings(b, *a, *c).len(),
             Pred::CodeRange(a, lo, hi)
@@ -702,22 +723,30 @@ impl Attrs {
             {
                 (*lo..*hi).map(|c| self.postings(b, *a, c).len()).sum()
             }
-            Pred::And(ps) => ps.iter().map(|p| self.estimate(b, p)).min().unwrap_or(n),
-            Pred::Or(ps) => ps.iter().map(|p| self.estimate(b, p)).sum::<usize>().min(n),
-            Pred::Not(p) => n - self.estimate(b, p),
-            _ => self.sample(b, p),
+            Pred::And(ps) => ps
+                .iter()
+                .map(|p| self.estimate(b, p, tx))
+                .min()
+                .unwrap_or(n),
+            Pred::Or(ps) => ps
+                .iter()
+                .map(|p| self.estimate(b, p, tx))
+                .sum::<usize>()
+                .min(n),
+            Pred::Not(p) => n - self.estimate(b, p, tx),
+            _ => self.sample(b, p, tx),
         }
     }
 
     /// Fraction passing over up to 1,024 evenly spaced slots, scaled to `n`.
-    fn sample(&self, b: &[u8], p: &Pred) -> usize {
+    fn sample(&self, b: &[u8], p: &Pred, tx: Option<&TextIndex>) -> usize {
         if self.n == 0 {
             return 0;
         }
         let step = (self.n / 1024).max(1);
         let slots = (0..self.n).step_by(step);
         let total = slots.clone().count();
-        let hits = slots.filter(|&s| self.pass(b, p, s as u32)).count();
+        let hits = slots.filter(|&s| self.pass(b, p, s as u32, tx)).count();
         (hits as f64 / total as f64 * self.n as f64) as usize
     }
 
@@ -725,19 +754,25 @@ impl Attrs {
     /// no posting-backed leaf constrains the predicate. The returned list is
     /// exact (each candidate is re-checked against the whole predicate) and
     /// ascending.
-    pub(crate) fn candidates(&self, b: &[u8], p: &Pred) -> Option<Vec<u32>> {
-        let seed = self.seed(b, p)?;
+    pub(crate) fn candidates(
+        &self,
+        b: &[u8],
+        p: &Pred,
+        tx: Option<&TextIndex>,
+    ) -> Option<Vec<u32>> {
+        let seed = self.seed(b, p, tx)?;
         let n = self.n as u32;
         Some(
             seed.into_iter()
-                .filter(|&s| s < n && self.pass(b, p, s))
+                .filter(|&s| s < n && self.pass(b, p, s, tx))
                 .collect(),
         )
     }
 
     /// Smallest posting-backed superset of the slots passing `p`.
-    fn seed(&self, b: &[u8], p: &Pred) -> Option<Vec<u32>> {
+    fn seed(&self, b: &[u8], p: &Pred, tx: Option<&TextIndex>) -> Option<Vec<u32>> {
         match p {
+            Pred::TextHas(t) => Some(tx?.postings(b, t).map(|(s, _)| s).collect()),
             Pred::Code(a, c) if self.attrs[*a].postings.is_some() => {
                 Some(self.postings(b, *a, *c).to_vec())
             }
@@ -752,12 +787,12 @@ impl Attrs {
             }
             Pred::And(ps) => ps
                 .iter()
-                .filter_map(|p| self.seed(b, p))
+                .filter_map(|p| self.seed(b, p, tx))
                 .min_by_key(Vec::len),
             Pred::Or(ps) => {
                 let mut all = Vec::new();
                 for p in ps {
-                    all.extend(self.seed(b, p)?);
+                    all.extend(self.seed(b, p, tx)?);
                 }
                 all.sort_unstable();
                 all.dedup();
@@ -810,6 +845,10 @@ pub(crate) enum Pred {
     IntRange(usize, i64, i64),
     /// `Float` column between the bounds; the booleans say inclusive.
     FloatRange(usize, f64, f64, bool, bool),
+    /// The text index holds this token for the slot.
+    TextHas(String),
+    /// A `Str` column whose value, tokenised, contains the token (no index).
+    StrTok(usize, String),
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Not(Box<Pred>),
@@ -853,20 +892,20 @@ mod tests {
     fn agrees(f: &Filter) {
         let recs = recs();
         let (b, attrs) = build(&recs);
-        let p = attrs.prepare(&b, f);
+        let p = attrs.prepare(&b, f, None);
         for (s, m) in recs.iter().enumerate() {
             assert_eq!(
-                attrs.pass(&b, &p, s as u32),
+                attrs.pass(&b, &p, s as u32, None),
                 f.eval(m),
                 "{f:?} on slot {s}: {m:?}"
             );
         }
-        if let Some(c) = attrs.candidates(&b, &p) {
+        if let Some(c) = attrs.candidates(&b, &p, None) {
             let want: Vec<u32> = (0..recs.len() as u32)
                 .filter(|&s| f.eval(&recs[s as usize]))
                 .collect();
             assert_eq!(c, want, "candidates for {f:?}");
-            let e = attrs.estimate(&b, &p);
+            let e = attrs.estimate(&b, &p, None);
             match f {
                 // And takes its most selective child, Or sums: both upper bounds.
                 Filter::And(_) | Filter::Or(_) => assert!(
@@ -935,14 +974,14 @@ mod tests {
     fn estimates_without_postings_are_sampled() {
         let recs = recs();
         let (b, attrs) = build(&recs);
-        let p = attrs.prepare(&b, &Filter::lt("score", 0.25f64));
-        let e = attrs.estimate(&b, &p);
+        let p = attrs.prepare(&b, &Filter::lt("score", 0.25f64), None);
+        let e = attrs.estimate(&b, &p, None);
         assert!(
             (40..=60).contains(&e),
             "estimate {e} for a 25% float range over 200 records"
         );
         assert!(
-            attrs.candidates(&b, &p).is_none(),
+            attrs.candidates(&b, &p, None).is_none(),
             "float ranges have no postings"
         );
     }

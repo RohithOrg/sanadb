@@ -21,6 +21,11 @@ pub enum Filter {
     Ge(String, Value),
     /// String key starts with this prefix.
     Prefix(String, String),
+    /// String key, tokenised like the text index (lowercase, split on
+    /// non-alphanumerics), contains this token. On the store's text field
+    /// this runs on the inverted index: a tag set stored as "t12 t345" is
+    /// filtered at posting-list speed.
+    Contains(String, String),
     /// Key is present with any value.
     Exists(String),
     And(Vec<Filter>),
@@ -53,6 +58,9 @@ impl Filter {
     pub fn prefix(key: impl Into<String>, p: impl Into<String>) -> Filter {
         Filter::Prefix(key.into(), p.into())
     }
+    pub fn contains(key: impl Into<String>, token: impl Into<String>) -> Filter {
+        Filter::Contains(key.into(), token.into())
+    }
     pub fn exists(key: impl Into<String>) -> Filter {
         Filter::Exists(key.into())
     }
@@ -84,6 +92,12 @@ impl Filter {
                 .get(k)
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.starts_with(p.as_str())),
+            Filter::Contains(k, tok) => {
+                let want = crate::text::tokenize(tok);
+                m.get(k).and_then(Value::as_str).is_some_and(|s| {
+                    !want.is_empty() && crate::text::tokenize(s).iter().any(|t| *t == want[0])
+                })
+            }
             Filter::Exists(k) => m.contains_key(k),
             Filter::And(fs) => fs.iter().all(|f| f.eval(m)),
             Filter::Or(fs) => fs.iter().any(|f| f.eval(m)),

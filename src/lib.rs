@@ -1072,7 +1072,7 @@ impl Db {
             let dead = !i.tombstones.is_empty();
             let live = |slot: u32| !dead || !i.tombstones.contains(&slot);
             let prepared = match spec {
-                Spec::Expr(f) => g.prepare(f),
+                Spec::Expr(f) => g.prepare(f, self.opts.text_field.as_deref()),
                 _ => None,
             };
             let graph_hits = match &prepared {

@@ -83,7 +83,7 @@ enum Filter {
 }
 
 /// Parse the filter dict. `{"k": v}` is equality; `{"k": {"$op": v}}` applies
-/// operators `$eq $ne $in $lt $le $lte $gt $ge $gte $prefix $exists`; the keys
+/// operators `$eq $ne $in $lt $le $lte $gt $ge $gte $prefix $contains $exists`; the keys
 /// `$and`, `$or` take lists of dicts and `$not` one dict. Several keys in one
 /// dict are and-ed.
 fn to_filter(d: &Bound<'_, PyDict>) -> PyResult<Expr> {
@@ -134,6 +134,7 @@ fn to_filter(d: &Bound<'_, PyDict>) -> PyResult<Expr> {
                             "$gt" => Expr::Gt(key.clone(), to_value(&arg)?),
                             "$ge" | "$gte" => Expr::Ge(key.clone(), to_value(&arg)?),
                             "$prefix" => Expr::Prefix(key.clone(), arg.extract()?),
+                            "$contains" | "$has" => Expr::Contains(key.clone(), arg.extract()?),
                             "$exists" => {
                                 let want: bool = arg.extract()?;
                                 if want {

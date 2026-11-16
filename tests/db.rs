@@ -2398,3 +2398,90 @@ fn keyword_and_hybrid_search_over_a_text_field() {
     let plain = Db::open(dir.path().join("plain.sana"), Options::new(dim as u32)).unwrap();
     assert!(plain.search_text("x", 3, None).is_err());
 }
+
+#[test]
+fn contains_filter_runs_on_the_text_index() {
+    use sanadb::Filter;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tags.sana");
+    let dim = 4usize;
+    let opts = || {
+        Options::new(dim as u32)
+            .text_field("tags")
+            .exact_filter_scan(100_000)
+    };
+    let db = Db::open(&path, opts()).unwrap();
+    let n = 5000u64;
+    // Tag sets as a space-separated string, like YFCC's label lists.
+    let tags = |i: u64| {
+        format!(
+            "t{} t{} {}",
+            i % 50,
+            100 + i % 7,
+            if i.is_multiple_of(500) {
+                "rare"
+            } else {
+                "common"
+            }
+        )
+    };
+    for i in 0..n {
+        let mut m = Metadata::new();
+        m.insert("tags".into(), Value::from(tags(i)));
+        m.insert("note".into(), Value::from(format!("note {}", i % 3)));
+        db.insert(i, &vec_of(dim, i), m).unwrap();
+    }
+    // Tail: evaluated from metadata by tokenising.
+    let q = vec_of(dim, 123);
+    let got: Vec<u64> = db
+        .search_where(&q, 5, &Filter::contains("tags", "rare"))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(
+        got.iter().all(|i| i.is_multiple_of(500)) && got.len() == 5,
+        "{got:?}"
+    );
+    db.checkpoint().unwrap();
+    // Indexed: posting-list candidates, exact answer.
+    let want = brute(dim, n, &q, 5, |i| i.is_multiple_of(500));
+    let got: Vec<u64> = db
+        .search_where(&q, 5, &Filter::contains("tags", "RARE"))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(got, want);
+    // Two tags and-ed: both posting lists, intersection exact.
+    let f = Filter::and([
+        Filter::contains("tags", "t7"),
+        Filter::contains("tags", "t103"),
+    ]);
+    let want = brute(dim, n, &q, 5, |i| i % 50 == 7 && i % 7 == 3);
+    let got: Vec<u64> = db
+        .search_where(&q, 5, &f)
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(got, want);
+    // Contains on a plain Str column (not the text field) still works, by decoding.
+    let got: Vec<u64> = db
+        .search_where(&q, 5, &Filter::contains("note", "2"))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(got.len() == 5 && got.iter().all(|i| i % 3 == 2), "{got:?}");
+    // A token nobody has, and a common token (walk regime).
+    assert!(
+        db.search_where(&q, 5, &Filter::contains("tags", "nothing"))
+            .unwrap()
+            .is_empty()
+    );
+    let got = db
+        .search_where(&q, 5, &Filter::contains("tags", "common"))
+        .unwrap();
+    assert!(got.len() == 5 && got.iter().all(|h| !h.id.is_multiple_of(500)));
+}

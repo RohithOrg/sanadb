@@ -292,6 +292,37 @@ impl TextIndex {
         })
     }
 
+    /// Whether `slot` holds `term`: a binary search over the term's postings,
+    /// which are sorted by slot.
+    pub(crate) fn has(&self, b: &[u8], term: &str, slot: u32) -> bool {
+        let Some(i) = self.find(b, term) else {
+            return false;
+        };
+        let (Some(lo), Some(hi)) = (
+            u64_at(b, self.post_offs + i * 8),
+            u64_at(b, self.post_offs + (i + 1) * 8),
+        ) else {
+            return false;
+        };
+        let (mut lo, mut hi) = (lo as usize, hi as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let o = self.postings + mid * 8;
+            let Some(s) = b
+                .get(o..o + 4)
+                .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
+            else {
+                return false;
+            };
+            match s.cmp(&slot) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+
     /// Document frequency of a term.
     pub(crate) fn df(&self, b: &[u8], term: &str) -> usize {
         self.find(b, term)
