@@ -592,7 +592,12 @@ impl Db {
         };
         if let Some((src, dst)) = &index {
             io_ctx(std::fs::copy(src, dst).map(|_| ()), "copy index", src)?;
-            io_ctx(std::fs::File::open(dst).and_then(|f| f.sync_all()), "sync index copy", dst)?;
+            // Windows needs a writable handle to flush; a read handle is refused.
+            io_ctx(
+                std::fs::OpenOptions::new().write(true).open(dst).and_then(|f| f.sync_all()),
+                "sync index copy",
+                dst,
+            )?;
         }
         {
             let mut i = self.inner.write();
