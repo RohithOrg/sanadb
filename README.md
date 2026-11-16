@@ -81,6 +81,7 @@ stubs.
 | Sparse | SPLADE-style `(index, weight)` vectors, dot-product search over inverted lists |
 | Hybrid | reciprocal rank fusion of the dense result with the keyword or sparse result |
 | Processes | one writer, any number of read-only handles in any process, following the writer's writes and checkpoints |
+| Embeddings | bring your model: an `Embedder` trait in Rust, `embedding_function` with `add()` and `query()` in Python, an OpenAI-compatible endpoint or command in studio |
 | Operations | consistent `backup()`, operation counters in `stats()`, optional `tracing` events |
 | Format | frozen for 0.x and specified byte for byte; stores from every published version open and are tested |
 

@@ -1,4 +1,11 @@
-//! `sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only]`
+//! `sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only]
+//!   [--embed-url URL --embed-model NAME [--embed-key-env VAR] | --embed-cmd CMD]`
+//!
+//! With an embedder attached the page searches by text and adds records
+//! from text: `--embed-url` is an OpenAI-compatible `/v1/embeddings`
+//! endpoint (OpenAI, Ollama, LM Studio, vLLM, text-embeddings-inference),
+//! `--embed-cmd` any command that reads a JSON array of strings on stdin
+//! and prints a JSON array of float arrays.
 //!
 //! Serves a single page on localhost that opens the store, lists and
 //! searches records, draws a 2-D map of a sample of the vectors (PCA, with
@@ -15,12 +22,129 @@ use tiny_http::{Header, Method, Request, Response, Server};
 const PAGE: &str = include_str!("../ui/index.html");
 const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#2E4BE8"/><circle cx="11" cy="20" r="3.2" fill="#fff"/><circle cx="21" cy="11" r="3.2" fill="#fff"/><circle cx="22" cy="22" r="2.2" fill="#fff" opacity=".7"/><path d="M11 20 21 11M11 20l11 2" stroke="#fff" stroke-width="1.6" opacity=".8"/></svg>"##;
 
+/// How text becomes a vector, when the user attached a model.
+enum Embedder {
+    Http {
+        url: String,
+        model: String,
+        key: Option<String>,
+    },
+    Cmd(String),
+}
+
+impl Embedder {
+    fn describe(&self) -> J {
+        match self {
+            Embedder::Http { url, model, .. } => {
+                json!({"kind": "http", "url": url, "model": model})
+            }
+            Embedder::Cmd(c) => json!({"kind": "command", "command": c}),
+        }
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        match self {
+            Embedder::Http { url, model, key } => {
+                let mut req = ureq::post(url).header("Content-Type", "application/json");
+                if let Some(k) = key {
+                    req = req.header("Authorization", &format!("Bearer {k}"));
+                }
+                let body = json!({"model": model, "input": texts});
+                let mut resp = req
+                    .send_json(&body)
+                    .map_err(|e| format!("embedding request to {url} failed: {e}"))?;
+                let v: J = resp
+                    .body_mut()
+                    .read_json()
+                    .map_err(|e| format!("embedding response is not JSON: {e}"))?;
+                let data = v["data"].as_array().ok_or_else(|| {
+                    format!(
+                        "embedding response has no `data` array: {}",
+                        short(&v.to_string())
+                    )
+                })?;
+                let mut out: Vec<(usize, Vec<f32>)> = data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let idx = d["index"].as_u64().map(|x| x as usize).unwrap_or(i);
+                        let e = d["embedding"]
+                            .as_array()
+                            .ok_or("embedding entry has no `embedding` array")?
+                            .iter()
+                            .map(|x| {
+                                x.as_f64()
+                                    .map(|x| x as f32)
+                                    .ok_or("non-numeric embedding value")
+                            })
+                            .collect::<Result<Vec<f32>, &str>>()?;
+                        Ok((idx, e))
+                    })
+                    .collect::<Result<_, &str>>()
+                    .map_err(|e| e.to_string())?;
+                out.sort_by_key(|(i, _)| *i);
+                if out.len() != texts.len() {
+                    return Err(format!(
+                        "asked for {} embeddings, got {}",
+                        texts.len(),
+                        out.len()
+                    ));
+                }
+                Ok(out.into_iter().map(|(_, e)| e).collect())
+            }
+            Embedder::Cmd(cmd) => {
+                use std::io::Write;
+                let mut child = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .map_err(|e| format!("cannot run embed command: {e}"))?;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(serde_json::to_string(texts).unwrap().as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let out = child.wait_with_output().map_err(|e| e.to_string())?;
+                if !out.status.success() {
+                    return Err(format!("embed command exited with {}", out.status));
+                }
+                let v: Vec<Vec<f32>> = serde_json::from_slice(&out.stdout).map_err(|e| {
+                    format!("embed command output is not a JSON array of float arrays: {e}")
+                })?;
+                if v.len() != texts.len() {
+                    return Err(format!(
+                        "asked for {} embeddings, got {}",
+                        texts.len(),
+                        v.len()
+                    ));
+                }
+                Ok(v)
+            }
+        }
+    }
+}
+
+fn short(s: &str) -> String {
+    if s.len() > 200 {
+        format!("{}…", &s[..200])
+    } else {
+        s.to_string()
+    }
+}
+
 struct App {
     db: Db,
     path: String,
     dim: usize,
     metric: Metric,
     read_only: bool,
+    embed: Option<Embedder>,
+    /// Where `add` stores the text it embedded: the text field, else `text`.
+    text_key: String,
     /// PCA basis of the last map: mean, two components, and the sampled
     /// points, so later searches can be projected onto the same plane.
     map: Mutex<Option<MapState>>,
@@ -39,11 +163,29 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut path = None;
     let mut port = 7070u16;
-    let mut text_field = None;
+    let mut text_field: Option<String> = None;
     let mut read_only = false;
+    let (mut embed_url, mut embed_model, mut embed_key_env, mut embed_cmd) =
+        (None, None, None, None);
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--embed-url" => {
+                embed_url = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--embed-model" => {
+                embed_model = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--embed-key-env" => {
+                embed_key_env = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--embed-cmd" => {
+                embed_cmd = Some(args[i + 1].clone());
+                i += 1;
+            }
             "--port" => {
                 port = args[i + 1].parse().expect("--port takes a number");
                 i += 1;
@@ -59,10 +201,23 @@ fn main() {
     }
     let Some(path) = path else {
         eprintln!(
-            "usage: sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only]"
+            "usage: sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only] [--embed-url URL --embed-model NAME [--embed-key-env VAR] | --embed-cmd CMD]"
         );
         std::process::exit(2);
     };
+    let embed = match (embed_url, embed_cmd) {
+        (Some(url), _) => {
+            let Some(model) = embed_model else {
+                eprintln!("--embed-url needs --embed-model");
+                std::process::exit(2);
+            };
+            let key = embed_key_env.and_then(|v| std::env::var(v).ok());
+            Some(Embedder::Http { url, model, key })
+        }
+        (None, Some(cmd)) => Some(Embedder::Cmd(cmd)),
+        (None, None) => None,
+    };
+    let text_key = text_field.clone().unwrap_or_else(|| "text".to_string());
     let (dim, metric) = Db::peek(&path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
         std::process::exit(1);
@@ -98,6 +253,8 @@ fn main() {
         dim: dim as usize,
         metric,
         read_only,
+        embed,
+        text_key,
         map: Mutex::new(None),
     });
     let server = Server::http(("127.0.0.1", port)).expect("bind");
@@ -147,6 +304,7 @@ fn handle(app: Arc<App>, mut req: Request) {
         (Method::Post, "/api/record") => update(&app, &query, &body),
         (Method::Delete, "/api/record") => remove(&app, &query),
         (Method::Post, "/api/search") => search(&app, &body),
+        (Method::Post, "/api/add") => add(&app, &body),
         (Method::Get, "/api/map") => map(&app, &query),
         (Method::Get, "/api/labels") => labels(&app, &query),
         (Method::Get, "/api/files") => Ok(files(&app)),
@@ -190,6 +348,8 @@ fn info(app: &App) -> J {
         "dim": app.dim,
         "metric": metric_name(app.metric),
         "read_only": app.read_only,
+        "embed": app.embed.as_ref().map(|e| e.describe()),
+        "text_key": app.text_key,
         "len": app.db.len(),
         "delta_len": app.db.delta_len(),
         "index": ix.map(|x| json!({
@@ -429,6 +589,8 @@ fn hits_json(app: &App, hits: &[Hit], with_meta: bool) -> Vec<J> {
 struct SearchReq {
     id: Option<u64>,
     vector: Option<Vec<f32>>,
+    /// Text to embed with the attached model and use as the query vector.
+    query_text: Option<String>,
     text: Option<String>,
     sparse: Option<(Vec<u32>, Vec<f32>)>,
     filter: Option<J>,
@@ -449,9 +611,23 @@ fn search(app: &App, body: &str) -> Result<J, String> {
         .filter(|f| !f.as_object().is_some_and(|o| o.is_empty()))
         .map(json_filter)
         .transpose()?;
-    let vector = match (&r.vector, r.id) {
-        (Some(v), _) => Some(v.clone()),
-        (None, Some(id)) => Some(app.db.get(id).ok_or("no such record")?.0),
+    let vector = match (&r.vector, r.id, &r.query_text) {
+        (Some(v), _, _) => Some(v.clone()),
+        (None, Some(id), _) => Some(app.db.get(id).ok_or("no such record")?.0),
+        (None, None, Some(t)) if !t.trim().is_empty() => {
+            let e = app.embed.as_ref().ok_or(
+                "no embedding model attached: start studio with --embed-url or --embed-cmd",
+            )?;
+            let v = e.embed(std::slice::from_ref(t))?.remove(0);
+            if v.len() != app.dim {
+                return Err(format!(
+                    "the model returned {} dimensions, the store has {}",
+                    v.len(),
+                    app.dim
+                ));
+            }
+            Some(v)
+        }
         _ => None,
     };
     let t = std::time::Instant::now();
@@ -506,7 +682,9 @@ fn search(app: &App, body: &str) -> Result<J, String> {
                 "sparse",
             )
         }
-        (None, None, None) => return Err("give an id, a vector, text or a sparse query".into()),
+        (None, None, None) => {
+            return Err("give an id, text to embed, keyword text or a sparse query".into());
+        }
     };
     let micros = t.elapsed().as_micros();
     Ok(json!({
@@ -516,6 +694,63 @@ fn search(app: &App, body: &str) -> Result<J, String> {
         "walk": hits_json(app, &walk, false),
         "query_xy": vector.as_ref().and_then(|v| app.map.lock().unwrap().as_ref().map(|s| project(s, v))),
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct AddReq {
+    id: Option<u64>,
+    text: Option<String>,
+    vector: Option<Vec<f32>>,
+    #[serde(default)]
+    meta: J,
+}
+
+/// Add one record from text (embedded with the attached model) or from a
+/// vector. The text is kept in the metadata under the store's text key.
+fn add(app: &App, body: &str) -> Result<J, String> {
+    if app.read_only {
+        return Err("store opened read-only".into());
+    }
+    let r: AddReq = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let mut meta = if r.meta.is_null() {
+        sanadb::Metadata::new()
+    } else {
+        json_meta(&r.meta)?
+    };
+    let vector = match (&r.vector, &r.text) {
+        (Some(v), _) => v.clone(),
+        (None, Some(t)) if !t.trim().is_empty() => {
+            let e = app.embed.as_ref().ok_or(
+                "no embedding model attached: start studio with --embed-url or --embed-cmd",
+            )?;
+            meta.entry(app.text_key.clone())
+                .or_insert_with(|| Value::Str(t.clone()));
+            e.embed(std::slice::from_ref(t))?.remove(0)
+        }
+        _ => return Err("give text to embed or a vector".into()),
+    };
+    if vector.len() != app.dim {
+        return Err(format!(
+            "{} dimensions given, the store has {}",
+            vector.len(),
+            app.dim
+        ));
+    }
+    let id = match r.id {
+        Some(id) => id,
+        None => app.db.ids().last().map_or(0, |m| m + 1),
+    };
+    if r.id.is_some() && app.db.get(id).is_some() {
+        return Err(format!(
+            "record {id} exists; delete it or leave the id empty for a new one"
+        ));
+    }
+    app.db
+        .insert(id, &vector, meta)
+        .map_err(|e| e.to_string())?;
+    *app.map.lock().unwrap() = None;
+    let (v, m) = app.db.get(id).ok_or("inserted record not readable")?;
+    Ok(json!({"id": id, "vector_len": v.len(), "meta": meta_json(&m)}))
 }
 
 fn project(s: &MapState, v: &[f32]) -> (f32, f32) {

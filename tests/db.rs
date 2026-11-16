@@ -3243,3 +3243,76 @@ fn sparse_vectors_index_search_and_round_trip() {
         Value::Sparse(vec![(2, 1.0), (5, 3.0)])
     );
 }
+
+#[test]
+fn embedder_trait_adds_and_searches_by_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(
+        dir.path().join("e.sana"),
+        Options::new(16).text_field("body"),
+    )
+    .unwrap();
+    // Any closure is an embedder: here a hashed bag of words.
+    let model = |texts: &[&str]| -> sanadb::Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let mut v = vec![0f32; 16];
+                for w in t.split_whitespace() {
+                    let h = w
+                        .bytes()
+                        .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+                    v[(h % 16) as usize] += 1.0;
+                }
+                v
+            })
+            .collect())
+    };
+    db.add_text(
+        1,
+        "the borrow checker",
+        meta(&[("lang", "rust")]),
+        "body",
+        &model,
+    )
+    .unwrap();
+    db.add_text(
+        2,
+        "asyncio event loop",
+        meta(&[("lang", "py")]),
+        "body",
+        &model,
+    )
+    .unwrap();
+    db.add_text(
+        3,
+        "borrow checker rejects aliasing",
+        HashMap::new(),
+        "body",
+        &model,
+    )
+    .unwrap();
+    assert_eq!(
+        db.get(3).unwrap().1["body"],
+        "borrow checker rejects aliasing"
+    );
+    let hits = db
+        .search_text_embedded("borrow checker", 2, None, &model)
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|h| h.id)
+            .collect::<std::collections::HashSet<_>>(),
+        [1, 3].into()
+    );
+    let hits = db
+        .search_text_embedded(
+            "event loop",
+            1,
+            Some(&sanadb::Filter::eq("lang", "py")),
+            &model,
+        )
+        .unwrap();
+    assert_eq!(hits[0].id, 2);
+    assert_eq!(db.search_text("aliasing", 1, None).unwrap()[0].id, 3);
+}

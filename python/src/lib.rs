@@ -212,6 +212,41 @@ fn to_filter(d: &Bound<'_, PyDict>) -> PyResult<Expr> {
 #[pyclass(name = "Db", module = "sanadb")]
 struct PyDb {
     inner: Arc<sanadb_core::Db>,
+    /// A callable `list[str] -> array-like (n, dim)`, when the user gave one.
+    embed: Option<PyObject>,
+    text_key: String,
+}
+
+/// Call the embedding function on `texts` and return one f32 vector each.
+fn call_embed(py: Python<'_>, f: &PyObject, texts: &[String]) -> PyResult<Vec<Vec<f32>>> {
+    let out = f.bind(py).call1((PyList::new(py, texts)?,))?;
+    let rows: Vec<Vec<f32>> = if let Ok(a) = out.downcast::<PyArray2<f32>>() {
+        a.readonly()
+            .as_array()
+            .outer_iter()
+            .map(|r| r.to_vec())
+            .collect()
+    } else if let Ok(a) = out.downcast::<PyArray2<f64>>() {
+        a.readonly()
+            .as_array()
+            .outer_iter()
+            .map(|r| r.iter().map(|&x| x as f32).collect())
+            .collect()
+    } else {
+        out.extract::<Vec<Vec<f32>>>().map_err(|_| {
+            PyTypeError::new_err(
+                "embedding_function must return an (n, dim) array or a list of float lists",
+            )
+        })?
+    };
+    if rows.len() != texts.len() {
+        return Err(PyValueError::new_err(format!(
+            "embedding_function returned {} vectors for {} texts",
+            rows.len(),
+            texts.len()
+        )));
+    }
+    Ok(rows)
 }
 
 #[pymethods]
@@ -233,7 +268,7 @@ impl PyDb {
     /// no lock is taken, reads follow the writer's appends and checkpoints,
     /// and writes raise PermissionError.
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None, embedding_function = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -251,7 +286,9 @@ impl PyDb {
         read_only: bool,
         storage: &str,
         text_field: Option<String>,
+        embedding_function: Option<PyObject>,
     ) -> PyResult<Self> {
+        let text_key = text_field.clone().unwrap_or_else(|| "text".to_string());
         let metric = match metric {
             "l2" => Metric::L2,
             "dot" | "ip" => Metric::Dot,
@@ -299,6 +336,8 @@ impl PyDb {
             .map_err(err)?;
         Ok(PyDb {
             inner: Arc::new(db),
+            embed: embedding_function,
+            text_key,
         })
     }
 
@@ -542,6 +581,99 @@ impl PyDb {
     }
 
     /// Copy the store into `dir` in a consistent state; returns the copy's path.
+    /// Embed `documents` with the embedding function and insert them in one
+    /// atomic batch; each document's text is kept under the text field (or
+    /// `text`) so `get` and `search_text` see it. `ids` default to the next
+    /// free ids.
+    #[pyo3(signature = (documents, ids = None, metas = None))]
+    fn add(
+        &self,
+        py: Python<'_>,
+        documents: Vec<String>,
+        ids: Option<Vec<u64>>,
+        metas: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<Vec<u64>> {
+        let f = self
+            .embed
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("add() needs an embedding_function on the Db"))?;
+        let ids = match ids {
+            Some(i) if i.len() != documents.len() => {
+                return Err(PyValueError::new_err(
+                    "ids must have one entry per document",
+                ));
+            }
+            Some(i) => i,
+            None => {
+                let next = self.inner.ids().last().map_or(0, |m| m + 1);
+                (next..next + documents.len() as u64).collect()
+            }
+        };
+        let mut metas: Vec<Metadata> = match metas {
+            Some(l) => {
+                if l.len() != documents.len() {
+                    return Err(PyValueError::new_err(
+                        "metas must have one entry per document",
+                    ));
+                }
+                l.iter()
+                    .map(|o| {
+                        if o.is_none() {
+                            Ok(Metadata::new())
+                        } else {
+                            to_meta(Some(o.downcast::<PyDict>()?))
+                        }
+                    })
+                    .collect::<PyResult<_>>()?
+            }
+            None => vec![Metadata::new(); documents.len()],
+        };
+        let vectors = call_embed(py, f, &documents)?;
+        for (m, d) in metas.iter_mut().zip(&documents) {
+            m.entry(self.text_key.clone())
+                .or_insert_with(|| Value::Str(d.clone()));
+        }
+        let db = self.inner.clone();
+        let out = ids.clone();
+        py.allow_threads(move || {
+            let mut b = Batch::new();
+            for ((id, v), m) in ids.into_iter().zip(&vectors).zip(metas) {
+                b = b.insert(id, v, m);
+            }
+            db.write_batch(b)
+        })
+        .map_err(err)?;
+        Ok(out)
+    }
+
+    /// Embed `texts` and search each: a list of `[(id, score), ...]` per text.
+    #[pyo3(signature = (texts, k = 10, filter = None))]
+    fn query(
+        &self,
+        py: Python<'_>,
+        texts: Vec<String>,
+        k: usize,
+        filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<Vec<(u64, f32)>>> {
+        let f = self.embed.as_ref().ok_or_else(|| {
+            PyValueError::new_err("query() needs an embedding_function on the Db")
+        })?;
+        let flt = filter.map(to_filter).transpose()?;
+        let vectors = call_embed(py, f, &texts)?;
+        let db = self.inner.clone();
+        py.allow_threads(move || {
+            vectors
+                .iter()
+                .map(|v| match &flt {
+                    Some(fl) => db.search_where(v, k, fl),
+                    None => db.search(v, k),
+                })
+                .map(|r| r.map(|hits| hits.into_iter().map(|h| (h.id, h.score)).collect()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(err)
+    }
+
     /// Dot-product search over the store's sparse key: `query` is an `(indices,
     /// weights)` pair. Scores are negated dot products.
     #[pyo3(signature = (query, k = 10, filter = None))]

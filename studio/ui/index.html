@@ -66,6 +66,7 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 label{display:block;font-size:12px;font-weight:500;color:var(--ink-2);margin:10px 0 4px}
 label:first-of-type{margin-top:0}
 label .hint{font-weight:400;color:var(--muted);margin-left:6px}
+label .hint code,.msg code{font:11.5px var(--mono);color:var(--ink-2)}
 .check{display:flex;align-items:center;gap:7px;margin-top:10px;font-size:12.5px;color:var(--ink-2);cursor:pointer}
 .check input{margin:0;width:14px;height:14px;accent-color:var(--ink)}
 .msg{font-size:12px;color:var(--muted);margin-top:8px;min-height:1.2em}
@@ -185,6 +186,7 @@ footer b{color:var(--ink);font:12px var(--mono);font-weight:500}
     </div>
     <div class="path" id="path" title=""></div>
     <div class="facts" id="facts"></div>
+    <button id="addbtn" title="Add a record from text (needs an embedding model) or from a vector">Add record</button>
     <button id="ckpt" title="Build the graph index over everything written so far and compact the log">Checkpoint</button>
     <button class="theme" id="theme" title="Switch light / dark" aria-label="Switch light or dark theme">
       <svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
@@ -195,6 +197,11 @@ footer b{color:var(--ink);font:12px var(--mono);font-weight:500}
   <aside>
     <div class="sect">
       <h2>Query</h2>
+      <div id="embedq" hidden>
+        <label for="qembed">Text to embed <span class="hint" id="embedname"></span></label>
+        <textarea id="qembed" spellcheck="true" placeholder="any text; the attached model turns it into the query vector"></textarea>
+      </div>
+      <div class="msg" id="noembed" hidden>No embedding model attached: searches start from a record id. Start studio with <code>--embed-url</code> or <code>--embed-cmd</code> to search by text.</div>
       <label for="qid">Record id <span class="hint">its vector is the query</span></label>
       <input type="text" id="qid" placeholder="4211" inputmode="numeric" autocomplete="off">
       <label for="qtext">Keyword text <span class="hint">BM25; with an id, hybrid</span></label>
@@ -315,7 +322,12 @@ async function loadInfo() {
     (ix ? `<span>index ${count(ix.nodes)} nodes · ${ix.storage}${ix.pq_subspaces ? " · PQ " + ix.pq_subspaces : ""}${ix.tombstones ? " · " + human(ix.tombstones) + " tombstoned" : ""}</span>`
         : `<span>no index yet</span>`) +
     `<span class="tail">${count(info.delta_len)} in the tail</span>` +
+    (info.embed ? `<span title="${esc(info.embed.url || info.embed.command)}">model <b>${esc(info.embed.model || "command")}</b></span>` : "") +
     (info.read_only ? `<span class="ro">read-only</span>` : "");
+  $("embedq").hidden = !info.embed;
+  $("noembed").hidden = !!info.embed;
+  if (info.embed) $("embedname").textContent = info.embed.model ? `with ${info.embed.model}` : "with the attached command";
+  $("addbtn").disabled = info.read_only;
   $("ckpt").disabled = info.read_only;
   $("keys").innerHTML = info.keys.length
     ? info.keys.map(k => `<span class="k"><code>${esc(k.name)}</code><span>${k.kind}</span></span>`).join("")
@@ -434,10 +446,51 @@ async function inspect(id) {
   };
 }
 
+/* ---------- add record ---------- */
+$("addbtn").onclick = () => {
+  selected = null; markSelected(); draw();
+  $("inspector").innerHTML = `
+    <h2>Add record</h2>
+    ${info.embed ? `<label for="atext">Text <span class="hint">embedded with ${esc(info.embed.model || "the attached command")}, kept under <code>${esc(info.text_key)}</code></span></label>
+    <textarea id="atext" style="min-height:90px" placeholder="the document, passage or caption to store"></textarea>`
+    : `<div class="msg">No embedding model attached, so the vector has to be given.</div>`}
+    <label for="avec">Vector <span class="hint">${info.embed ? "optional, overrides the text" : `${info.dim} numbers`}</span></label>
+    <textarea id="avec" placeholder="[0.12, -0.03, …] or space-separated"></textarea>
+    <label for="ameta">Metadata <span class="hint">JSON object, optional</span></label>
+    <textarea id="ameta" spellcheck="false" placeholder='{"lang": "en", "year": 2026}'></textarea>
+    <label for="aid">Id <span class="hint">optional, next free id otherwise</span></label>
+    <input type="text" id="aid" inputmode="numeric" placeholder="auto">
+    <div class="actions"><button class="primary" id="asave">Add record</button></div>
+    <div class="msg" id="amsg"></div>`;
+  $("asave").onclick = async () => {
+    const body = {};
+    const t = ($("atext") && $("atext").value.trim()) || "";
+    const vs = $("avec").value.trim();
+    if (vs) {
+      const nums = vs.replace(/[\[\]]/g, " ").split(/[\s,]+/).filter(Boolean).map(Number);
+      if (nums.some(isNaN)) { $("amsg").className = "msg err"; $("amsg").textContent = "Vector: numbers only."; return; }
+      body.vector = nums;
+    }
+    if (t) body.text = t;
+    const m = $("ameta").value.trim();
+    if (m) { try { body.meta = JSON.parse(m); } catch (e) { $("amsg").className = "msg err"; $("amsg").textContent = "Metadata is not valid JSON: " + e.message; return; } }
+    const idv = $("aid").value.trim(); if (idv) body.id = +idv;
+    $("asave").disabled = true; $("amsg").className = "msg"; $("amsg").textContent = t && !vs ? "Embedding and writing…" : "Writing…";
+    try {
+      const j = await api("/api/add", {method: "POST", body: JSON.stringify(body)});
+      $("amsg").className = "msg ok"; $("amsg").textContent = `Record ${j.id} written to the log; it is searchable now and in the index at the next checkpoint.`;
+      mapData = null; loadInfo(); loadList(); loadMap();
+      setTimeout(() => inspect(j.id), 600);
+    } catch (e) { $("amsg").className = "msg err"; $("amsg").textContent = e.message; }
+    $("asave").disabled = false;
+  };
+};
+
 /* ---------- search ---------- */
 async function search() {
   const body = {k: +$("qk").value || 10, walk: $("qwalk").checked};
   const id = $("qid").value.trim(); if (id) body.id = +id;
+  const qe = $("qembed").value.trim(); if (qe && !id) body.query_text = qe;
   const text = $("qtext").value.trim(); if (text) body.text = text;
   const sp = $("qsparse").value.trim();
   if (sp) {
@@ -448,7 +501,7 @@ async function search() {
   if (text && sp) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Keyword text or a sparse vector, not both."; return; }
   const f = $("qfilter").value.trim();
   if (f) { try { body.filter = JSON.parse(f); } catch (e) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Filter is not valid JSON: " + e.message; return; } }
-  if (!id && !text && !sp) { $("qmsg").className = "msg err"; $("qmsg").textContent = "Give a record id, keyword text or a sparse vector."; return; }
+  if (!id && !qe && !text && !sp) { $("qmsg").className = "msg err"; $("qmsg").textContent = info.embed ? "Give text to embed, a record id, keyword text or a sparse vector." : "Give a record id, keyword text or a sparse vector."; return; }
   $("go").disabled = true; $("qmsg").className = "msg"; $("qmsg").textContent = "Searching…";
   try {
     const j = await api("/api/search", {method: "POST", body: JSON.stringify(body)});
@@ -471,6 +524,7 @@ async function search() {
 }
 $("go").onclick = search;
 for (const id of ["qid", "qtext", "qsparse"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") search(); });
+$("qembed").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); search(); } });
 $("qfilter").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) search(); });
 $("ckpt").onclick = async () => {
   $("ckpt").disabled = true; $("ckpt").textContent = "Building…";

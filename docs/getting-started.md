@@ -58,6 +58,31 @@ In Rust the same calls are `search`, `search_where(&q, k, &Filter::and([...]))`,
 `search_filtered(&q, k, |m| ...)`, `search_text`, `search_hybrid`,
 `search_sparse`, `search_hybrid_sparse`, `search_many`.
 
+## 3b. Bring an embedding model
+
+The store takes vectors; it does not make them. Attach the model you use
+and work in text:
+
+```python
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("all-MiniLM-L6-v2")          # 384 dimensions
+
+db = sanadb.Db("docs.sana", dim=384, metric="cosine", text_field="body",
+               embedding_function=lambda texts: model.encode(texts))
+ids = db.add(["Rust borrow checker explained", "asyncio event loop internals"],
+             metas=[{"lang": "rust"}, {"lang": "python"}])
+hits = db.query(["how does borrowing work"], k=5, filter={"lang": "rust"})[0]
+```
+
+`embedding_function` is any callable from a list of strings to an
+`(n, dim)` array: a sentence-transformers model, an OpenAI or Ollama
+client, your own. `add` keeps each document's text under the text field
+so `get` and `search_text` see it; `query` embeds and searches. In Rust
+the same is the `Embedder` trait (any closure or struct), `Db::add_text`
+and `Db::search_text_embedded`, with an `OpenAiEmbedder` for any
+OpenAI-compatible endpoint behind the `embed-http` feature. Studio takes
+the model as a flag; see [studio.md](studio.md).
+
 ## 4. Read back
 
 ```python

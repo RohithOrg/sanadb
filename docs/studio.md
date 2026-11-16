@@ -15,13 +15,38 @@ sanadb-studio data/vectors.sana
 # sanadb studio 0.2.1: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
 ```
 
-`sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only]`
+```
+sanadb-studio <store.sana> [--port 7070] [--text-field KEY] [--read-only]
+              [--embed-url URL --embed-model NAME [--embed-key-env VAR] | --embed-cmd CMD]
+```
 
 The dimension and metric come from the file. Pass `--text-field` with the
 key the store was built with to enable keyword and hybrid search. Studio
 opens the store as its writer; if another process holds it, studio falls
 back to read-only and says so in the header. It binds to `127.0.0.1` and
 has no authentication: one store, one machine, one person.
+
+## 0. Attach an embedding model
+
+Without a model the page can only search from a record that is already
+in the store. With one, you type text. Two ways to attach it:
+
+```bash
+# any OpenAI-compatible /v1/embeddings endpoint: Ollama, LM Studio, vLLM,
+# text-embeddings-inference, OpenAI itself (the key comes from an env var)
+sanadb-studio docs.sana --embed-url http://localhost:11434/v1/embeddings --embed-model nomic-embed-text
+sanadb-studio docs.sana --embed-url https://api.openai.com/v1/embeddings --embed-model text-embedding-3-small --embed-key-env OPENAI_API_KEY
+
+# or any command: a JSON array of strings on stdin, a JSON array of float arrays on stdout
+sanadb-studio docs.sana --embed-cmd "python embed.py"
+```
+
+The model's dimension has to match the store's; a mismatch is reported
+on the first query. The header shows which model is attached, the query
+panel gains a "Text to embed" box, and the **Add record** button in the
+header takes text, optional metadata and an optional id, embeds the text,
+keeps it under the text field (or `text`), and writes the record. Nothing
+is sent anywhere except to the endpoint or command you named.
 
 ## 1. Read the header
 
@@ -42,8 +67,11 @@ million records and is cached until the next checkpoint.
 
 ![the query panel](img/studio-2-query.png)
 
-- **From record id** uses that record's vector as the query: the way to
-  ask "what is near this one".
+- **Text to embed** (with a model attached) is the query most people
+  mean: the text becomes a vector through the model and the search runs
+  on that.
+- **Record id** uses that record's vector as the query: the way to ask
+  "what is near this one".
 - **Keyword text** runs BM25 over the text field; with an id as well it
   becomes a hybrid search, fused by reciprocal rank.
 - **Sparse vector** takes `index:weight` pairs (`3:1.0 52:2.0`), alone or
@@ -147,6 +175,4 @@ in both.
 ## What it is not
 
 Not an admin console and not multi-store: one file, one process, no
-users. Inserting new records from the page is not there yet (it needs a
-vector, and the page has no embedding model); import from a file is on
-the roadmap.
+users. Import from a file is on the roadmap.

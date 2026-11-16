@@ -13,6 +13,7 @@
 //! keep going while it runs.
 
 mod attrs;
+pub mod embed;
 #[doc(hidden)]
 pub mod fault;
 mod filter;
@@ -25,6 +26,7 @@ mod sparse;
 mod text;
 mod wal;
 
+pub use embed::Embedder;
 pub use filter::Filter;
 pub use graph::Storage;
 

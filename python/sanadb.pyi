@@ -33,7 +33,10 @@ class Db:
         read_only: bool = False,
         storage: str = "f32",
         text_field: Optional[str] = None,
-    ) -> None: ...
+        embedding_function: Optional[Callable[[list[str]], npt.ArrayLike]] = None,
+    ) -> None:
+        """`embedding_function` maps a list of texts to an (n, dim) array; it
+        enables `add()` and `query()`, like Chroma's embedding functions."""
     @property
     def dim(self) -> int: ...
     @property
@@ -49,6 +52,18 @@ class Db:
         metas: Optional[Sequence[Optional[Metadata]]] = None,
     ) -> None:
         """Insert `(n, dim)` vectors atomically: all of them or none."""
+    def add(
+        self,
+        documents: Sequence[str],
+        ids: Optional[Sequence[int]] = None,
+        metas: Optional[Sequence[Optional[Metadata]]] = None,
+    ) -> list[int]:
+        """Embed the documents and insert them atomically; the text is kept
+        under the text field (or `text`). Returns the ids used."""
+    def query(
+        self, texts: Sequence[str], k: int = 10, filter: Optional[Mapping[str, Any]] = None
+    ) -> list[list[tuple[int, float]]]:
+        """Embed each text and search: one `[(id, score), ...]` per text."""
     def delete(self, id: int) -> bool: ...
     def delete_many(self, ids: Sequence[int]) -> None: ...
     def get(self, id: int) -> Optional[tuple[npt.NDArray[np.float32], Metadata]]: ...

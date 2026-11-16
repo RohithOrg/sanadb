@@ -277,3 +277,24 @@ def test_sparse_vectors(tmp_path):
     with pytest.raises(ValueError):
         db.insert(4, np.ones(4, dtype=np.float32), {"other": ([1], [1.0])})
     assert db.stats()["sparse_searches"] == 4
+
+
+def test_embedding_function_add_and_query(tmp_path):
+    def embed(texts):
+        # a hashed bag of words: deterministic, 16 dims
+        out = np.zeros((len(texts), 16), dtype=np.float32)
+        for i, t in enumerate(texts):
+            for w in t.lower().split():
+                out[i, hash(w) % 16] += 1.0
+        return out
+    db = sanadb.Db(str(tmp_path / "e.sana"), dim=16, embedding_function=embed, text_field="body")
+    ids = db.add(["the borrow checker", "asyncio event loop", "borrow checker rejects aliasing"], metas=[{"lang": "rust"}, {"lang": "py"}, {"lang": "rust"}])
+    assert ids == [0, 1, 2]
+    assert db.get(2)[1]["body"] == "borrow checker rejects aliasing"
+    hits = db.query(["borrow checker"], k=2)[0]
+    assert {i for i, _ in hits} == {0, 2}
+    assert [i for i, _ in db.query(["event loop"], k=1, filter={"lang": "py"})[0]] == [1]
+    assert db.search_text("aliasing")[0][0] == 2
+    plain = sanadb.Db(str(tmp_path / "p.sana"), dim=16)
+    with pytest.raises(ValueError):
+        plain.add(["x"])
