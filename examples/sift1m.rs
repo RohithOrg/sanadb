@@ -21,10 +21,18 @@ fn read_vecs<T: Copy, const W: usize>(path: &Path, from: impl Fn([u8; W]) -> T) 
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let dim = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     let stride = 4 + dim * W;
-    assert_eq!(bytes.len() % stride, 0, "{} is not a whole number of records", path.display());
+    assert_eq!(
+        bytes.len() % stride,
+        0,
+        "{} is not a whole number of records",
+        path.display()
+    );
     let mut out = Vec::with_capacity(bytes.len() / stride * dim);
     for rec in bytes.chunks_exact(stride) {
-        assert_eq!(u32::from_le_bytes(rec[..4].try_into().unwrap()) as usize, dim);
+        assert_eq!(
+            u32::from_le_bytes(rec[..4].try_into().unwrap()) as usize,
+            dim
+        );
         out.extend(rec[4..].as_chunks::<W>().0.iter().map(|c| from(*c)));
     }
     (dim, out)
@@ -50,10 +58,24 @@ fn main() {
     // an index over the same `n` already exists there (for profiling queries).
     let tmp = tempfile::tempdir().unwrap();
     let keep = std::env::var_os("SIFT_STORE").map(std::path::PathBuf::from);
-    let path = keep.as_deref().unwrap_or(tmp.path()).join(format!("sift{}.{}.sana", n / 1000, if use_pq { "pq" } else { "nopq" }));
-    let params = GraphParams { use_pq, prune_slack, ..GraphParams::default() };
+    let path = keep.as_deref().unwrap_or(tmp.path()).join(format!(
+        "sift{}.{}.sana",
+        n / 1000,
+        if use_pq { "pq" } else { "nopq" }
+    ));
+    let params = GraphParams {
+        use_pq,
+        prune_slack,
+        ..GraphParams::default()
+    };
     // Bulk load: one explicit build at the end, no automatic ones in between.
-    let mut db = Db::open(&path, Options::new(dim as u32).graph(params).auto_checkpoint_delta(0)).unwrap();
+    let mut db = Db::open(
+        &path,
+        Options::new(dim as u32)
+            .graph(params)
+            .auto_checkpoint_delta(0),
+    )
+    .unwrap();
     println!("prune_slack={prune_slack}");
 
     if db.index_stats().is_some_and(|s| s.nodes == n) {
@@ -61,28 +83,51 @@ fn main() {
     } else {
         let t = Instant::now();
         for i in 0..n {
-            db.insert(i as u64, &base[i * dim..(i + 1) * dim], HashMap::new()).unwrap();
+            db.insert(i as u64, &base[i * dim..(i + 1) * dim], HashMap::new())
+                .unwrap();
         }
         println!("insert {n}: {:.1?}", t.elapsed());
         let t = Instant::now();
         db.checkpoint().unwrap();
         let build = t.elapsed();
         let stats = db.index_stats().unwrap();
-        let idx_bytes = fs::metadata(format!("{}.idx", path.display())).unwrap().len();
-        println!("build: {build:.1?}  nodes={} pq_subspaces={} index={:.0} MB", stats.nodes, stats.pq_subspaces, idx_bytes as f64 / 1e6);
+        let idx_bytes = fs::metadata(format!("{}.idx", path.display()))
+            .unwrap()
+            .len();
+        println!(
+            "build: {build:.1?}  nodes={} pq_subspaces={} index={:.0} MB",
+            stats.nodes,
+            stats.pq_subspaces,
+            idx_bytes as f64 / 1e6
+        );
     }
 
     // Ground truth: published top-100 for the full set, brute force otherwise.
     let k = 10;
     let truth: Vec<Vec<u64>> = if n == n_total {
-        (0..n_queries).map(|q| gt[q * gt_k..q * gt_k + k].iter().map(|&i| i as u64).collect()).collect()
+        (0..n_queries)
+            .map(|q| {
+                gt[q * gt_k..q * gt_k + k]
+                    .iter()
+                    .map(|&i| i as u64)
+                    .collect()
+            })
+            .collect()
     } else {
         println!("subset: computing brute-force ground truth for {n_queries} queries");
         (0..n_queries)
             .map(|qi| {
                 let q = &queries[qi * dim..(qi + 1) * dim];
                 let mut d: Vec<(f32, u64)> = (0..n)
-                    .map(|i| (q.iter().zip(&base[i * dim..(i + 1) * dim]).map(|(a, b)| (a - b) * (a - b)).sum(), i as u64))
+                    .map(|i| {
+                        (
+                            q.iter()
+                                .zip(&base[i * dim..(i + 1) * dim])
+                                .map(|(a, b)| (a - b) * (a - b))
+                                .sum(),
+                            i as u64,
+                        )
+                    })
                     .collect();
                 d.sort_by(|a, b| a.0.total_cmp(&b.0));
                 d[..k].iter().map(|e| e.1).collect()
@@ -90,10 +135,21 @@ fn main() {
             .collect()
     };
 
-    println!("{:>6} {:>9} {:>9} {:>9} {:>9}", "beam", "recall@10", "mean", "p50", "p99");
+    println!(
+        "{:>6} {:>9} {:>9} {:>9} {:>9}",
+        "beam", "recall@10", "mean", "p50", "p99"
+    );
     for beam in [32u32, 64, 128, 256] {
         drop(db);
-        db = Db::open(&path, Options::new(dim as u32).graph(params).search_beam(beam).max_search_beam(beam).auto_checkpoint_delta(0)).unwrap();
+        db = Db::open(
+            &path,
+            Options::new(dim as u32)
+                .graph(params)
+                .search_beam(beam)
+                .max_search_beam(beam)
+                .auto_checkpoint_delta(0),
+        )
+        .unwrap();
         let mut hit = 0usize;
         let mut lat: Vec<f64> = Vec::with_capacity(n_queries);
         for qi in 0..n_queries {

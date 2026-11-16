@@ -15,7 +15,10 @@ pub(crate) const MIN_N: usize = 1024;
 /// Number of subspaces for `dim`: sub-vectors of ~4 floats, at most 128 of them.
 pub(crate) fn choose_m(dim: usize) -> usize {
     let range = || (1..=dim.min(128)).rev();
-    range().find(|&m| dim.is_multiple_of(m) && dim / m >= 4).or_else(|| range().find(|&m| dim.is_multiple_of(m))).unwrap_or(1)
+    range()
+        .find(|&m| dim.is_multiple_of(m) && dim / m >= 4)
+        .or_else(|| range().find(|&m| dim.is_multiple_of(m)))
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +44,12 @@ impl Codebook {
                 }
             }
         }
-        Codebook { dim, m, centroids, by_dim }
+        Codebook {
+            dim,
+            m,
+            centroids,
+            by_dim,
+        }
     }
 
     pub fn sub(&self) -> usize {
@@ -70,7 +78,14 @@ impl Codebook {
                     let row = sample[i];
                     &vectors[row * dim + s * sub..row * dim + (s + 1) * sub]
                 };
-                crate::kmeans::emeans(&point, sample.len(), sub, K, 3, seed ^ (s as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15))
+                crate::kmeans::emeans(
+                    &point,
+                    sample.len(),
+                    sub,
+                    K,
+                    3,
+                    seed ^ (s as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15),
+                )
             })
             .collect();
         Codebook::new(dim, m, centroids.concat())
@@ -84,7 +99,11 @@ impl Codebook {
         codes.par_chunks_mut(m).enumerate().for_each(|(row, out)| {
             let v = &vectors[row * dim..(row + 1) * dim];
             for s in 0..m {
-                out[s] = nearest(&self.centroids[s * K * sub..(s + 1) * K * sub], sub, &v[s * sub..(s + 1) * sub]) as u8;
+                out[s] = nearest(
+                    &self.centroids[s * K * sub..(s + 1) * K * sub],
+                    sub,
+                    &v[s * sub..(s + 1) * sub],
+                ) as u8;
             }
         });
         codes
@@ -101,7 +120,10 @@ impl Codebook {
                 let qd = q[s * sub + d];
                 let cents = &self.by_dim[(s * sub + d) * K..(s * sub + d + 1) * K];
                 match metric {
-                    Metric::L2 | Metric::Cosine => row.iter_mut().zip(cents).for_each(|(l, &c)| *l += (qd - c) * (qd - c)),
+                    Metric::L2 | Metric::Cosine => row
+                        .iter_mut()
+                        .zip(cents)
+                        .for_each(|(l, &c)| *l += (qd - c) * (qd - c)),
                     Metric::Dot => row.iter_mut().zip(cents).for_each(|(l, &c)| *l -= qd * c),
                 }
             }
@@ -124,7 +146,13 @@ pub(crate) fn lut_distance(lut: &[f32], code: &[u8]) -> f32 {
         }
     }
     let done = chunks.len() * 4;
-    (acc[0] + acc[1]) + (acc[2] + acc[3]) + rest.iter().enumerate().map(|(i, &c)| lut[(done + i) * K + c as usize]).sum::<f32>()
+    (acc[0] + acc[1])
+        + (acc[2] + acc[3])
+        + rest
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| lut[(done + i) * K + c as usize])
+            .sum::<f32>()
 }
 
 use crate::kmeans::{XorShift, nearest};
@@ -148,14 +176,20 @@ mod tests {
     fn pq_distance_tracks_exact() {
         let (dim, n) = (16usize, 4000usize);
         let mut rng = XorShift(7);
-        let vectors: Vec<f32> = (0..n * dim).map(|_| (rng.next() >> 40) as f32 / (1u64 << 24) as f32).collect();
+        let vectors: Vec<f32> = (0..n * dim)
+            .map(|_| (rng.next() >> 40) as f32 / (1u64 << 24) as f32)
+            .collect();
         let cb = Codebook::train(&vectors, dim, choose_m(dim), 1);
         let codes = cb.encode_all(&vectors);
         let q = &vectors[..dim];
         let lut = cb.lut(q, Metric::L2);
         let mut err = 0f32;
         for i in 0..n {
-            let exact: f32 = q.iter().zip(&vectors[i * dim..(i + 1) * dim]).map(|(a, b)| (a - b) * (a - b)).sum();
+            let exact: f32 = q
+                .iter()
+                .zip(&vectors[i * dim..(i + 1) * dim])
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
             let approx = lut_distance(&lut, &codes[i * cb.m..(i + 1) * cb.m]);
             err += (exact - approx).abs() / exact.max(1e-3);
         }

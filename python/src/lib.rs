@@ -7,14 +7,15 @@ use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use sanadb_core::{GraphParams, Metadata, Metric, Options, Value};
+use sanadb_core::{Filter as Expr, GraphParams, Metadata, Metric, Options, Value};
 
 fn err(e: sanadb_core::Error) -> PyErr {
     match e {
         sanadb_core::Error::Io(io) => PyIOError::new_err(io.to_string()),
-        sanadb_core::Error::DimMismatch { .. } | sanadb_core::Error::MetaTooLarge | sanadb_core::Error::HeaderMismatch { .. } | sanadb_core::Error::InvalidVector => {
-            PyValueError::new_err(e.to_string())
-        }
+        sanadb_core::Error::DimMismatch { .. }
+        | sanadb_core::Error::MetaTooLarge
+        | sanadb_core::Error::HeaderMismatch { .. }
+        | sanadb_core::Error::InvalidVector => PyValueError::new_err(e.to_string()),
         sanadb_core::Error::TypeMismatch { .. } => PyTypeError::new_err(e.to_string()),
         other => PyRuntimeError::new_err(other.to_string()),
     }
@@ -42,7 +43,10 @@ fn to_value(v: &Bound<'_, PyAny>) -> PyResult<Value> {
     } else if v.is_instance_of::<PyString>() {
         Ok(Value::Str(v.extract()?))
     } else {
-        Err(PyTypeError::new_err(format!("metadata values must be str, int, float or bool, got {}", v.get_type().name()?)))
+        Err(PyTypeError::new_err(format!(
+            "metadata values must be str, int, float or bool, got {}",
+            v.get_type().name()?
+        )))
     }
 }
 
@@ -69,11 +73,96 @@ fn meta_to_py<'py>(py: Python<'py>, m: &Metadata) -> PyResult<Bound<'py, PyDict>
     Ok(d)
 }
 
-/// Either a dict of exact-match pairs (evaluated in Rust, GIL released) or a
-/// Python callable taking the metadata dict (GIL held during the search).
+/// Either a filter dict (compiled to a `Filter`, evaluated in Rust on the
+/// index's columns, GIL released) or a Python callable taking the metadata
+/// dict (GIL held during the search, applied to visited nodes).
 enum Filter {
-    Equals(Metadata),
+    Expr(Expr),
     Callable(PyObject),
+}
+
+/// Parse the filter dict. `{"k": v}` is equality; `{"k": {"$op": v}}` applies
+/// operators `$eq $ne $in $lt $le $lte $gt $ge $gte $prefix $exists`; the keys
+/// `$and`, `$or` take lists of dicts and `$not` one dict. Several keys in one
+/// dict are and-ed.
+fn to_filter(d: &Bound<'_, PyDict>) -> PyResult<Expr> {
+    let mut terms = Vec::with_capacity(d.len());
+    for (k, v) in d.iter() {
+        let key: String = k.extract()?;
+        let term = match key.as_str() {
+            "$and" | "$or" => {
+                let list = v.downcast::<PyList>().map_err(|_| {
+                    PyValueError::new_err(format!("{key} takes a list of filter dicts"))
+                })?;
+                let fs = list
+                    .iter()
+                    .map(|o| to_filter(o.downcast::<PyDict>()?))
+                    .collect::<PyResult<Vec<_>>>()?;
+                if key == "$and" {
+                    Expr::And(fs)
+                } else {
+                    Expr::Or(fs)
+                }
+            }
+            "$not" => Expr::Not(Box::new(to_filter(
+                v.downcast::<PyDict>()
+                    .map_err(|_| PyValueError::new_err("$not takes a filter dict"))?,
+            )?)),
+            _ if key.starts_with('$') => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown filter operator {key}"
+                )));
+            }
+            _ => match v.downcast::<PyDict>() {
+                Err(_) => Expr::Eq(key, to_value(&v)?),
+                Ok(ops) => {
+                    let mut fs = Vec::with_capacity(ops.len());
+                    for (op, arg) in ops.iter() {
+                        let op: String = op.extract()?;
+                        fs.push(match op.as_str() {
+                            "$eq" => Expr::Eq(key.clone(), to_value(&arg)?),
+                            "$ne" => Expr::Ne(key.clone(), to_value(&arg)?),
+                            "$in" => Expr::In(
+                                key.clone(),
+                                arg.try_iter()?
+                                    .map(|x| to_value(&x?))
+                                    .collect::<PyResult<Vec<_>>>()?,
+                            ),
+                            "$lt" => Expr::Lt(key.clone(), to_value(&arg)?),
+                            "$le" | "$lte" => Expr::Le(key.clone(), to_value(&arg)?),
+                            "$gt" => Expr::Gt(key.clone(), to_value(&arg)?),
+                            "$ge" | "$gte" => Expr::Ge(key.clone(), to_value(&arg)?),
+                            "$prefix" => Expr::Prefix(key.clone(), arg.extract()?),
+                            "$exists" => {
+                                let want: bool = arg.extract()?;
+                                if want {
+                                    Expr::Exists(key.clone())
+                                } else {
+                                    Expr::Not(Box::new(Expr::Exists(key.clone())))
+                                }
+                            }
+                            _ => {
+                                return Err(PyValueError::new_err(format!(
+                                    "unknown filter operator {op} for key {key}"
+                                )));
+                            }
+                        });
+                    }
+                    if fs.len() == 1 {
+                        fs.pop().unwrap()
+                    } else {
+                        Expr::And(fs)
+                    }
+                }
+            },
+        };
+        terms.push(term);
+    }
+    Ok(if terms.len() == 1 {
+        terms.pop().unwrap()
+    } else {
+        Expr::And(terms)
+    })
 }
 
 #[pyclass(name = "Db", module = "sanadb")]
@@ -109,7 +198,11 @@ impl PyDb {
             "l2" => Metric::L2,
             "dot" | "ip" => Metric::Dot,
             "cosine" => Metric::Cosine,
-            other => return Err(PyValueError::new_err(format!("unknown metric {other:?}; use \"l2\", \"dot\" or \"cosine\""))),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown metric {other:?}; use \"l2\", \"dot\" or \"cosine\""
+                )));
+            }
         };
         let opts = Options::new(dim)
             .metric(metric)
@@ -117,9 +210,19 @@ impl PyDb {
             .max_search_beam(max_search_beam)
             .io_width(io_width)
             .sync_every_write(sync_every_write)
-            .graph(GraphParams { max_degree, build_beam, alpha, use_pq: pq, ..GraphParams::default() });
-        let db = py.allow_threads(|| sanadb_core::Db::open(path, opts)).map_err(err)?;
-        Ok(PyDb { inner: Arc::new(db) })
+            .graph(GraphParams {
+                max_degree,
+                build_beam,
+                alpha,
+                use_pq: pq,
+                ..GraphParams::default()
+            });
+        let db = py
+            .allow_threads(|| sanadb_core::Db::open(path, opts))
+            .map_err(err)?;
+        Ok(PyDb {
+            inner: Arc::new(db),
+        })
     }
 
     #[getter]
@@ -139,7 +242,13 @@ impl PyDb {
 
     /// Insert or replace one record. `meta` values are stored as strings.
     #[pyo3(signature = (id, vector, meta = None))]
-    fn insert(&self, py: Python<'_>, id: u64, vector: &Bound<'_, PyAny>, meta: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    fn insert(
+        &self,
+        py: Python<'_>,
+        id: u64,
+        vector: &Bound<'_, PyAny>,
+        meta: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
         let v = to_vec(vector)?;
         let m = to_meta(meta)?;
         let db = self.inner.clone();
@@ -148,17 +257,35 @@ impl PyDb {
 
     /// Insert many records from a 2-D float32 array, one row per id.
     #[pyo3(signature = (ids, vectors, metas = None))]
-    fn insert_many(&self, py: Python<'_>, ids: Vec<u64>, vectors: PyReadonlyArray2<'_, f32>, metas: Option<&Bound<'_, PyList>>) -> PyResult<()> {
+    fn insert_many(
+        &self,
+        py: Python<'_>,
+        ids: Vec<u64>,
+        vectors: PyReadonlyArray2<'_, f32>,
+        metas: Option<&Bound<'_, PyList>>,
+    ) -> PyResult<()> {
         let shape = vectors.shape();
         if shape[0] != ids.len() {
-            return Err(PyValueError::new_err(format!("{} ids but {} rows", ids.len(), shape[0])));
+            return Err(PyValueError::new_err(format!(
+                "{} ids but {} rows",
+                ids.len(),
+                shape[0]
+            )));
         }
         let metas: Vec<Metadata> = match metas {
             Some(l) => {
                 if l.len() != ids.len() {
                     return Err(PyValueError::new_err("metas must have one entry per id"));
                 }
-                l.iter().map(|o| if o.is_none() { Ok(Metadata::new()) } else { to_meta(Some(o.downcast::<PyDict>()?)) }).collect::<PyResult<_>>()?
+                l.iter()
+                    .map(|o| {
+                        if o.is_none() {
+                            Ok(Metadata::new())
+                        } else {
+                            to_meta(Some(o.downcast::<PyDict>()?))
+                        }
+                    })
+                    .collect::<PyResult<_>>()?
             }
             None => vec![Metadata::new(); ids.len()],
         };
@@ -185,7 +312,10 @@ impl PyDb {
             None => Ok(None),
             Some((v, m)) => {
                 let arr = PyArray1::from_vec(py, v);
-                Ok(Some(PyTuple::new(py, [arr.into_any(), meta_to_py(py, &m)?.into_any()])?))
+                Ok(Some(PyTuple::new(
+                    py,
+                    [arr.into_any(), meta_to_py(py, &m)?.into_any()],
+                )?))
             }
         }
     }
@@ -195,28 +325,38 @@ impl PyDb {
     /// `filter` is a dict of metadata pairs that must all match exactly, or a
     /// callable `meta -> bool`. Dict filters run with the GIL released.
     #[pyo3(signature = (query, k = 10, filter = None))]
-    fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize, filter: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(u64, f32)>> {
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        k: usize,
+        filter: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<(u64, f32)>> {
         let q = to_vec(query)?;
         let filter = match filter {
             None => None,
-            Some(f) if f.is_instance_of::<PyDict>() => Some(Filter::Equals(to_meta(Some(f.downcast::<PyDict>()?))?)),
+            Some(f) if f.is_instance_of::<PyDict>() => {
+                Some(Filter::Expr(to_filter(f.downcast::<PyDict>()?)?))
+            }
             Some(f) if f.is_callable() => Some(Filter::Callable(f.clone().unbind())),
             Some(_) => return Err(PyValueError::new_err("filter must be a dict or a callable")),
         };
         let db = self.inner.clone();
         let hits = match filter {
             None => py.allow_threads(move || db.search(&q, k)).map_err(err)?,
-            Some(Filter::Equals(want)) => py
-                .allow_threads(move || db.search_filtered(&q, k, |m| want.iter().all(|(k, v)| m.get(k) == Some(v))))
+            Some(Filter::Expr(f)) => py
+                .allow_threads(move || db.search_where(&q, k, &f))
                 .map_err(err)?,
             Some(Filter::Callable(f)) => {
                 let py_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
                 let hits = db
-                    .search_filtered(&q, k, |m| match meta_to_py(py, m).and_then(|d| f.bind(py).call1((d,))?.is_truthy()) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            *py_err.borrow_mut() = Some(e);
-                            false
+                    .search_filtered(&q, k, |m| {
+                        match meta_to_py(py, m).and_then(|d| f.bind(py).call1((d,))?.is_truthy()) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                *py_err.borrow_mut() = Some(e);
+                                false
+                            }
                         }
                     })
                     .map_err(err)?;
@@ -232,18 +372,24 @@ impl PyDb {
     /// k nearest neighbours for every row of a 2-D float32 array, computed
     /// across all cores with the GIL released. Returns `(ids, scores)`, two
     /// `(n, k)` arrays; rows with fewer than `k` results are padded with
-    /// `ids = -1` and `scores = nan`. `filter` is a dict of metadata pairs
-    /// that must all match (callables are not accepted here).
+    /// `ids = -1` and `scores = nan`. `filter` is a filter dict as for
+    /// `search` (callables are not accepted here).
     #[pyo3(signature = (queries, k = 10, filter = None))]
-    fn search_many<'py>(&self, py: Python<'py>, queries: PyReadonlyArray2<'py, f32>, k: usize, filter: Option<&Bound<'py, PyDict>>) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
+    fn search_many<'py>(
+        &self,
+        py: Python<'py>,
+        queries: PyReadonlyArray2<'py, f32>,
+        k: usize,
+        filter: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
         let n = queries.shape()[0];
         let flat: Vec<f32> = queries.as_slice()?.to_vec();
-        let want = filter.map(|f| to_meta(Some(f))).transpose()?;
+        let f = filter.map(to_filter).transpose()?;
         let db = self.inner.clone();
         let hits = py
-            .allow_threads(move || match want {
+            .allow_threads(move || match f {
                 None => db.search_many(&flat, k),
-                Some(want) => db.search_many_filtered(&flat, k, |m| want.iter().all(|(k, v)| m.get(k) == Some(v))),
+                Some(f) => db.search_many_where(&flat, k, &f),
             })
             .map_err(err)?;
         let mut ids = vec![-1i64; n * k];
@@ -254,7 +400,10 @@ impl PyDb {
                 scores[row * k + j] = h.score;
             }
         }
-        Ok((PyArray1::from_vec(py, ids).reshape([n, k])?, PyArray1::from_vec(py, scores).reshape([n, k])?))
+        Ok((
+            PyArray1::from_vec(py, ids).reshape([n, k])?,
+            PyArray1::from_vec(py, scores).reshape([n, k])?,
+        ))
     }
 
     /// fsync the log so acknowledged writes survive power loss.
@@ -285,7 +434,12 @@ impl PyDb {
     }
 
     fn __repr__(&self) -> String {
-        format!("sanadb.Db(dim={}, len={}, delta={})", self.inner.dim(), self.inner.len(), self.inner.delta_len())
+        format!(
+            "sanadb.Db(dim={}, len={}, delta={})",
+            self.inner.dim(),
+            self.inner.len(),
+            self.inner.delta_len()
+        )
     }
 }
 

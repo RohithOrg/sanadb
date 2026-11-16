@@ -20,7 +20,14 @@ use rayon::prelude::*;
 
 /// Train `k` centroids over `n` points of dimension `dim`, reading point `i`
 /// through `point(i)`. Returns `k * dim` floats.
-pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: usize, dim: usize, k: usize, epochs: usize, seed: u64) -> Vec<f32> {
+pub(crate) fn emeans<'a>(
+    point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a),
+    n: usize,
+    dim: usize,
+    k: usize,
+    epochs: usize,
+    seed: u64,
+) -> Vec<f32> {
     let mut rng = XorShift(seed | 1);
     if n == 0 || k == 0 {
         return vec![0.0; k * dim];
@@ -40,8 +47,18 @@ pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: us
     // PQ subspaces are a few floats wide, so they take the quality law.
     let coefficient = if dim <= 16 { 0.00439175 } else { 0.035134 };
     let raw_b = coefficient * kf.powf(0.134749) * nf.powf(0.876473) * t.powf(0.813344);
-    let batch = if dim <= 16 { round_pow2(raw_b).min(n / 2) } else { round_pow2(raw_b).min(round_pow2(nf / 2.0)) }.clamp(1, n);
-    let alpha0 = (0.8244 * kf.powf(-0.4617) * (batch as f64).powf(0.9003) * nf.powf(-0.4498) * t.powf(-0.1057)).clamp(1e-4, 1.0);
+    let batch = if dim <= 16 {
+        round_pow2(raw_b).min(n / 2)
+    } else {
+        round_pow2(raw_b).min(round_pow2(nf / 2.0))
+    }
+    .clamp(1, n);
+    let alpha0 = (0.8244
+        * kf.powf(-0.4617)
+        * (batch as f64).powf(0.9003)
+        * nf.powf(-0.4498)
+        * t.powf(-0.1057))
+    .clamp(1e-4, 1.0);
 
     // Init: k-means++ (D^2 sampling) over a subsample. The reference uses a
     // random subset; ++ seeding avoids the midpoint-between-two-clusters
@@ -54,7 +71,10 @@ pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: us
     }
     let mut cents: Vec<f32> = Vec::with_capacity(k * dim);
     cents.extend_from_slice(point(perm[0]));
-    let mut d2: Vec<f32> = perm[..pool].iter().map(|&i| sq_dist(point(i), &cents[..dim])).collect();
+    let mut d2: Vec<f32> = perm[..pool]
+        .iter()
+        .map(|&i| sq_dist(point(i), &cents[..dim]))
+        .collect();
     for _ in 1..k {
         let total: f64 = d2.iter().map(|&d| d as f64).sum();
         let pick = if total <= 0.0 {
@@ -96,7 +116,10 @@ pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: us
         for chunk in perm.chunks(batch) {
             let frac = step.min(total_steps) as f64 / total_steps.max(1) as f64;
             let alpha = alpha0 * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * frac).cos()));
-            let assign: Vec<usize> = chunk.par_iter().map(|&i| nearest(&cents, dim, point(i))).collect();
+            let assign: Vec<usize> = chunk
+                .par_iter()
+                .map(|&i| nearest(&cents, dim, point(i)))
+                .collect();
             sums.iter_mut().for_each(|s| *s = 0.0);
             counts.iter_mut().for_each(|c| *c = 0);
             for (&i, &a) in chunk.iter().zip(&assign) {
@@ -113,13 +136,19 @@ pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: us
                 let new_mass = (1.0 - alpha) * mass[j] + alpha * nj as f64;
                 let w = (alpha * nj as f64 / new_mass) as f32;
                 let inv = 1.0 / nj as f32;
-                for (c, s) in cents[j * dim..(j + 1) * dim].iter_mut().zip(&sums[j * dim..(j + 1) * dim]) {
+                for (c, s) in cents[j * dim..(j + 1) * dim]
+                    .iter_mut()
+                    .zip(&sums[j * dim..(j + 1) * dim])
+                {
                     *c += w * (s * inv - *c);
                 }
                 mass[j] = new_mass;
                 if last {
                     pass_counts[j] += nj as u64;
-                    for (p, s) in pass_sums[j * dim..(j + 1) * dim].iter_mut().zip(&sums[j * dim..(j + 1) * dim]) {
+                    for (p, s) in pass_sums[j * dim..(j + 1) * dim]
+                        .iter_mut()
+                        .zip(&sums[j * dim..(j + 1) * dim])
+                    {
                         *p += *s as f64;
                     }
                 }
@@ -133,7 +162,10 @@ pub(crate) fn emeans<'a>(point: &(dyn Fn(usize) -> &'a [f32] + Sync + 'a), n: us
     // Finalise on exact last-epoch means where a cluster saw any point.
     for j in 0..k {
         if pass_counts[j] > 0 {
-            for (c, p) in cents[j * dim..(j + 1) * dim].iter_mut().zip(&pass_sums[j * dim..(j + 1) * dim]) {
+            for (c, p) in cents[j * dim..(j + 1) * dim]
+                .iter_mut()
+                .zip(&pass_sums[j * dim..(j + 1) * dim])
+            {
                 *c = (p / pass_counts[j] as f64) as f32;
             }
         }
@@ -221,26 +253,49 @@ mod tests {
         // 8 tight blobs in 4 dims; k = 8 must land one centroid per blob.
         let dim = 4;
         let mut rng = XorShift(3);
-        let blobs: Vec<Vec<f32>> = (0..8).map(|b| (0..dim).map(|d| ((b >> d) & 1) as f32 * 10.0).collect()).collect();
+        let blobs: Vec<Vec<f32>> = (0..8)
+            .map(|b| (0..dim).map(|d| ((b >> d) & 1) as f32 * 10.0).collect())
+            .collect();
         let pts: Vec<Vec<f32>> = (0..4000)
-            .map(|i| blobs[i % 8].iter().map(|c| c + ((rng.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5)).collect())
+            .map(|i| {
+                blobs[i % 8]
+                    .iter()
+                    .map(|c| c + ((rng.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5))
+                    .collect()
+            })
             .collect();
         let cents = emeans(&|i| pts[i].as_slice(), pts.len(), dim, 8, 3, 1);
         let mut hit = vec![false; 8];
         for c in cents.chunks_exact(dim) {
             let b = nearest(&blobs.concat(), dim, c);
-            let d: f32 = c.iter().zip(&blobs[b]).map(|(a, x)| (a - x) * (a - x)).sum();
+            let d: f32 = c
+                .iter()
+                .zip(&blobs[b])
+                .map(|(a, x)| (a - x) * (a - x))
+                .sum();
             assert!(d < 1.0, "centroid {c:?} far from blob {b}");
             hit[b] = true;
         }
-        assert!(hit.iter().all(|&h| h), "every blob gets a centroid: {hit:?}");
+        assert!(
+            hit.iter().all(|&h| h),
+            "every blob gets a centroid: {hit:?}"
+        );
     }
 
     /// Plain Lloyd's algorithm, the baseline e-means is supposed to match in
     /// far fewer passes.
-    fn lloyd<'a>(point: &dyn Fn(usize) -> &'a [f32], n: usize, dim: usize, k: usize, iters: usize, seed: u64) -> Vec<f32> {
+    fn lloyd<'a>(
+        point: &dyn Fn(usize) -> &'a [f32],
+        n: usize,
+        dim: usize,
+        k: usize,
+        iters: usize,
+        seed: u64,
+    ) -> Vec<f32> {
         let mut rng = XorShift(seed | 1);
-        let mut cents: Vec<f32> = (0..k).flat_map(|_| point((rng.next() % n as u64) as usize).to_vec()).collect();
+        let mut cents: Vec<f32> = (0..k)
+            .flat_map(|_| point((rng.next() % n as u64) as usize).to_vec())
+            .collect();
         for _ in 0..iters {
             let mut sums = vec![0f64; k * dim];
             let mut counts = vec![0usize; k];
@@ -253,9 +308,13 @@ mod tests {
             }
             for c in 0..k {
                 if counts[c] == 0 {
-                    cents[c * dim..(c + 1) * dim].copy_from_slice(point((rng.next() % n as u64) as usize));
+                    cents[c * dim..(c + 1) * dim]
+                        .copy_from_slice(point((rng.next() % n as u64) as usize));
                 } else {
-                    for (dst, s) in cents[c * dim..(c + 1) * dim].iter_mut().zip(&sums[c * dim..(c + 1) * dim]) {
+                    for (dst, s) in cents[c * dim..(c + 1) * dim]
+                        .iter_mut()
+                        .zip(&sums[c * dim..(c + 1) * dim])
+                    {
                         *dst = (s / counts[c] as f64) as f32;
                     }
                 }
@@ -264,11 +323,19 @@ mod tests {
         cents
     }
 
-    fn distortion<'a>(point: &dyn Fn(usize) -> &'a [f32], n: usize, dim: usize, cents: &[f32]) -> f64 {
-        (0..n).map(|i| {
-            let c = nearest(cents, dim, point(i));
-            sq_dist(point(i), &cents[c * dim..(c + 1) * dim]) as f64
-        }).sum::<f64>() / n as f64
+    fn distortion<'a>(
+        point: &dyn Fn(usize) -> &'a [f32],
+        n: usize,
+        dim: usize,
+        cents: &[f32],
+    ) -> f64 {
+        (0..n)
+            .map(|i| {
+                let c = nearest(cents, dim, point(i));
+                sq_dist(point(i), &cents[c * dim..(c + 1) * dim]) as f64
+            })
+            .sum::<f64>()
+            / n as f64
     }
 
     /// The setting that matters for PQ: 256 centroids over 4-dimensional
@@ -280,15 +347,22 @@ mod tests {
         let mut rng = XorShift(11);
         // Heavy-tailed-ish data: sum of two uniforms, scaled per dimension.
         let pts: Vec<Vec<f32>> = (0..n)
-            .map(|_| (0..dim).map(|d| {
-                let u = |r: &mut XorShift| (r.next() >> 40) as f32 / (1u64 << 24) as f32;
-                (u(&mut rng) + u(&mut rng)) * (1.0 + d as f32)
-            }).collect())
+            .map(|_| {
+                (0..dim)
+                    .map(|d| {
+                        let u = |r: &mut XorShift| (r.next() >> 40) as f32 / (1u64 << 24) as f32;
+                        (u(&mut rng) + u(&mut rng)) * (1.0 + d as f32)
+                    })
+                    .collect()
+            })
             .collect();
         let point = |i: usize| pts[i].as_slice();
         let e = distortion(&point, n, dim, &emeans(&point, n, dim, k, 3, 1));
         let l = distortion(&point, n, dim, &lloyd(&point, n, dim, k, 20, 1));
-        eprintln!("distortion e-means(3 epochs)={e:.5} lloyd(20 iters)={l:.5} ratio={:.3}", e / l);
+        eprintln!(
+            "distortion e-means(3 epochs)={e:.5} lloyd(20 iters)={l:.5} ratio={:.3}",
+            e / l
+        );
         assert!(e <= l * 1.05, "e-means distortion {e} vs lloyd {l}");
     }
 

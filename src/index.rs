@@ -18,7 +18,12 @@ pub(crate) struct Flat {
 
 impl Flat {
     pub fn new(metric: Metric) -> Self {
-        Flat { metric, ids: Vec::new(), offs: Vec::new(), slot_of: HashMap::new() }
+        Flat {
+            metric,
+            ids: Vec::new(),
+            offs: Vec::new(),
+            slot_of: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, id: u64, off: u64) {
@@ -34,7 +39,9 @@ impl Flat {
 
     /// Swap-remove so the arrays stay dense.
     pub fn remove(&mut self, id: u64) {
-        let Some(slot) = self.slot_of.remove(&id) else { return };
+        let Some(slot) = self.slot_of.remove(&id) else {
+            return;
+        };
         let last = self.ids.len() - 1;
         if slot != last {
             self.ids.swap(slot, last);
@@ -58,7 +65,13 @@ impl Flat {
     }
 
     /// Exact k-NN over every record, resolving vectors through `vec`.
-    pub fn search<'a>(&self, q: &[f32], k: usize, accept: impl Fn(u64) -> bool, vec: &dyn Fn(u64) -> &'a [f32]) -> Vec<Hit> {
+    pub fn search<'a>(
+        &self,
+        q: &[f32],
+        k: usize,
+        accept: impl Fn(u64) -> bool,
+        vec: &dyn Fn(u64) -> &'a [f32],
+    ) -> Vec<Hit> {
         if k == 0 {
             return Vec::new();
         }
@@ -75,7 +88,13 @@ impl Flat {
                 heap.push(Candidate { score, id });
             }
         }
-        let mut out: Vec<Hit> = heap.into_iter().map(|c| Hit { id: c.id, score: c.score }).collect();
+        let mut out: Vec<Hit> = heap
+            .into_iter()
+            .map(|c| Hit {
+                id: c.id,
+                score: c.score,
+            })
+            .collect();
         out.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
         out
     }

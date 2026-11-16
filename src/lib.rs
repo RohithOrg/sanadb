@@ -12,11 +12,15 @@
 //! and a checkpoint builds the new graph outside both so readers and writers
 //! keep going while it runs.
 
+mod attrs;
+mod filter;
 mod graph;
 mod index;
 mod kmeans;
 mod pq;
 mod wal;
+
+pub use filter::Filter;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,8 +31,8 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 
-pub use graph::GraphParams;
 use graph::GraphIndex;
+pub use graph::GraphParams;
 use index::Flat;
 use wal::{Entry, Header, Replayed, Wal};
 
@@ -39,18 +43,31 @@ pub use value::{Kind, Metadata, Value};
 pub enum Error {
     Io(std::io::Error),
     Corrupt(&'static str),
-    HeaderMismatch { on_disk: (u32, Metric), requested: (u32, Metric) },
-    DimMismatch { expected: u32, got: usize },
+    HeaderMismatch {
+        on_disk: (u32, Metric),
+        requested: (u32, Metric),
+    },
+    DimMismatch {
+        expected: u32,
+        got: usize,
+    },
     MetaTooLarge,
     /// A key already holds values of another type in this store.
-    TypeMismatch { key: String, expected: Kind, got: Kind },
+    TypeMismatch {
+        key: String,
+        expected: Kind,
+        got: Kind,
+    },
     /// A vector contained NaN or infinity.
     InvalidVector,
     /// Another `Db` (in this or another process) has the store open.
     Locked,
     /// The file was written by a newer sanadb whose layout this build cannot
     /// read. Upgrade sanadb; the data is intact.
-    NeedsNewerVersion { file_level: u8, supported: u8 },
+    NeedsNewerVersion {
+        file_level: u8,
+        supported: u8,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -62,7 +79,12 @@ impl From<std::io::Error> for Error {
 /// Attach the failing operation and path to an I/O error, so a report from a
 /// platform we cannot reproduce on says which step broke.
 fn io_ctx<T>(r: std::io::Result<T>, what: &str, path: &Path) -> Result<T> {
-    r.map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()))))
+    r.map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{what} {}: {e}", path.display()),
+        ))
+    })
 }
 
 impl std::fmt::Display for Error {
@@ -71,15 +93,36 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Corrupt(why) => write!(f, "corrupt file: {why}"),
             Error::HeaderMismatch { on_disk, requested } => {
-                write!(f, "file has dim={} metric={:?}, opened with dim={} metric={:?}", on_disk.0, on_disk.1, requested.0, requested.1)
+                write!(
+                    f,
+                    "file has dim={} metric={:?}, opened with dim={} metric={:?}",
+                    on_disk.0, on_disk.1, requested.0, requested.1
+                )
             }
-            Error::DimMismatch { expected, got } => write!(f, "vector has {got} dims, store expects {expected}"),
-            Error::MetaTooLarge => write!(f, "metadata key/value longer than 65535 bytes or more than 65535 pairs"),
-            Error::TypeMismatch { key, expected, got } => write!(f, "metadata key {key:?} holds {expected:?} values in this store, got {got:?}"),
-            Error::InvalidVector => write!(f, "vector contains NaN or infinity, or is all zeros under the cosine metric"),
+            Error::DimMismatch { expected, got } => {
+                write!(f, "vector has {got} dims, store expects {expected}")
+            }
+            Error::MetaTooLarge => write!(
+                f,
+                "metadata key/value longer than 65535 bytes or more than 65535 pairs"
+            ),
+            Error::TypeMismatch { key, expected, got } => write!(
+                f,
+                "metadata key {key:?} holds {expected:?} values in this store, got {got:?}"
+            ),
+            Error::InvalidVector => write!(
+                f,
+                "vector contains NaN or infinity, or is all zeros under the cosine metric"
+            ),
             Error::Locked => write!(f, "store is open elsewhere (lock file held)"),
-            Error::NeedsNewerVersion { file_level, supported } => {
-                write!(f, "file needs reader level {file_level}, this sanadb supports {supported}: upgrade sanadb")
+            Error::NeedsNewerVersion {
+                file_level,
+                supported,
+            } => {
+                write!(
+                    f,
+                    "file needs reader level {file_level}, this sanadb supports {supported}: upgrade sanadb"
+                )
             }
         }
     }
@@ -128,7 +171,9 @@ fn prepare(metric: Metric, v: &[f32]) -> Result<std::borrow::Cow<'_, [f32]>> {
     if norm == 0.0 {
         return Err(Error::InvalidVector);
     }
-    Ok(std::borrow::Cow::Owned(v.iter().map(|x| x / norm).collect()))
+    Ok(std::borrow::Cow::Owned(
+        v.iter().map(|x| x / norm).collect(),
+    ))
 }
 
 /// Internal distances for `Cosine` are squared L2 on unit vectors; present
@@ -155,6 +200,10 @@ pub struct Options {
     /// Upper bound the beam may grow to when a filter leaves fewer than `k`
     /// results. Set equal to `search_beam` to disable the retry.
     pub max_search_beam: u32,
+    /// `search_where` answers a filter exactly, by reading every matching
+    /// record, when the index's posting lists put the match count at or
+    /// below this. Above it the graph is walked with the filter steering it.
+    pub exact_filter_scan: u32,
     /// Run `checkpoint` automatically once the log holds this many entries
     /// more than there are live records. 0 disables.
     pub auto_checkpoint_garbage: usize,
@@ -179,6 +228,7 @@ impl Options {
             graph: GraphParams::default(),
             search_beam: 64,
             max_search_beam: 4096,
+            exact_filter_scan: 16_384,
             auto_checkpoint_garbage: 100_000,
             auto_checkpoint_delta: 250_000,
             io_width: 4,
@@ -190,6 +240,10 @@ impl Options {
     }
     pub fn io_width(mut self, width: u32) -> Self {
         self.io_width = width.max(1);
+        self
+    }
+    pub fn exact_filter_scan(mut self, records: u32) -> Self {
+        self.exact_filter_scan = records;
         self
     }
     pub fn metric(mut self, m: Metric) -> Self {
@@ -229,6 +283,14 @@ pub struct IndexStats {
     pub tombstones: usize,
 }
 
+/// How a search restricts its results.
+#[derive(Clone, Copy)]
+enum Spec<'a> {
+    All,
+    Closure(&'a dyn Fn(&Metadata) -> bool),
+    Expr(&'a Filter),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub id: u64,
@@ -249,7 +311,7 @@ struct Inner {
     delta: Flat,
     /// Sequence number of the write that produced each delta record.
     delta_seq: HashMap<u64, u64>,
-    meta: HashMap<u64, Metadata>,
+    meta: HashMap<u64, Arc<Metadata>>,
     /// Type fixed for each metadata key by the first value written under it.
     types: HashMap<String, Kind>,
     /// Monotonic count of writes, used to tell which delta records a running
@@ -280,13 +342,31 @@ impl Db {
     pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db> {
         let path = path.as_ref().to_path_buf();
         let idx_path = sidecar(&path, ".idx");
-        let file_lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(sidecar(&path, ".lock"))?;
-        match file_lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Locked),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        let file_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(sidecar(&path, ".lock"))?;
+        // A store that was just closed can read as locked for a few
+        // milliseconds (seen about once in 25 parallel test-suite runs under
+        // load on macOS, holder never identified), so a held lock is retried
+        // briefly, as SQLite's busy handler does, before it is an error.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            match file_lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Locked),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
         }
-        let header = Header { dim: opts.dim, metric: opts.metric };
+        let header = Header {
+            dim: opts.dim,
+            metric: opts.metric,
+        };
         let graph = GraphIndex::open(&idx_path, opts.dim, opts.metric)?.map(Arc::new);
         let (wal, entries) = Wal::open(&path, header)?;
         let mut inner = Inner {
@@ -303,21 +383,37 @@ impl Db {
         };
         for e in entries {
             match e {
-                Replayed::Insert { id, vector_off, meta } => inner.apply_insert(id, vector_off, meta),
+                Replayed::Insert {
+                    id,
+                    vector_off,
+                    meta,
+                } => inner.apply_insert(id, vector_off, meta),
                 Replayed::Delete { id } => inner.apply_delete(id),
                 Replayed::Meta { id, meta } => {
                     inner.note_types(&meta);
-                    inner.meta.insert(id, meta);
+                    inner.meta.insert(id, Arc::new(meta));
                 }
             }
         }
         // Every live record must have a vector somewhere.
         for &id in inner.meta.keys() {
-            if inner.delta.offset(id).is_none() && inner.graph.as_ref().and_then(|g| g.slot(id)).is_none() {
-                return Err(Error::Corrupt("record has metadata but its vector is missing from the index"));
+            if inner.delta.offset(id).is_none()
+                && inner.graph.as_ref().and_then(|g| g.slot(id)).is_none()
+            {
+                return Err(Error::Corrupt(
+                    "record has metadata but its vector is missing from the index",
+                ));
             }
         }
-        Ok(Db { path, idx_path, header, opts, inner: RwLock::new(inner), checkpoint_lock: Mutex::new(()), _file_lock: file_lock })
+        Ok(Db {
+            path,
+            idx_path,
+            header,
+            opts,
+            inner: RwLock::new(inner),
+            checkpoint_lock: Mutex::new(()),
+            _file_lock: file_lock,
+        })
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, Inner>> {
@@ -348,22 +444,41 @@ impl Db {
     /// Shape of the on-disk graph index, or `None` before the first checkpoint.
     pub fn index_stats(&self) -> Option<IndexStats> {
         let i = self.inner.read();
-        i.graph.as_ref().map(|g| IndexStats { nodes: g.len(), pq_subspaces: g.pq_subspaces(), tombstones: i.tombstones.len() })
+        i.graph.as_ref().map(|g| IndexStats {
+            nodes: g.len(),
+            pq_subspaces: g.pq_subspaces(),
+            tombstones: i.tombstones.len(),
+        })
     }
 
     /// Insert or replace the record with this id.
     pub fn insert(&self, id: u64, vector: &[f32], meta: Metadata) -> Result<()> {
         if vector.len() != self.header.dim as usize {
-            return Err(Error::DimMismatch { expected: self.header.dim, got: vector.len() });
+            return Err(Error::DimMismatch {
+                expected: self.header.dim,
+                got: vector.len(),
+            });
         }
-        if meta.len() > u16::MAX as usize || meta.iter().any(|(k, v)| k.len() > u16::MAX as usize || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)) {
+        if meta.len() > u16::MAX as usize
+            || meta.iter().any(|(k, v)| {
+                k.len() > u16::MAX as usize
+                    || v.as_str().is_some_and(|s| s.len() > u16::MAX as usize)
+            })
+        {
             return Err(Error::MetaTooLarge);
         }
         let vector = prepare(self.header.metric, vector)?;
         let garbage = {
             let mut i = self.write()?;
             i.check_types(&meta)?;
-            let off = i.append(&Entry::Insert { id, vector: vector.to_vec(), meta: meta.clone() }, self.opts.sync_every_write)?;
+            let off = i.append(
+                &Entry::Insert {
+                    id,
+                    vector: vector.to_vec(),
+                    meta: meta.clone(),
+                },
+                self.opts.sync_every_write,
+            )?;
             i.apply_insert(id, off, meta);
             i.garbage()
         };
@@ -388,19 +503,60 @@ impl Db {
     pub fn get(&self, id: u64) -> Option<(Vec<f32>, Metadata)> {
         let i = self.inner.read();
         let meta = i.meta.get(&id)?;
-        let vector = i.delta.offset(id).map(|o| i.wal.vector_at(o)).or_else(|| i.graph.as_ref()?.vector_of(id))?;
-        Some((vector.to_vec(), meta.clone()))
+        let vector = i
+            .delta
+            .offset(id)
+            .map(|o| i.wal.vector_at(o))
+            .or_else(|| i.graph.as_ref()?.vector_of(id))?;
+        Some((vector.to_vec(), (**meta).clone()))
     }
 
     /// k-nearest-neighbour search. Exact over records written since the last
     /// checkpoint, approximate (graph walk) over the rest.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<Hit>> {
-        self.search_impl(query, k, None)
+        self.search_impl(query, k, Spec::All)
     }
 
-    /// k-NN restricted to records whose metadata passes `filter`.
-    pub fn search_filtered(&self, query: &[f32], k: usize, filter: impl Fn(&Metadata) -> bool) -> Result<Vec<Hit>> {
-        self.search_impl(query, k, Some(&filter))
+    /// k-NN restricted to records whose metadata passes `filter`. The
+    /// closure is opaque to the engine, so it is applied to the nodes the
+    /// walk visits (with the beam widened until `k` pass); prefer
+    /// `search_where` for anything a `Filter` can express.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: impl Fn(&Metadata) -> bool,
+    ) -> Result<Vec<Hit>> {
+        self.search_impl(query, k, Spec::Closure(&filter))
+    }
+
+    /// k-NN restricted to records matching `filter`. Against an index built
+    /// by 0.1.4 or later the filter runs on attribute columns: a visited node
+    /// is checked with an array read, and a filter that matches few records
+    /// (at most `Options::exact_filter_scan` by the posting lists) is
+    /// answered exactly by scanning those records instead of walking.
+    pub fn search_where(&self, query: &[f32], k: usize, filter: &Filter) -> Result<Vec<Hit>> {
+        self.search_impl(query, k, Spec::Expr(filter))
+    }
+
+    /// `search_many` restricted to records matching `filter`.
+    pub fn search_many_where(
+        &self,
+        queries: &[f32],
+        k: usize,
+        filter: &Filter,
+    ) -> Result<Vec<Vec<Hit>>> {
+        let dim = self.header.dim as usize;
+        if !queries.len().is_multiple_of(dim) {
+            return Err(Error::DimMismatch {
+                expected: self.header.dim,
+                got: queries.len() % dim,
+            });
+        }
+        queries
+            .par_chunks(dim)
+            .map(|q| self.search_where(q, k, filter))
+            .collect()
     }
 
     /// k-NN for many queries at once, spread over all cores. `queries` is
@@ -412,32 +568,93 @@ impl Db {
     }
 
     /// `search_many` restricted to records whose metadata passes `filter`.
-    pub fn search_many_filtered(&self, queries: &[f32], k: usize, filter: impl Fn(&Metadata) -> bool + Sync) -> Result<Vec<Vec<Hit>>> {
+    pub fn search_many_filtered(
+        &self,
+        queries: &[f32],
+        k: usize,
+        filter: impl Fn(&Metadata) -> bool + Sync,
+    ) -> Result<Vec<Vec<Hit>>> {
         let dim = self.header.dim as usize;
         if !queries.len().is_multiple_of(dim) {
-            return Err(Error::DimMismatch { expected: self.header.dim, got: queries.len() % dim });
+            return Err(Error::DimMismatch {
+                expected: self.header.dim,
+                got: queries.len() % dim,
+            });
         }
-        queries.par_chunks(dim).map(|q| self.search_filtered(q, k, &filter)).collect()
+        queries
+            .par_chunks(dim)
+            .map(|q| self.search_filtered(q, k, &filter))
+            .collect()
     }
 
-    fn search_impl(&self, query: &[f32], k: usize, filter: Option<&dyn Fn(&Metadata) -> bool>) -> Result<Vec<Hit>> {
+    fn search_impl(&self, query: &[f32], k: usize, spec: Spec<'_>) -> Result<Vec<Hit>> {
         if query.len() != self.header.dim as usize {
-            return Err(Error::DimMismatch { expected: self.header.dim, got: query.len() });
+            return Err(Error::DimMismatch {
+                expected: self.header.dim,
+                got: query.len(),
+            });
         }
         let query = &*prepare(self.header.metric, query)?;
         let i = self.read()?;
         // Without a filter the metadata map is never consulted: that lookup
         // ran once per visited node and was 6% of a warm query.
-        let passes = |id: u64| filter.is_none_or(|f| i.meta.get(&id).is_some_and(f));
-        let mut hits = i.delta.search(query, k, passes, &|off| i.wal.vector_at(off));
+        let passes_meta = |m: &Metadata| match spec {
+            Spec::All => true,
+            Spec::Closure(f) => f(m),
+            Spec::Expr(f) => f.eval(m),
+        };
+        let passes =
+            |id: u64| matches!(spec, Spec::All) || i.meta.get(&id).is_some_and(|m| passes_meta(m));
+        let mut hits = i
+            .delta
+            .search(query, k, passes, &|off| i.wal.vector_at(off));
         if let Some(g) = &i.graph {
-            let (beam, max_beam, width) = (self.opts.search_beam as usize, self.opts.max_search_beam as usize, self.opts.io_width as usize);
-            let dead = !i.tombstones.is_empty();
-            hits.extend(
-                g.search(query, k, beam, max_beam, width, |slot| (!dead || !i.tombstones.contains(&slot)) && passes(g.id(slot)))
-                    .into_iter()
-                    .map(|(score, slot)| Hit { id: g.id(slot), score }),
+            let (beam, max_beam, width) = (
+                self.opts.search_beam as usize,
+                self.opts.max_search_beam as usize,
+                self.opts.io_width as usize,
             );
+            let dead = !i.tombstones.is_empty();
+            let live = |slot: u32| !dead || !i.tombstones.contains(&slot);
+            let prepared = match spec {
+                Spec::Expr(f) => g.prepare(f),
+                _ => None,
+            };
+            let graph_hits = match &prepared {
+                Some(p) => {
+                    let max_scan = self.opts.exact_filter_scan as usize;
+                    // Few enough matches by the posting lists: read them all.
+                    let scan = (g.estimate(p) <= max_scan * 2)
+                        .then(|| g.candidates(p))
+                        .flatten()
+                        .filter(|c| c.len() <= max_scan);
+                    match scan {
+                        Some(c) => g.scan(query, k, c.into_iter().filter(|&s| live(s))),
+                        None => g.search(
+                            query,
+                            k,
+                            beam,
+                            max_beam,
+                            width,
+                            |slot| live(slot) && g.pass(p, slot),
+                            true,
+                        ),
+                    }
+                }
+                None => g.search(
+                    query,
+                    k,
+                    beam,
+                    max_beam,
+                    width,
+                    |slot| live(slot) && passes(g.id(slot)),
+                    false,
+                ),
+            };
+            hits.extend(graph_hits.into_iter().map(|(score, slot)| Hit {
+                id: g.id(slot),
+                score,
+            }));
             hits.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.id.cmp(&b.id)));
             hits.truncate(k);
         }
@@ -473,7 +690,7 @@ impl Db {
         //    The temp file is memory-mapped, so the build's working set, not
         //    the dataset, has to fit in RAM.
         let vec_tmp = self.idx_path.with_extension("vec.tmp");
-        let (ids, snap_seq, base) = {
+        let (ids, snap_seq, base, metas) = {
             let mut i = self.write()?;
             i.wal.sync()?;
             let live_in_graph = i.graph.as_ref().map_or(0, |g| g.len() - i.tombstones.len());
@@ -486,8 +703,16 @@ impl Db {
                     // until a rebuild adds them.
                     && (g.pq_subspaces() > 0 || !self.opts.graph.use_pq || total < pq::MIN_N)
             });
-            let mut ids: Vec<u64> = Vec::with_capacity(if incremental { i.delta.len() } else { i.meta.len() });
-            let mut w = std::io::BufWriter::new(io_ctx(std::fs::File::create(&vec_tmp), "create snapshot", &vec_tmp)?);
+            let mut ids: Vec<u64> = Vec::with_capacity(if incremental {
+                i.delta.len()
+            } else {
+                i.meta.len()
+            });
+            let mut w = std::io::BufWriter::new(io_ctx(
+                std::fs::File::create(&vec_tmp),
+                "create snapshot",
+                &vec_tmp,
+            )?);
             use std::io::Write as _;
             if let Some(g) = i.graph.as_ref().filter(|_| !incremental) {
                 for slot in 0..g.len() as u32 {
@@ -504,8 +729,13 @@ impl Db {
             w.flush()?;
             i.deletes_since_snapshot = Some(HashSet::new());
             let base = incremental.then(|| (i.graph.clone().unwrap(), i.tombstones.clone()));
-            (ids, i.write_seq, base)
+            // Metadata for the attribute columns: a map of `Arc`s, so this is
+            // one pointer per live record and the encoding runs outside the lock.
+            let metas: HashMap<u64, Arc<Metadata>> =
+                i.meta.iter().map(|(&id, m)| (id, m.clone())).collect();
+            (ids, i.write_seq, base, metas)
         };
+        let meta_of = |id: u64| metas.get(&id).cloned();
 
         // 2. Build outside the lock. This is the slow part.
         let idx_tmp = self.idx_path.with_extension("idx.tmp");
@@ -517,12 +747,32 @@ impl Db {
             } else {
                 let file = io_ctx(std::fs::File::open(&vec_tmp), "open snapshot", &vec_tmp)?;
                 // Safety: the snapshot file is complete and never written again.
-                Some(io_ctx(unsafe { memmap2::Mmap::map(&file) }, "map snapshot", &vec_tmp)?)
+                Some(io_ctx(
+                    unsafe { memmap2::Mmap::map(&file) },
+                    "map snapshot",
+                    &vec_tmp,
+                )?)
             };
             let vectors: &[f32] = mmap.as_ref().map_or(&[], |m| bytemuck::cast_slice(m));
             match &base {
-                Some((graph, dead)) => graph::update_and_write(&idx_tmp, graph, dead, &ids, vectors, self.opts.graph),
-                None => graph::build_and_write(&idx_tmp, dim, self.header.metric, &ids, vectors, self.opts.graph),
+                Some((graph, dead)) => graph::update_and_write(
+                    &idx_tmp,
+                    graph,
+                    dead,
+                    &ids,
+                    vectors,
+                    self.opts.graph,
+                    &meta_of,
+                ),
+                None => graph::build_and_write(
+                    &idx_tmp,
+                    dim,
+                    self.header.metric,
+                    &ids,
+                    vectors,
+                    self.opts.graph,
+                    &meta_of,
+                ),
             }
         })();
         drop(base);
@@ -540,20 +790,32 @@ impl Db {
         // a reference, and `base` was dropped above. If the rename fails the
         // old file is still there; reopen it so the store stays usable.
         i.graph = None;
-        if let Err(e) = io_ctx(std::fs::rename(&idx_tmp, &self.idx_path), "replace index", &self.idx_path) {
-            i.graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric).ok().flatten().map(Arc::new);
+        if let Err(e) = io_ctx(
+            std::fs::rename(&idx_tmp, &self.idx_path),
+            "replace index",
+            &self.idx_path,
+        ) {
+            i.graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)
+                .ok()
+                .flatten()
+                .map(Arc::new);
             let _ = std::fs::remove_file(&idx_tmp);
             return Err(e);
         }
         // Map the new file before the log swap so the log we write only names
         // vectors the new index holds.
-        let graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)?.ok_or(Error::Corrupt("index vanished after rename"))?;
+        let graph = GraphIndex::open(&self.idx_path, self.header.dim, self.header.metric)?
+            .ok_or(Error::Corrupt("index vanished after rename"))?;
 
         let deleted = i.deletes_since_snapshot.take().unwrap_or_default();
         // Records written during the build survive in the delta; they are
         // rewritten into the new log first, in this order, so their new
         // offsets can be matched up afterwards.
-        let survivors: Vec<(u64, u64)> = i.delta.iter().filter(|(id, _)| i.delta_seq.get(id).is_some_and(|&s| s > snap_seq)).collect();
+        let survivors: Vec<(u64, u64)> = i
+            .delta
+            .iter()
+            .filter(|(id, _)| i.delta_seq.get(id).is_some_and(|&s| s > snap_seq))
+            .collect();
         let mut tombstones = HashSet::new();
         for (id, _) in &survivors {
             if let Some(slot) = graph.slot(*id) {
@@ -564,22 +826,42 @@ impl Db {
         // re-inserted (then the survivor loop already tombstoned it). These
         // ids also get a Delete frame in the new log, so a reopen replays the
         // tombstone instead of serving the stale graph node.
-        let dead: Vec<u64> = deleted.into_iter().filter(|id| !i.meta.contains_key(id)).filter(|id| graph.slot(*id).is_some()).collect();
+        let dead: Vec<u64> = deleted
+            .into_iter()
+            .filter(|id| !i.meta.contains_key(id))
+            .filter(|id| graph.slot(*id).is_some())
+            .collect();
         for id in &dead {
             tombstones.insert(graph.slot(*id).unwrap());
         }
 
         let log_tmp = self.path.with_extension("tmp");
         let survivor_ids: HashSet<u64> = survivors.iter().map(|(id, _)| *id).collect();
-        let inserts = survivors.iter().map(|&(id, off)| Entry::Insert { id, vector: i.wal.vector_at(off).to_vec(), meta: i.meta[&id].clone() });
-        let metas = i.meta.iter().filter(|(id, _)| !survivor_ids.contains(id)).map(|(&id, m)| Entry::Meta { id, meta: m.clone() });
+        let inserts = survivors.iter().map(|&(id, off)| Entry::Insert {
+            id,
+            vector: i.wal.vector_at(off).to_vec(),
+            meta: (*i.meta[&id]).clone(),
+        });
+        let metas = i
+            .meta
+            .iter()
+            .filter(|(id, _)| !survivor_ids.contains(id))
+            .map(|(&id, m)| Entry::Meta {
+                id,
+                meta: (**m).clone(),
+            });
         let deletes = dead.iter().map(|&id| Entry::Delete { id });
-        let new_offs = wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas).chain(deletes))?;
+        let new_offs =
+            wal::write_snapshot(&log_tmp, self.header, inserts.chain(metas).chain(deletes))?;
         // Same Windows rule for the log: close the old one before replacing
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.
         i.wal.release();
-        if let Err(e) = io_ctx(std::fs::rename(&log_tmp, &self.path), "replace log", &self.path) {
+        if let Err(e) = io_ctx(
+            std::fs::rename(&log_tmp, &self.path),
+            "replace log",
+            &self.path,
+        ) {
             let _ = std::fs::remove_file(&log_tmp);
             i.wal = Wal::open(&self.path, self.header)?.0;
             i.graph = Some(Arc::new(graph));
@@ -589,7 +871,11 @@ impl Db {
         // notion; Windows cannot open a directory as a file.
         #[cfg(unix)]
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            io_ctx(std::fs::File::open(dir).and_then(|d| d.sync_all()), "sync directory", dir)?;
+            io_ctx(
+                std::fs::File::open(dir).and_then(|d| d.sync_all()),
+                "sync directory",
+                dir,
+            )?;
         }
 
         let (wal, _) = Wal::open(&self.path, self.header)?;
@@ -608,7 +894,10 @@ impl Db {
         Ok(())
     }
 
-    fn maybe_auto_checkpoint(&self, (garbage, delta, indexed): (usize, usize, usize)) -> Result<()> {
+    fn maybe_auto_checkpoint(
+        &self,
+        (garbage, delta, indexed): (usize, usize, usize),
+    ) -> Result<()> {
         let g = self.opts.auto_checkpoint_garbage;
         let d = self.opts.auto_checkpoint_delta;
         let due = (g != 0 && garbage >= g) || (d != 0 && delta >= d && delta >= indexed);
@@ -634,7 +923,11 @@ impl Inner {
             if let Some(&t) = self.types.get(k)
                 && t != v.kind()
             {
-                return Err(Error::TypeMismatch { key: k.clone(), expected: t, got: v.kind() });
+                return Err(Error::TypeMismatch {
+                    key: k.clone(),
+                    expected: t,
+                    got: v.kind(),
+                });
             }
         }
         Ok(())
@@ -656,7 +949,7 @@ impl Inner {
         }
         self.delta.insert(id, vector_off);
         self.delta_seq.insert(id, self.write_seq);
-        self.meta.insert(id, meta);
+        self.meta.insert(id, Arc::new(meta));
     }
 
     fn apply_delete(&mut self, id: u64) {
@@ -687,8 +980,15 @@ impl Inner {
     /// (log entries that no longer describe a live record, delta size, live
     /// records in the graph).
     fn garbage(&self) -> (usize, usize, usize) {
-        let indexed = self.graph.as_ref().map_or(0, |g| g.len() - self.tombstones.len());
-        (self.log_entries.saturating_sub(self.meta.len()), self.delta.len(), indexed)
+        let indexed = self
+            .graph
+            .as_ref()
+            .map_or(0, |g| g.len() - self.tombstones.len());
+        (
+            self.log_entries.saturating_sub(self.meta.len()),
+            self.delta.len(),
+            indexed,
+        )
     }
 }
 

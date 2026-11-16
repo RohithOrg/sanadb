@@ -151,3 +151,40 @@ def test_metadata_is_typed(db):
     db.insert(4, np.zeros(8, dtype=np.float32), {"year": 1999})
     assert [i for i, _ in db.search(np.zeros(8, dtype=np.float32), k=1, filter={"year": 1999})] == [4]
     assert db.search(np.zeros(8, dtype=np.float32), k=1, filter={"year": "1999"}) == []
+
+
+def test_filter_dict_operators(tmp_path):
+    db = sanadb.Db(str(tmp_path / "f.sana"), dim=4)
+    rng = np.random.default_rng(5)
+    n = 3000
+    vecs = rng.random((n, 4), dtype=np.float32)
+    langs = ["en", "de", "fr"]
+    metas = [{"lang": langs[i % 3], "year": 2000 + i % 20, "score": (i % 100) / 100, "rare": True} if i % 300 == 1 else {"lang": langs[i % 3], "year": 2000 + i % 20, "score": (i % 100) / 100} for i in range(n)]
+    db.insert_many(list(range(n)), vecs, metas)
+    db.checkpoint()
+    q = vecs[17]
+
+    def brute(pred, k=5):
+        d = ((vecs - q) ** 2).sum(axis=1)
+        ids = [i for i in np.argsort(d, kind="stable") if pred(metas[i])]
+        return ids[:k]
+
+    # Exact regime (10 matches through the posting list), equality and $exists.
+    assert [i for i, _ in db.search(q, k=5, filter={"rare": True})] == brute(lambda m: m.get("rare") is True)
+    assert [i for i, _ in db.search(q, k=5, filter={"rare": {"$exists": True}, "year": {"$gte": 2005, "$lt": 2015}})] == brute(
+        lambda m: "rare" in m and 2005 <= m["year"] < 2015
+    )
+    assert [i for i, _ in db.search(q, k=5, filter={"$and": [{"rare": True}, {"lang": {"$in": ["de", "fr"]}}]})] == brute(
+        lambda m: m.get("rare") is True and m["lang"] in ("de", "fr")
+    )
+    # Walk regime: every hit passes, k results come back.
+    hits = db.search(q, k=5, filter={"lang": "de", "score": {"$lt": 0.5}})
+    assert len(hits) == 5 and all(metas[i]["lang"] == "de" and metas[i]["score"] < 0.5 for i, _ in hits)
+    hits = db.search(q, k=5, filter={"$or": [{"lang": "en"}, {"year": 2019}], "$not": {"lang": {"$prefix": "f"}}})
+    assert len(hits) == 5 and all((metas[i]["lang"] == "en" or metas[i]["year"] == 2019) and not metas[i]["lang"].startswith("f") for i, _ in hits)
+    assert db.search(q, k=5, filter={"lang": "zz"}) == []
+    assert db.search(q, k=5, filter={"year": "2001"}) == [], "wrong type matches nothing"
+    with pytest.raises(ValueError):
+        db.search(q, k=5, filter={"year": {"$between": [1, 2]}})
+    ids, _ = db.search_many(vecs[:3], k=5, filter={"rare": True})
+    assert ids.shape == (3, 5) and all(metas[i].get("rare") is True for i in ids.ravel() if i >= 0)

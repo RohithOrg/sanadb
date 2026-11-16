@@ -63,13 +63,14 @@ range filters, format stability before 1.0.
 Rust:
 
 ```rust
-use sanadb::{Db, Options, Metric};
+use sanadb::{Db, Filter, Options, Metric};
 use std::collections::HashMap;
 
 // Metric::L2, Metric::Dot, or Metric::Cosine (normalises on insert and query).
 let db = Db::open("vectors.sana", Options::new(768).metric(Metric::Cosine))?;
-db.insert(1, &embedding, HashMap::from([("doc".into(), "intro.md".into())]))?;
-let hits = db.search_filtered(&query, 10, |m| m["doc"].ends_with(".md"))?;
+db.insert(1, &embedding, HashMap::from([("doc".into(), "intro.md".into()), ("year".into(), 2024i64.into())]))?;
+let hits = db.search_where(&query, 10, &Filter::and([Filter::prefix("doc", "intro"), Filter::ge("year", 2020i64)]))?;
+let hits = db.search_filtered(&query, 10, |m| m["doc"].as_str().is_some_and(|s| s.ends_with(".md")))?; // any closure
 let batch = db.search_many(&queries, 10)?; // row-major `n * dim`, all cores
 db.sync()?;       // fsync: survive power loss
 db.checkpoint()?; // build the graph index, compact the log
@@ -81,10 +82,11 @@ Python:
 import numpy as np, sanadb
 
 db = sanadb.Db("vectors.sana", dim=768, metric="cosine")   # or "l2", "dot"
-db.insert(1, embedding, {"doc": "intro.md"})
+db.insert(1, embedding, {"doc": "intro.md", "year": 2024, "public": True})
 db.insert_many(ids, np.asarray(vectors, dtype=np.float32), metas)
 hits = db.search(query, k=10, filter={"doc": "intro.md"})   # [(id, score), ...]
-hits = db.search(query, k=10, filter=lambda m: m["doc"].endswith(".md"))
+hits = db.search(query, k=10, filter={"year": {"$gte": 2020}, "lang": {"$in": ["en", "de"]}, "$not": {"public": False}})
+hits = db.search(query, k=10, filter=lambda m: m["doc"].endswith(".md"))   # any callable, slower path
 ids, scores = db.search_many(queries, k=10)   # (n, k) arrays, all cores
 db.checkpoint()
 ```
@@ -139,10 +141,19 @@ each shard is built on its own and spilled to disk, and a final pass merges
 and prunes each node's edges. Peak memory is one shard's adjacency, not the
 whole graph's.
 
-**Filters.** A filter is applied to visited nodes. If fewer than `k` pass, the
-walk retries with the beam doubled, up to `max_search_beam`, so a 1% filter
-still returns `k` results. The cost grows with selectivity instead of the
-result silently coming back short.
+**Metadata and filters.** Values are typed (`Str`, `Int`, `Float`, `Bool`);
+the first value under a key fixes its type. At checkpoint each key becomes a
+slot-ordered column in the index file (strings dictionary-coded, with a
+presence bitmap and, up to 65,536 distinct values, posting lists). A
+`Filter` expression runs on those columns: checking a visited node is an
+array read. Per query one of two regimes is chosen from the posting lists.
+If at most `exact_filter_scan` records (default 16,384) can match, they are
+read and ranked exactly, so a rare filter gets recall 1.0 and never a short
+answer. Otherwise the walk is steered by the filter: rejected nodes are
+expanded for navigation but only passing nodes take result slots, so a 1%
+filter costs a longer walk rather than repeated widened walks. Closure
+filters cannot be inspected and keep the old path: applied to visited nodes,
+beam doubled until `k` pass, up to `max_search_beam`.
 
 **Concurrency.** A `RwLock` guards the in-memory state: reads share it, writes
 take it, checkpoints serialise on a separate mutex and hold neither during
@@ -262,6 +273,29 @@ What the tables say:
 - The harness's "index size" column is omitted: it measures process memory
   growth during build, which is near zero for a memory-mapped index.
 
+### Filtered search, SIFT1M with labels
+
+`examples/filtered.rs`: every record gets four string labels with 10, 100,
+1,000 and 10,000 distinct values, so an equality filter on each passes 10%,
+1%, 0.1% and 0.01% of the set. 500 published queries, k=10, beam 64, warm;
+ground truth is brute force over the records that pass. The column path is
+`search_where` with a `Filter`; the closure path is `search_filtered`, which
+cannot look inside the filter and widens the beam until `k` pass.
+
+| selectivity | regime | recall@10 | mean | p99 | closure recall@10 | closure mean |
+|---|---|---|---|---|---|---|
+| 10% | filtered walk | 0.995 | 1.04 ms | 1.8 ms | 0.792 | 0.42 ms |
+| 1% | exact scan, 10K matches | 1.000 | 1.34 ms | 1.6 ms | 0.900 | 3.96 ms |
+| 0.1% | exact scan | 1.000 | 110 µs | 161 µs | 0.399 | 10.4 ms |
+| 0.01% | exact scan | 1.000 | 9 µs | 14 µs | 0.044 | 10.5 ms |
+
+The rare-filter rows are the point: the old path returned 4 of 10 right
+answers at 0.1% and almost none at 0.01%, after 10 ms of widened walks; the
+posting lists make those the cheapest queries in the table. The scan beats
+the walk up to about 20,000 matches warm, which is where the default
+`exact_filter_scan` sits; at 10% the scan would take 13 ms and the walk
+wins. The 10% walk is 7x an unfiltered query; closing that is on the list.
+
 ### Cold cache, 5M vectors from SIFT1B
 
 First 5,000,000 vectors of big-ann-benchmarks "bigann" (uint8, dim 128, L2),
@@ -329,8 +363,11 @@ the exact scan takes 3.8 ms and the graph 140 µs.
    are the next items in the profile. AVX2 kernels for x86, where the
    autovectoriser does less without `target-cpu`. Close the R=32 gap on
    cosine data. A VectorDBBench client.
-2. Typed metadata and filter-aware graph traversal:
-   [design note](docs/design/typed-metadata-and-filtered-search.md).
+2. Filtered search, next steps from the
+   [design note](docs/design/typed-metadata-and-filtered-search.md): the
+   metadata map still lives in RAM beside the columns; measure on the
+   big-ann-benchmarks filter track (YFCC-10M); two-hop expansion through
+   rejected nodes if the filtered walk's recall needs it.
 3. Format freeze and 1.0.
 4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.

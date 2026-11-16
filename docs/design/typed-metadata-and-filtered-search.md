@@ -1,8 +1,13 @@
 # Typed metadata and filter-aware search
 
-Status: design, not started. Target: the release after 0.1.4; changes the
-log format (reader level 2) and so needs the migration path described at the
-end before any of it ships.
+Status: steps 1 to 4 of "Order of work" shipped in 0.1.4 (typed values with
+log reader level 2 and migration, attribute columns and posting lists in the
+index, the `Filter` type with the Python operator dict, the exact-scan regime
+and a filtered walk whose result slots admit only passing nodes). Not done:
+shrinking `Inner::meta` to the delta (the columns exist, the RAM map is still
+authoritative for `get` and for delta records), two-hop expansion through
+rejected nodes, and the YFCC measurements. The regime thresholds below are
+the shipped defaults; `Options::exact_filter_scan` is the one knob.
 
 ## Where we are
 

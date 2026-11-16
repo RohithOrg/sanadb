@@ -7,7 +7,53 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-16
+
+This release changes the Rust `Metadata` type and the log format (reader
+level 2); stores from 0.1.1 to 0.1.3 are converted on open, see Upgrading.
+
 ### Added
+- Typed metadata. `Metadata` is `HashMap<String, Value>` with
+  `Value::{Str, Int, Float, Bool}`. The first value written under a key fixes
+  that key's type for the store; writing another type is
+  `Error::TypeMismatch`. Python maps `str`, `int`, `float`, `bool` both ways
+  (`bool` before `int`) and rejects other value types with `TypeError`.
+- `Filter`, a filter expression (`Eq`, `Ne`, `In`, `Lt`, `Le`, `Gt`, `Ge`,
+  `Prefix`, `Exists`, `And`, `Or`, `Not`), and `Db::search_where` /
+  `search_many_where` that take one. In Python the `filter=` dict now
+  accepts operators: `{"year": {"$gte": 2020}, "lang": {"$in": ["en",
+  "de"]}, "$or": [...], "$not": {...}}`; a plain `{"k": v}` dict still means
+  equality. Callables keep working on the old post-filter path.
+- Attribute columns in the index file. At checkpoint every metadata key
+  becomes a slot-ordered column (strings dictionary-coded) with a presence
+  bitmap and, for keys with at most 65,536 distinct values, posting lists.
+  `search_where` evaluates its filter on these columns with an array read per
+  visited node, no hashing. The section is additive: 0.1.3 opens such an
+  index and ignores it. An index without the section (built before this
+  release) still works; `search_where` then evaluates filters from the
+  metadata map and does not use the scan regime until the next checkpoint.
+- Two filtered-search regimes chosen per query. When the posting lists put
+  the match count at or below `Options::exact_filter_scan` (default 16,384),
+  the matching records are read and ranked exactly: recall 1.0 and never a
+  short result for a rare filter. Otherwise the graph is walked with the
+  filter steering it: only passing nodes take result slots while rejected
+  nodes are still expanded for navigation, so a 1% filter no longer needs
+  the beam-doubling retries of the post-filter path. Measured on SIFT1M with
+  synthetic labels (`examples/filtered.rs`, 500 queries, beam 64, warm),
+  column path against the old post-filter closure path:
+
+  | selectivity | regime | recall@10 | mean | old recall@10 | old mean |
+  |---|---|---|---|---|---|
+  | 10% | walk | 0.995 | 1.04 ms | 0.792 | 0.42 ms |
+  | 1% | scan (10K matches) | 1.000 | 1.34 ms | 0.900 | 3.96 ms |
+  | 0.1% | scan | 1.000 | 110 µs | 0.399 | 10.4 ms |
+  | 0.01% | scan | 1.000 | 9 µs | 0.044 | 10.5 ms |
+
+  The scan is faster than the filtered walk up to about 20,000 matches when
+  the index is warm, which is where the default sits; at 10% (100K matches)
+  the scan takes 13 ms and the walk wins. The filtered walk at 10% costs 7x
+  an unfiltered query for 0.995 recall; its expansions are capped at 64 times
+  the beam.
 - `Db::search_many` and `search_many_filtered`: k-NN for a batch of queries
   (row-major slice) spread over all cores with rayon. In Python,
   `Db.search_many(queries, k, filter=None)` takes a 2-D float32 array and
@@ -35,6 +81,31 @@ the new version migrates old stores on open.
     built from a dimension-major copy of the codebook, so both vectorise.
 - Unfiltered searches no longer look up each visited node's metadata (6%).
 - `rustc-hash` is no longer a dependency.
+
+### Upgrading from 0.1.1 to 0.1.3
+- Rust: `Metadata` values are `Value`, not `String`. `"x".into()` still
+  builds a value, `m["k"] == "x"` still compares; code that called string
+  methods on a value uses `m["k"].as_str()`.
+- Logs are converted the first time a store is opened (temp file and
+  rename, as the 0.1.1 conversion was); every existing value becomes
+  `Value::Str`, nothing is parsed from its spelling, so a key that held
+  `"2024"` stays a string key. The index file is unchanged; the next
+  checkpoint adds the attribute columns. No downgrade.
+- Python: existing code is unchanged; dict filters with plain values behave
+  as before, except that a value of the wrong type for a key matches nothing
+  instead of comparing its string form.
+
+### Known issues
+- Under heavy CPU load, with the whole test suite running in parallel in one
+  process, about one run in 25 saw `Error::Locked` when reopening a store
+  that the same thread had just dropped, and once a record written before a
+  checkpoint was missing after the following reopen. Neither reproduces with
+  the test alone, with eight threads hammering `flock` (340,000 cycles, no
+  false conflict), or with `lsof` run at the moment of failure (no holder).
+  `Db::open` now retries a held lock for up to 200 ms before failing. The
+  tests carry diagnostics that will name the holder and the lost frame if it
+  happens again; if you see either outside the test suite, please open an
+  issue with the output.
 
 ### Fixed
 - A record deleted while a checkpoint was building now gets a Delete frame
@@ -149,7 +220,8 @@ published.
 - One process per store. No replication, encryption, typed metadata or range
   filters. Formats may change before 1.0 (with migration).
 
-[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/RohithOrg/sanadb/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/RohithOrg/sanadb/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/RohithOrg/sanadb/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/RohithOrg/sanadb/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/RohithOrg/sanadb/releases/tag/v0.1.1

@@ -27,7 +27,11 @@ const K: usize = 10;
 
 fn base(dir: &Path, n: usize) -> Vec<u8> {
     let mut b = fs::read(dir.join("base.5M.u8")).expect("base.5M.u8");
-    assert!(b.len() >= n * DIM, "base file has {} rows, asked for {n}", b.len() / DIM);
+    assert!(
+        b.len() >= n * DIM,
+        "base file has {} rows, asked for {n}",
+        b.len() / DIM
+    );
     b.truncate(n * DIM);
     b
 }
@@ -35,8 +39,14 @@ fn base(dir: &Path, n: usize) -> Vec<u8> {
 fn queries(dir: &Path, q: usize) -> Vec<f32> {
     let b = fs::read(dir.join("query.public.10K.u8bin")).expect("query.public.10K.u8bin");
     let nq = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
-    assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize, DIM);
-    b[8..8 + q.min(nq) * DIM].iter().map(|&x| x as f32).collect()
+    assert_eq!(
+        u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize,
+        DIM
+    );
+    b[8..8 + q.min(nq) * DIM]
+        .iter()
+        .map(|&x| x as f32)
+        .collect()
 }
 
 fn row(base: &[u8], i: usize) -> impl Iterator<Item = f32> + '_ {
@@ -44,7 +54,11 @@ fn row(base: &[u8], i: usize) -> impl Iterator<Item = f32> + '_ {
 }
 
 fn store_path(dir: &Path, n: usize, pq: bool) -> std::path::PathBuf {
-    dir.join(format!("sift{}k.{}.sana", n / 1000, if pq { "pq" } else { "nopq" }))
+    dir.join(format!(
+        "sift{}k.{}.sana",
+        n / 1000,
+        if pq { "pq" } else { "nopq" }
+    ))
 }
 
 fn main() {
@@ -59,7 +73,14 @@ fn main() {
             let _ = fs::remove_file(&path);
             let _ = fs::remove_file(format!("{}.idx", path.display()));
             let b = base(dir, n);
-            let db = Db::open(&path, Options::new(DIM as u32).graph(GraphParams { use_pq: pq, ..GraphParams::default() })).unwrap();
+            let db = Db::open(
+                &path,
+                Options::new(DIM as u32).graph(GraphParams {
+                    use_pq: pq,
+                    ..GraphParams::default()
+                }),
+            )
+            .unwrap();
             let t = Instant::now();
             let mut v = vec![0f32; DIM];
             for i in 0..n {
@@ -71,9 +92,18 @@ fn main() {
             let t = Instant::now();
             db.checkpoint().unwrap();
             let s = db.index_stats().unwrap();
-            let idx = fs::metadata(format!("{}.idx", path.display())).unwrap().len();
+            let idx = fs::metadata(format!("{}.idx", path.display()))
+                .unwrap()
+                .len();
             let log = fs::metadata(&path).unwrap().len();
-            println!("build: {:.1?} nodes={} pq_subspaces={} index={:.2} GB log={:.0} MB", t.elapsed(), s.nodes, s.pq_subspaces, idx as f64 / 1e9, log as f64 / 1e6);
+            println!(
+                "build: {:.1?} nodes={} pq_subspaces={} index={:.2} GB log={:.0} MB",
+                t.elapsed(),
+                s.nodes,
+                s.pq_subspaces,
+                idx as f64 / 1e9,
+                log as f64 / 1e6
+            );
         }
         "gt" => {
             let q: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
@@ -86,7 +116,11 @@ fn main() {
                     let qv = &qs[qi * DIM..(qi + 1) * DIM];
                     let mut best: Vec<(f32, u32)> = Vec::with_capacity(K + 1);
                     for i in 0..n {
-                        let d: f32 = qv.iter().zip(row(&b, i)).map(|(a, b)| (a - b) * (a - b)).sum();
+                        let d: f32 = qv
+                            .iter()
+                            .zip(row(&b, i))
+                            .map(|(a, b)| (a - b) * (a - b))
+                            .sum();
                         if best.len() < K || d < best[K - 1].0 {
                             let pos = best.partition_point(|e| e.0 <= d);
                             best.insert(pos, (d, i as u32));
@@ -98,7 +132,10 @@ fn main() {
                 .collect();
             let out: Vec<u8> = gt.iter().flat_map(|x| x.to_le_bytes()).collect();
             fs::write(dir.join(format!("gt.{n}.{q}.u32")), out).unwrap();
-            println!("ground truth for {q} queries over {n} rows: {:.1?}", t.elapsed());
+            println!(
+                "ground truth for {q} queries over {n} rows: {:.1?}",
+                t.elapsed()
+            );
         }
         "query" => {
             let q: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
@@ -106,13 +143,32 @@ fn main() {
             let beam: u32 = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(64);
             let width: u32 = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(4);
             let gt_bytes = fs::read(dir.join(format!("gt.{n}.{q}.u32"))).expect("run `gt` first");
-            let gt: Vec<u32> = gt_bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            let gt: Vec<u32> = gt_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect();
             let qs = queries(dir, q);
             let t = Instant::now();
-            let opts = Options::new(DIM as u32).graph(GraphParams { use_pq: pq, ..GraphParams::default() }).search_beam(beam).max_search_beam(beam).io_width(width);
+            let opts = Options::new(DIM as u32)
+                .graph(GraphParams {
+                    use_pq: pq,
+                    ..GraphParams::default()
+                })
+                .search_beam(beam)
+                .max_search_beam(beam)
+                .io_width(width);
             let db = Db::open(store_path(dir, n, pq), opts).unwrap();
-            println!("open: {:.2?}  n={} pq={pq} beam={beam} io_width={width} queries={q}", t.elapsed(), db.len());
-            println!("{:>6} {:>9} {:>9} {:>9} {:>9} {:>9}", "pass", "recall@10", "mean", "p50", "p99", "total");
+            println!(
+                "open: {:.2?}  n={} pq={pq} beam={beam} io_width={width} queries={q}",
+                t.elapsed(),
+                db.len()
+            );
+            println!(
+                "{:>6} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                "pass", "recall@10", "mean", "p50", "p99", "total"
+            );
             for pass in ["cold", "warm"] {
                 let mut lat = Vec::with_capacity(q);
                 let mut hit = 0usize;
@@ -122,12 +178,22 @@ fn main() {
                     let hits = db.search(&qs[qi * DIM..(qi + 1) * DIM], K).unwrap();
                     lat.push(t.elapsed().as_secs_f64() * 1e6);
                     let truth = &gt[qi * K..(qi + 1) * K];
-                    hit += hits.iter().filter(|h| truth.contains(&(h.id as u32))).count();
+                    hit += hits
+                        .iter()
+                        .filter(|h| truth.contains(&(h.id as u32)))
+                        .count();
                 }
                 let total = t0.elapsed();
                 lat.sort_by(|a, b| a.total_cmp(b));
                 let mean = lat.iter().sum::<f64>() / q as f64;
-                println!("{pass:>6} {:>9.4} {:>7.0}us {:>7.0}us {:>7.0}us {:>8.2?}", hit as f64 / (q * K) as f64, mean, lat[q / 2], lat[q * 99 / 100], total);
+                println!(
+                    "{pass:>6} {:>9.4} {:>7.0}us {:>7.0}us {:>7.0}us {:>8.2?}",
+                    hit as f64 / (q * K) as f64,
+                    mean,
+                    lat[q / 2],
+                    lat[q * 99 / 100],
+                    total
+                );
             }
         }
         _ => eprintln!("usage: bigann build|gt|query <dir> <n> ..."),

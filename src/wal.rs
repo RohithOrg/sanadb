@@ -52,18 +52,36 @@ pub(crate) struct Header {
 /// What gets written.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Entry {
-    Insert { id: u64, vector: Vec<f32>, meta: Metadata },
-    Delete { id: u64 },
-    Meta { id: u64, meta: Metadata },
+    Insert {
+        id: u64,
+        vector: Vec<f32>,
+        meta: Metadata,
+    },
+    Delete {
+        id: u64,
+    },
+    Meta {
+        id: u64,
+        meta: Metadata,
+    },
 }
 
 /// What replay yields. Insert carries the vector's byte offset in the file
 /// rather than the vector.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Replayed {
-    Insert { id: u64, vector_off: u64, meta: Metadata },
-    Delete { id: u64 },
-    Meta { id: u64, meta: Metadata },
+    Insert {
+        id: u64,
+        vector_off: u64,
+        meta: Metadata,
+    },
+    Delete {
+        id: u64,
+    },
+    Meta {
+        id: u64,
+        meta: Metadata,
+    },
 }
 
 pub(crate) struct Wal {
@@ -85,11 +103,19 @@ impl Wal {
         if exists {
             migrate(path, wanted)?;
         }
-        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         let (entries, len) = if exists {
             let header = read_header(&mut file)?;
             if header != wanted {
-                return Err(Error::HeaderMismatch { on_disk: (header.dim, header.metric), requested: (wanted.dim, wanted.metric) });
+                return Err(Error::HeaderMismatch {
+                    on_disk: (header.dim, header.metric),
+                    requested: (wanted.dim, wanted.metric),
+                });
             }
             read_entries(&mut file, header.dim)?
         } else {
@@ -105,11 +131,21 @@ impl Wal {
         // writer appends past `len`; bytes below `len` never change.
         let map = unsafe { Mmap::map(&file)? };
         file.seek(SeekFrom::Start(len))?;
-        Ok((Wal { writer: Some(BufWriter::new(file)), len, map: Some(map), dim: wanted.dim as usize }, entries))
+        Ok((
+            Wal {
+                writer: Some(BufWriter::new(file)),
+                len,
+                map: Some(map),
+                dim: wanted.dim as usize,
+            },
+            entries,
+        ))
     }
 
     fn writer(&mut self) -> Result<&mut BufWriter<File>> {
-        self.writer.as_mut().ok_or(Error::Corrupt("log used after release"))
+        self.writer
+            .as_mut()
+            .ok_or(Error::Corrupt("log used after release"))
     }
 
     /// Append a frame. For an insert, returns the byte offset of its vector.
@@ -186,7 +222,11 @@ impl Drop for Wal {
 
 /// Write a fresh log holding `entries` to `path` and fsync it. Returns, for
 /// each insert entry in order, the byte offset of its vector.
-pub(crate) fn write_snapshot(path: &Path, header: Header, entries: impl Iterator<Item = Entry>) -> Result<Vec<u64>> {
+pub(crate) fn write_snapshot(
+    path: &Path,
+    header: Header,
+    entries: impl Iterator<Item = Entry>,
+) -> Result<Vec<u64>> {
     let mut file = File::create(path)?;
     write_header(&mut file, header)?;
     let mut w = BufWriter::new(file);
@@ -227,7 +267,10 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
     let metric = Metric::from_u8(head[12]).ok_or(Error::Corrupt("old log: unknown metric"))?;
     let header = Header { dim, metric };
     if header != wanted {
-        return Err(Error::HeaderMismatch { on_disk: (dim, metric), requested: (wanted.dim, wanted.metric) });
+        return Err(Error::HeaderMismatch {
+            on_disk: (dim, metric),
+            requested: (wanted.dim, wanted.metric),
+        });
     }
     let bytes = std::fs::read(path)?;
     let mut pos = HEADER_LEN as usize;
@@ -235,13 +278,19 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
     while pos + 8 <= bytes.len() {
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else { break };
+        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else {
+            break;
+        };
         if len == 0 || crc32fast::hash(body) != crc {
             break;
         }
         pos += 8 + len;
         // Re-frame a v1 body as a v2 body: insert the three pad bytes.
-        let v2: Vec<u8> = if v1 { [&body[..1], &[0, 0, 0][..], &body[1..]].concat() } else { body.to_vec() };
+        let v2: Vec<u8> = if v1 {
+            [&body[..1], &[0, 0, 0][..], &body[1..]].concat()
+        } else {
+            body.to_vec()
+        };
         let e = match decode(&v2, dim, 0, false) {
             Decoded::Entry(e) => e,
             Decoded::Unknown => continue,
@@ -250,7 +299,12 @@ fn migrate(path: &Path, wanted: Header) -> Result<()> {
         entries.push(match e {
             Replayed::Insert { id, meta, .. } => {
                 let vb = &v2[4 + 8..4 + 8 + dim as usize * 4];
-                let vector = vb.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                let vector = vb
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
                 Entry::Insert { id, vector, meta }
             }
             Replayed::Delete { id } => Entry::Delete { id },
@@ -274,16 +328,22 @@ fn write_header(file: &mut File, h: Header) -> io::Result<()> {
 
 fn read_header(file: &mut File) -> Result<Header> {
     let mut buf = [0u8; HEADER_LEN as usize];
-    file.read_exact(&mut buf).map_err(|_| Error::Corrupt("file shorter than header"))?;
+    file.read_exact(&mut buf)
+        .map_err(|_| Error::Corrupt("file shorter than header"))?;
     if &buf[..8] != MAGIC {
         return Err(Error::Corrupt("bad magic"));
     }
     if buf[13] > READER_LEVEL {
-        return Err(Error::NeedsNewerVersion { file_level: buf[13], supported: READER_LEVEL });
+        return Err(Error::NeedsNewerVersion {
+            file_level: buf[13],
+            supported: READER_LEVEL,
+        });
     }
     if buf[13] < READER_LEVEL {
         // `migrate` runs before this and rewrites lower levels.
-        return Err(Error::Corrupt("log at an old reader level was not migrated"));
+        return Err(Error::Corrupt(
+            "log at an old reader level was not migrated",
+        ));
     }
     let dim = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let metric = Metric::from_u8(buf[12]).ok_or(Error::Corrupt("unknown metric"))?;
@@ -396,7 +456,11 @@ fn decode(body: &[u8], dim: u32, body_off: u64, tagged: bool) -> Decoded {
 
 /// Outer `None`: malformed. Inner `None`: unknown kind.
 fn decode_known(body: &[u8], dim: u32, body_off: u64, tagged: bool) -> Option<Option<Replayed>> {
-    let mut c = Cursor { buf: body, pos: 0, tagged };
+    let mut c = Cursor {
+        buf: body,
+        pos: 0,
+        tagged,
+    };
     let kind = c.u8()?;
     c.take(3)?;
     let e = match kind {
@@ -405,12 +469,19 @@ fn decode_known(body: &[u8], dim: u32, body_off: u64, tagged: bool) -> Option<Op
             let vector_off = body_off + c.pos as u64;
             c.take(dim as usize * 4)?;
             let meta = c.meta()?;
-            Replayed::Insert { id, vector_off, meta }
+            Replayed::Insert {
+                id,
+                vector_off,
+                meta,
+            }
         }
         KIND_DELETE => Replayed::Delete { id: c.u64()? },
         KIND_META => {
             let id = c.u64()?;
-            Replayed::Meta { id, meta: c.meta()? }
+            Replayed::Meta {
+                id,
+                meta: c.meta()?,
+            }
         }
         _ => return Some(None),
     };
