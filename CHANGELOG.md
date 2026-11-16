@@ -48,6 +48,27 @@ See `docs/design/snapshot-and-tail.md`.
   reader still maps it (Windows refuses the delete) the next writer open
   collects it. `Db::index_path()` returns the current file. Stores whose
   index is still the unnumbered `<path>.idx` open as before.
+- `Storage::I8` (`Options::storage`, Python `storage="int8"`): indexed vectors
+  kept as 8-bit codes with a per-record min and scale, `dim + 8` bytes
+  instead of `dim * 4`, so each hop of a cold query reads a quarter of the
+  vector bytes. The walk is unchanged (PQ codes); exact re-ranking and
+  `get` dequantise. The log stays `f32`, so recent writes are exact and the
+  value stored is only rounded once (requantising a dequantised vector gives
+  the same codes). Header byte 14 of the index names the storage; a 0.1.x
+  reader rejects an int8 index as inconsistent geometry rather than
+  misreading it. `IndexStats::storage` reports it. SIFT1M, PQ on, 10,000
+  queries, same machine, f32 index against int8 index built from the same
+  data:
+
+  | | f32 | int8 |
+  |---|---|---|
+  | index file | 744 MB | 372 MB |
+  | beam 64: recall@10, mean | 0.966, 161 µs | 0.960, 159 µs |
+  | beam 256 | 0.995, 411 µs | 0.988, 460 µs |
+
+  The vector is 128 of the 644 bytes an f32 block holds (the rest is the
+  adjacency list), so the file halves rather than quarters; the recall cost
+  is under one point at every beam.
 - `Db::write_batch(Batch)`: inserts and deletes applied atomically. The log
   brackets them in `Begin`/`Commit` frames (kinds 5 and 6); replay applies a
   batch only on its `Commit`, a writer opening a log that ends mid-batch cuts

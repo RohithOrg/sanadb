@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use sanadb::{Db, GraphParams, Options};
+use sanadb::{Db, GraphParams, Options, Storage};
 
 fn read_vecs<T: Copy, const W: usize>(path: &Path, from: impl Fn([u8; W]) -> T) -> (usize, Vec<T>) {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -45,6 +45,7 @@ fn main() {
     let n_queries: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
     let use_pq = args.get(4).is_none_or(|s| s != "pq:off");
     let prune_slack: f32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1.3);
+    let storage = if args.get(6).is_some_and(|s| s == "i8") { Storage::I8 } else { Storage::F32 };
 
     let (dim, base) = read_vecs::<f32, 4>(&dir.join("sift_base.fvecs"), f32::from_le_bytes);
     let n_total = base.len() / dim;
@@ -59,13 +60,15 @@ fn main() {
     let tmp = tempfile::tempdir().unwrap();
     let keep = std::env::var_os("SIFT_STORE").map(std::path::PathBuf::from);
     let path = keep.as_deref().unwrap_or(tmp.path()).join(format!(
-        "sift{}.{}.sana",
+        "sift{}.{}{}.sana",
         n / 1000,
-        if use_pq { "pq" } else { "nopq" }
+        if use_pq { "pq" } else { "nopq" },
+        if storage == Storage::I8 { ".i8" } else { "" }
     ));
     let params = GraphParams {
         use_pq,
         prune_slack,
+        storage,
         ..GraphParams::default()
     };
     // Bulk load: one explicit build at the end, no automatic ones in between.

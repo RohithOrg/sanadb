@@ -7,7 +7,7 @@ use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use sanadb_core::{Batch, Filter as Expr, GraphParams, Metadata, Metric, Options, Value};
+use sanadb_core::{Batch, Filter as Expr, GraphParams, Metadata, Metric, Options, Storage, Value};
 
 fn err(e: sanadb_core::Error) -> PyErr {
     match e {
@@ -179,11 +179,15 @@ impl PyDb {
     /// stored as given) or "cosine" (negative cosine similarity; vectors are
     /// normalised on insert and query).
     ///
+    /// storage="int8" stores indexed vectors with 8-bit scalar quantisation
+    /// (a quarter of the bytes per hop; exact re-ranking and get() use the
+    /// dequantised vector). The log keeps f32 until the next checkpoint.
+    ///
     /// read_only=True opens an existing store beside its writer (any process):
     /// no lock is taken, reads follow the writer's appends and checkpoints,
     /// and writes raise PermissionError.
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32"))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -199,6 +203,7 @@ impl PyDb {
         build_beam: u32,
         alpha: f32,
         read_only: bool,
+        storage: &str,
     ) -> PyResult<Self> {
         let metric = match metric {
             "l2" => Metric::L2,
@@ -209,6 +214,11 @@ impl PyDb {
                     "unknown metric {other:?}; use \"l2\", \"dot\" or \"cosine\""
                 )));
             }
+        };
+        let storage = match storage {
+            "f32" => Storage::F32,
+            "int8" | "i8" => Storage::I8,
+            other => return Err(PyValueError::new_err(format!("unknown storage {other:?}; use \"f32\" or \"int8\""))),
         };
         let opts = Options::new(dim)
             .metric(metric)
@@ -221,6 +231,7 @@ impl PyDb {
                 build_beam,
                 alpha,
                 use_pq: pq,
+                storage,
                 ..GraphParams::default()
             });
         let db = py
@@ -450,6 +461,7 @@ impl PyDb {
                 d.set_item("nodes", s.nodes)?;
                 d.set_item("pq_subspaces", s.pq_subspaces)?;
                 d.set_item("tombstones", s.tombstones)?;
+            d.set_item("storage", match s.storage { Storage::F32 => "f32", Storage::I8 => "int8" })?;
                 Ok(Some(d))
             }
         }

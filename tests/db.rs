@@ -1794,3 +1794,64 @@ fn write_batch_is_all_or_nothing() {
     assert_eq!(db.len(), 12);
     assert!(db.get(0).is_none() && db.get(300).is_some() && db.get(301).is_some());
 }
+
+#[test]
+fn int8_storage_keeps_recall_and_shrinks_the_index() {
+    use sanadb::Storage;
+    let (dim, n) = (32usize, 20_000u64);
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, storage: Storage| -> (Db, u64) {
+        let path = dir.path().join(name);
+        let db = Db::open(&path, Options::new(dim as u32).storage(storage)).unwrap();
+        for i in 0..n {
+            db.insert(i, &vec_of(dim, i), meta(&[("k", "v")])).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let size = std::fs::metadata(db.index_path().unwrap()).unwrap().len();
+        (db, size)
+    };
+    let (f32db, f32_size) = build("f32.sana", Storage::F32);
+    let (i8db, i8_size) = build("i8.sana", Storage::I8);
+    assert_eq!(i8db.index_stats().unwrap().storage, Storage::I8);
+    assert!(i8_size < f32_size * 3 / 4, "int8 index {i8_size} vs f32 {f32_size}");
+    // get() returns the dequantised vector: close, not exact.
+    let (v, m) = i8db.get(123).unwrap();
+    assert_eq!(m["k"], "v");
+    let truth = vec_of(dim, 123);
+    let err = v.iter().zip(&truth).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(err > 0.0 && err < 0.01, "max abs error {err}");
+    // Recall against brute force, both storages.
+    let recall = |db: &Db| {
+        let mut hit = 0;
+        for qi in 0..100u64 {
+            let q = vec_of(dim, 7_000_000 + qi);
+            let want = brute(dim, n, &q, 10, |_| true);
+            hit += db.search(&q, 10).unwrap().iter().filter(|h| want.contains(&h.id)).count();
+        }
+        hit as f64 / 1000.0
+    };
+    let (rf, ri) = (recall(&f32db), recall(&i8db));
+    eprintln!("recall@10 f32={rf} int8={ri}; index bytes f32={f32_size} int8={i8_size}");
+    assert!(ri >= rf - 0.03, "int8 recall {ri} vs f32 {rf}");
+    // Incremental update (expands the old int8 vectors), then reopen.
+    for i in n..n + 500 {
+        i8db.insert(i, &vec_of(dim, i), HashMap::new()).unwrap();
+    }
+    i8db.delete(5).unwrap();
+    i8db.checkpoint().unwrap();
+    assert_eq!(i8db.index_stats().unwrap().nodes, n as usize + 499);
+    assert_eq!(i8db.index_stats().unwrap().storage, Storage::I8);
+    let path = dir.path().join("i8.sana");
+    drop(i8db);
+    let db = Db::open(&path, Options::new(dim as u32).storage(Storage::I8)).unwrap();
+    assert_eq!(db.len(), n as usize + 499);
+    assert!(db.get(5).is_none());
+    assert_eq!(db.search(&vec_of(dim, n + 100), 1).unwrap()[0].id, n + 100);
+    assert!(recall(&db) >= rf - 0.03);
+    // A second checkpoint of the same data reproduces the same codes.
+    let before = db.get(123).unwrap().0;
+    db.insert(n + 1000, &vec_of(dim, n + 1000), HashMap::new()).unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(db.get(123).unwrap().0, before, "requantisation must not drift");
+    assert!(!dir.path().join("i8.sana.f32.tmp").exists() && std::fs::read_dir(dir.path()).unwrap().flatten().all(|e| !e.file_name().to_str().unwrap().ends_with(".f32.tmp")));
+}

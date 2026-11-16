@@ -18,9 +18,11 @@ mod graph;
 mod index;
 mod kmeans;
 mod pq;
+mod quant;
 mod wal;
 
 pub use filter::Filter;
+pub use graph::Storage;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -245,6 +247,11 @@ impl Options {
         self.io_width = width.max(1);
         self
     }
+    /// Vector storage in the index: `Storage::F32` (default) or `Storage::I8`.
+    pub fn storage(mut self, s: Storage) -> Self {
+        self.graph.storage = s;
+        self
+    }
     pub fn exact_filter_scan(mut self, records: u32) -> Self {
         self.exact_filter_scan = records;
         self
@@ -284,6 +291,8 @@ pub struct IndexStats {
     pub pq_subspaces: usize,
     /// Graph records hidden by a later delete or overwrite.
     pub tombstones: usize,
+    /// How the index stores vectors.
+    pub storage: Storage,
 }
 
 /// Inserts and deletes to apply together with `Db::write_batch`.
@@ -591,6 +600,7 @@ impl Db {
             nodes: g.len(),
             pq_subspaces: g.pq_subspaces(),
             tombstones: i.tombstones.len(),
+            storage: g.storage(),
         })
     }
 
@@ -733,7 +743,7 @@ impl Db {
         let g = i.graph.as_ref()?;
         let slot = g.slot(id).filter(|s| !i.tombstones.contains(s))?;
         let meta = i.meta.get(&id).map(|m| (**m).clone()).or_else(|| g.metadata(slot))?;
-        Some((g.vector(slot).to_vec(), meta))
+        Some((g.vector(slot).into_owned(), meta))
     }
 
     /// k-nearest-neighbour search. Exact over records written since the last
@@ -949,7 +959,7 @@ impl Db {
                 for slot in 0..g.len() as u32 {
                     if !i.tombstones.contains(&slot) {
                         ids.push(g.id(slot));
-                        w.write_all(bytemuck::cast_slice(g.vector(slot)))?;
+                        w.write_all(bytemuck::cast_slice(&g.vector(slot)))?;
                     }
                 }
             }

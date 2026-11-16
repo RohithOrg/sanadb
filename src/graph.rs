@@ -77,6 +77,9 @@ pub struct GraphParams {
     /// peak RAM is roughly `shard_size * (R*4 + 50)` bytes for the adjacency.
     /// Also the largest graph that is updated in place rather than rebuilt.
     pub shard_size: u32,
+    /// How vectors are stored in the index blocks. The log always holds
+    /// `f32`, so records since the last checkpoint are exact either way.
+    pub storage: Storage,
     /// During insertion an adjacency list may grow to `prune_slack * R`
     /// before it is pruned back to R. 1.0 prunes on every overflow; 1.3 (the
     /// DiskANN default) cuts prune calls sharply on data with hub nodes.
@@ -92,6 +95,42 @@ impl Default for GraphParams {
             use_pq: true,
             shard_size: 1_000_000,
             prune_slack: 1.3,
+            storage: Storage::F32,
+        }
+    }
+}
+
+/// Vector storage in the index file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Storage {
+    /// Full precision: `dim * 4` bytes per record.
+    #[default]
+    F32 = 0,
+    /// 8-bit scalar quantisation with a per-record min and scale: `dim + 8`
+    /// bytes per record, about a quarter of the index size for the vectors
+    /// and so about a quarter of the disk reads per hop. Exact re-ranking
+    /// and `get` use the dequantised vector; recall drops by a fraction of a
+    /// percent on typical embeddings (measured in the tests). Builds that
+    /// update an index in place first expand the stored vectors to `f32` in
+    /// a temp file.
+    I8 = 1,
+}
+
+impl Storage {
+    fn from_u8(b: u8) -> Option<Storage> {
+        match b {
+            0 => Some(Storage::F32),
+            1 => Some(Storage::I8),
+            _ => None,
+        }
+    }
+    /// Bytes of a block taken by the vector (and, for `I8`, its min and
+    /// scale), padded to 4.
+    fn vector_bytes(self, dim: usize) -> usize {
+        match self {
+            Storage::F32 => dim * 4,
+            Storage::I8 => dim.next_multiple_of(4) + 8,
         }
     }
 }
@@ -117,6 +156,7 @@ pub(crate) struct GraphIndex {
     entry: u32,
     block: usize,
     blocks_off: usize,
+    storage: Storage,
     n: usize,
     /// Offset of the sorted id table, when the file has one.
     idtab: Option<usize>,
@@ -162,6 +202,7 @@ impl GraphIndex {
             });
         }
         let dim = dim as usize;
+        let storage = Storage::from_u8(h[14]).ok_or(Error::Corrupt("index unknown vector storage"))?;
         let (n, r, entry, block, m) = (
             u32_at(16) as usize,
             u32_at(20) as usize,
@@ -177,7 +218,7 @@ impl GraphIndex {
         } else {
             m * pq::K * (dim / m) * 4 + n * m
         };
-        if block != block_size(dim, r)
+        if block != block_size(dim, r, storage)
             || (m != 0 && !dim.is_multiple_of(m))
             || mmap.len() < pq_off + pq_len
             || (n > 0 && entry as usize >= n)
@@ -228,6 +269,7 @@ impl GraphIndex {
             entry,
             block,
             blocks_off,
+            storage,
             n,
             idtab,
             slot_of,
@@ -273,13 +315,30 @@ impl GraphIndex {
         u64::from_le_bytes(self.mmap[o..o + 8].try_into().unwrap())
     }
 
-    pub fn vector(&self, slot: u32) -> &[f32] {
+    /// The stored vector: borrowed from the mapping for `F32`, dequantised
+    /// into a fresh buffer for `I8`.
+    pub fn vector(&self, slot: u32) -> std::borrow::Cow<'_, [f32]> {
         let o = self.blocks_off + slot as usize * self.block;
-        bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])
+        match self.storage {
+            Storage::F32 => std::borrow::Cow::Borrowed(bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])),
+            Storage::I8 => {
+                let codes = &self.mmap[o..o + self.dim];
+                let p = o + self.dim.next_multiple_of(4);
+                let min = f32::from_le_bytes(self.mmap[p..p + 4].try_into().unwrap());
+                let scale = f32::from_le_bytes(self.mmap[p + 4..p + 8].try_into().unwrap());
+                let mut out = vec![0f32; self.dim];
+                crate::quant::dequantize(codes, min, scale, &mut out);
+                std::borrow::Cow::Owned(out)
+            }
+        }
+    }
+
+    pub fn storage(&self) -> Storage {
+        self.storage
     }
 
     fn neighbors(&self, slot: u32) -> &[u32] {
-        let o = self.blocks_off + slot as usize * self.block + self.dim * 4;
+        let o = self.blocks_off + slot as usize * self.block + self.storage.vector_bytes(self.dim);
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
         bytemuck::cast_slice(&self.mmap[o + 4..o + 4 + count.min(self.r) * 4])
     }
@@ -339,7 +398,7 @@ impl GraphIndex {
                     self.entry,
                     beam,
                     width,
-                    |s| distance(self.metric, q, self.vector(s)),
+                    |s| distance(self.metric, q, &self.vector(s)),
                     pass,
                 ),
             };
@@ -350,7 +409,7 @@ impl GraphIndex {
                     // Re-rank the best `beam` approximate candidates exactly.
                     visited.truncate(beam.max(k));
                     for c in visited.iter_mut() {
-                        c.0 = distance(self.metric, q, self.vector(c.1));
+                        c.0 = distance(self.metric, q, &self.vector(c.1));
                     }
                     visited.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                 }
@@ -367,7 +426,7 @@ impl GraphIndex {
     /// leave few enough candidates that reading each one beats a walk.
     pub fn scan(&self, q: &[f32], k: usize, slots: impl Iterator<Item = u32>) -> Vec<(f32, u32)> {
         let mut out: Vec<(f32, u32)> = slots
-            .map(|s| (distance(self.metric, q, self.vector(s)), s))
+            .map(|s| (distance(self.metric, q, &self.vector(s)), s))
             .collect();
         out.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         out.truncate(k);
@@ -433,8 +492,8 @@ impl Walkable for GraphIndex {
     // Windows has no madvise; the walk still works, one page fault at a time.
 }
 
-fn block_size(dim: usize, r: usize) -> usize {
-    (dim * 4 + 4 + r * 4).next_multiple_of(ALIGN)
+fn block_size(dim: usize, r: usize, storage: Storage) -> usize {
+    (storage.vector_bytes(dim) + 4 + r * 4).next_multiple_of(ALIGN)
 }
 
 /// Vector lookup by slot, shared by the build and update paths.
@@ -959,6 +1018,7 @@ pub(crate) fn build_and_write(
             pq_ref,
             &|s| adj[s as usize].clone(),
             meta_of,
+            params.storage,
         );
     }
 
@@ -991,7 +1051,7 @@ pub(crate) fn build_and_write(
         prune(&vec, metric, g, cands, r, params.alpha)
     };
     let result = write_index(
-        path, dim, metric, ids, &vec, r, entry, pq_ref, &merged, meta_of,
+        path, dim, metric, ids, &vec, r, entry, pq_ref, &merged, meta_of, params.storage,
     );
     drop(files);
     for p in tmp_paths {
@@ -1023,10 +1083,35 @@ pub(crate) fn update_and_write(
     assert_eq!(new_vectors.len(), added * dim);
     let total = old + added;
     let r = params.max_degree.max(existing.r as u32) as usize;
+    // Old vectors come straight from the mapping when stored as f32; an
+    // int8 index is expanded once into a temp file next to the new index.
+    let expanded: Option<(memmap2::Mmap, PathBuf)> = match existing.storage {
+        Storage::F32 => None,
+        Storage::I8 => {
+            let tmp = path.with_extension("f32.tmp");
+            {
+                let mut w = BufWriter::new(File::create(&tmp)?);
+                for s in 0..old as u32 {
+                    w.write_all(bytemuck::cast_slice(&existing.vector(s)))?;
+                }
+                w.flush()?;
+            }
+            let f = File::open(&tmp)?;
+            // Safety: written above and never touched again while mapped.
+            Some((unsafe { memmap2::Mmap::map(&f)? }, tmp))
+        }
+    };
+    let old_f32: Option<&[f32]> = expanded.as_ref().map(|(m, _)| bytemuck::cast_slice(&m[..]));
     let vec = move |s: u32| -> &[f32] {
         let s = s as usize;
         if s < old {
-            existing.vector(s as u32)
+            match old_f32 {
+                Some(all) => &all[s * dim..(s + 1) * dim],
+                None => match existing.vector(s as u32) {
+                    std::borrow::Cow::Borrowed(v) => v,
+                    std::borrow::Cow::Owned(_) => unreachable!("f32 storage borrows"),
+                },
+            }
         } else {
             &new_vectors[(s - old) * dim..(s - old + 1) * dim]
         }
@@ -1161,9 +1246,14 @@ pub(crate) fn update_and_write(
             .take(r)
             .collect()
     };
-    write_index(
-        path, dim, metric, &ids, &vec_new, r, entry_new, pq_ref, &edges, meta_of,
-    )
+    let result = write_index(
+        path, dim, metric, &ids, &vec_new, r, entry_new, pq_ref, &edges, meta_of, params.storage,
+    );
+    if let Some((m, tmp)) = expanded {
+        drop(m);
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }
 
 /// Serialise the index. `vec(slot)` and `edges(slot)` are in final slot
@@ -1180,14 +1270,15 @@ fn write_index(
     pq: Option<(&Codebook, &[u8])>,
     edges: &(dyn Fn(u32) -> Vec<u32> + Sync),
     meta_of: &MetaFn<'_>,
+    storage: Storage,
 ) -> Result<()> {
     let n = ids.len();
     let m = pq.map_or(0, |(cb, _)| cb.m);
-    let block = block_size(dim, r);
+    let block = block_size(dim, r, storage);
     let mut w = BufWriter::new(File::create(path)?);
     w.write_all(MAGIC)?;
     w.write_all(&(dim as u32).to_le_bytes())?;
-    w.write_all(&[metric as u8, IDX_READER_LEVEL, 0, 0])?;
+    w.write_all(&[metric as u8, IDX_READER_LEVEL, storage as u8, 0])?;
     w.write_all(&(n as u32).to_le_bytes())?;
     w.write_all(&(r as u32).to_le_bytes())?;
     w.write_all(&entry.to_le_bytes())?;
@@ -1206,12 +1297,21 @@ fn write_index(
             .into_par_iter()
             .map(edges)
             .collect();
+        let vb = storage.vector_bytes(dim);
         for (s, a) in (start..end).zip(&chunk) {
             buf.fill(0);
-            buf[..dim * 4].copy_from_slice(bytemuck::cast_slice(vec(s as u32)));
+            match storage {
+                Storage::F32 => buf[..dim * 4].copy_from_slice(bytemuck::cast_slice(vec(s as u32))),
+                Storage::I8 => {
+                    let (min, scale) = crate::quant::quantize(vec(s as u32), &mut buf[..dim]);
+                    let p = dim.next_multiple_of(4);
+                    buf[p..p + 4].copy_from_slice(&min.to_le_bytes());
+                    buf[p + 4..p + 8].copy_from_slice(&scale.to_le_bytes());
+                }
+            }
             let a = &a[..a.len().min(r)];
-            buf[dim * 4..dim * 4 + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
-            buf[dim * 4 + 4..dim * 4 + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(a));
+            buf[vb..vb + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
+            buf[vb + 4..vb + 4 + a.len() * 4].copy_from_slice(bytemuck::cast_slice(a));
             w.write_all(&buf)?;
         }
     }

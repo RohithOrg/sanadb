@@ -94,6 +94,11 @@ ids, scores = db.search_many(queries, k=10)   # (n, k) arrays, all cores
 db.checkpoint()
 ```
 
+`Options::storage(Storage::I8)` keeps indexed vectors as 8-bit codes (half
+the index file on SIFT1M, under a point of recall); `Db::write_batch`
+applies inserts and deletes atomically; `Db::open_read_only` opens a store
+beside its writer from any process.
+
 `Db` is thread-safe. Reads run concurrently, a checkpoint builds the new index
 without blocking readers or writers, and the Python bindings release the GIL
 during inserts, dict-filtered searches, batch searches and checkpoints. Scores are distances:
@@ -369,21 +374,23 @@ the exact scan takes 3.8 ms and the graph 140 µs.
 
 ## Next
 
-1. Close the remaining gap to faiss HNSW: the heaps and the PQ table build
-   are the next items in the profile. AVX2 kernels for x86, where the
-   autovectoriser does less without `target-cpu`. Close the R=32 gap on
-   cosine data. A VectorDBBench client.
-2. Readers in other processes and metadata off the heap:
-   [design note](docs/design/snapshot-and-tail.md). Shared lock for
-   readers, exclusive for the one writer; a `Db` holds only the log tail in
-   RAM.
-3. Filtered search, next steps from the
-   [design note](docs/design/typed-metadata-and-filtered-search.md): the
-   metadata map still lives in RAM beside the columns; measure on the
-   big-ann-benchmarks filter track (YFCC-10M); two-hop expansion through
-   rejected nodes if the filtered walk's recall needs it.
-4. Format freeze and 1.0.
-5. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
+1. Hybrid search: BM25 over a text field and learned sparse vectors, fused
+   with the graph result. [Design note](docs/design/hybrid-search.md),
+   measured on BEIR against Pyserini before it ships.
+2. x86 kernels: AVX2 for build, exact scan and re-ranking, where the
+   default target has no FMA. Query latency is memory-bound and will not
+   move; builds and scans will. The int8 path gets a fused kernel.
+3. Filtered search at moderate selectivity: a 10% filter costs 7x an
+   unfiltered query because the walk needs 64 passing nodes to stop.
+   Candidates: a filter-aware edge budget at build (ACORN-γ), or a smaller
+   result heap for filtered walks. Measure on the big-ann-benchmarks filter
+   track (YFCC-10M).
+4. Close the R=32 gap on cosine data; a VectorDBBench client; more
+   ann-benchmarks datasets.
+5. Format freeze and 1.0. Readers in other processes and metadata off the
+   heap are done ([design note](docs/design/snapshot-and-tail.md)); what
+   remains before freezing is a year of other people's workloads.
+6. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.
 
 ## Development
