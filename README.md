@@ -363,13 +363,17 @@ the exact scan takes 3.8 ms and the graph 140 µs.
    are the next items in the profile. AVX2 kernels for x86, where the
    autovectoriser does less without `target-cpu`. Close the R=32 gap on
    cosine data. A VectorDBBench client.
-2. Filtered search, next steps from the
+2. Readers in other processes and metadata off the heap:
+   [design note](docs/design/snapshot-and-tail.md). Shared lock for
+   readers, exclusive for the one writer; a `Db` holds only the log tail in
+   RAM.
+3. Filtered search, next steps from the
    [design note](docs/design/typed-metadata-and-filtered-search.md): the
    metadata map still lives in RAM beside the columns; measure on the
    big-ann-benchmarks filter track (YFCC-10M); two-hop expansion through
    rejected nodes if the filtered walk's recall needs it.
-3. Format freeze and 1.0.
-4. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
+4. Format freeze and 1.0.
+5. `sanadb studio`: a local web UI to open a store, map it in 2D, cluster,
    search, watch the beam walk, and edit metadata.
 
 ## Development
