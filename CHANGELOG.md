@@ -7,6 +7,12 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-16
+
+The release that reaches PyPI: 0.2.3 published to crates.io but its PyPI
+upload failed (see Changed). Also the documentation split by language,
+the docs refresh script, and the failure-modes page.
+
 ### Changed
 - Release workflow: `sanadb` and `sanadb-studio` are uploaded to PyPI in
   two steps; one upload of both packages' files was refused in 0.2.3 (the
