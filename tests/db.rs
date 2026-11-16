@@ -902,8 +902,15 @@ fn survives_being_killed_mid_write() {
             if let Some((v, m)) = db.get(id) {
                 assert_eq!(v, vec_of(8, id), "round {round}: vector of {id}");
                 assert_eq!(m["i"], id.to_string());
-                let top = db.search(&v, 1).unwrap();
-                assert_eq!(top[0].id, id);
+                let top = db.search(&v, 3).unwrap();
+                assert_eq!(
+                    top[0].id,
+                    id,
+                    "round {round}: own-vector search for {id} of {n} records returned {:?}; index {:?}, delta {}",
+                    top.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+                    db.index_stats(),
+                    db.delta_len()
+                );
                 seen += 1;
             }
         }
@@ -1649,9 +1656,12 @@ fn reader_child_reads_until_told_to_stop() {
             }
         }
         rounds += 1;
+        if rounds.is_multiple_of(5) {
+            let _ = std::fs::write(path.with_extension("progress"), rounds.to_string());
+        }
     }
     eprintln!("reader child: {rounds} rounds, final len {max_len}");
-    assert!(rounds > 10);
+    assert!(rounds > 0, "the reader never completed a round");
     std::fs::write(path.with_extension("rounds"), rounds.to_string()).unwrap();
 }
 
@@ -1687,7 +1697,15 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
     let t = std::time::Instant::now();
     let mut next = 300u64;
     let mut round = 0;
-    while t.elapsed() < std::time::Duration::from_millis(1500) {
+    let progress = || -> u64 {
+        std::fs::read_to_string(path.with_extension("progress"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    while t.elapsed() < std::time::Duration::from_millis(1500)
+        || (progress() < 20 && t.elapsed() < std::time::Duration::from_secs(60))
+    {
         for _ in 0..50 {
             w.insert(
                 next,
@@ -1715,7 +1733,7 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
         "writer: {round} rounds, {} records; reader: {rounds} rounds",
         w.len()
     );
-    assert!(rounds > 10);
+    assert!(rounds >= 20, "reader did only {rounds} rounds");
     // While the reader mapped an old index, the writer could not delete it on
     // Windows (Unix deletes it at once). Either way, once the reader is gone,
     // the next writer open leaves exactly the current index behind.
