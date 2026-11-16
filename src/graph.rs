@@ -202,7 +202,8 @@ impl GraphIndex {
             });
         }
         let dim = dim as usize;
-        let storage = Storage::from_u8(h[14]).ok_or(Error::Corrupt("index unknown vector storage"))?;
+        let storage =
+            Storage::from_u8(h[14]).ok_or(Error::Corrupt("index unknown vector storage"))?;
         let (n, r, entry, block, m) = (
             u32_at(16) as usize,
             u32_at(20) as usize,
@@ -241,24 +242,43 @@ impl GraphIndex {
         // attribute table; anything else is a 0.1.3 file with neither.
         let fixed_end = pq_off + pq_len;
         let tail = &mmap[fixed_end..];
-        let (attrs_off, idtab) = if tail.len() >= FOOTER_LEN && &mmap[mmap.len() - 8..] == FOOTER_MAGIC {
+        let (attrs_off, idtab) = if tail.len() >= FOOTER_LEN
+            && &mmap[mmap.len() - 8..] == FOOTER_MAGIC
+        {
             let f = mmap.len() - FOOTER_LEN;
-            let at = |o: usize| u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize;
+            let at =
+                |o: usize| u64::from_le_bytes(mmap[f + o..f + o + 8].try_into().unwrap()) as usize;
             let (a, t) = (at(0), at(8));
             if t < fixed_end || t + n * 12 > f {
                 return Err(Error::Corrupt("index id table inconsistent"));
             }
             (Some(a), Some(t))
-        } else if tail.len() >= attrs::LEGACY_TRAILER_LEN && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC {
+        } else if tail.len() >= attrs::LEGACY_TRAILER_LEN
+            && &mmap[mmap.len() - 8..] == attrs::LEGACY_TRAILER_MAGIC
+        {
             let o = mmap.len() - attrs::LEGACY_TRAILER_LEN;
-            (Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize), None)
+            (
+                Some(u64::from_le_bytes(mmap[o..o + 8].try_into().unwrap()) as usize),
+                None,
+            )
         } else {
             (None, None)
         };
-        let attrs = attrs_off.map(|a| Attrs::parse(&mmap, fixed_end, a, n)).transpose()?;
+        let attrs = attrs_off
+            .map(|a| Attrs::parse(&mmap, fixed_end, a, n))
+            .transpose()?;
         let slot_of = idtab.is_none().then(|| {
             (0..n)
-                .map(|s| (u64::from_le_bytes(mmap[ids_off + s * 8..ids_off + s * 8 + 8].try_into().unwrap()), s as u32))
+                .map(|s| {
+                    (
+                        u64::from_le_bytes(
+                            mmap[ids_off + s * 8..ids_off + s * 8 + 8]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        s as u32,
+                    )
+                })
                 .collect()
         });
         Ok(Some(GraphIndex {
@@ -293,7 +313,8 @@ impl GraphIndex {
         }
         let t = self.idtab?;
         let n = self.n;
-        let id_at = |i: usize| u64::from_le_bytes(self.mmap[t + i * 8..t + i * 8 + 8].try_into().unwrap());
+        let id_at =
+            |i: usize| u64::from_le_bytes(self.mmap[t + i * 8..t + i * 8 + 8].try_into().unwrap());
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -320,7 +341,9 @@ impl GraphIndex {
     pub fn vector(&self, slot: u32) -> std::borrow::Cow<'_, [f32]> {
         let o = self.blocks_off + slot as usize * self.block;
         match self.storage {
-            Storage::F32 => std::borrow::Cow::Borrowed(bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4])),
+            Storage::F32 => {
+                std::borrow::Cow::Borrowed(bytemuck::cast_slice(&self.mmap[o..o + self.dim * 4]))
+            }
             Storage::I8 => {
                 let codes = &self.mmap[o..o + self.dim];
                 let p = o + self.dim.next_multiple_of(4);
@@ -1051,7 +1074,17 @@ pub(crate) fn build_and_write(
         prune(&vec, metric, g, cands, r, params.alpha)
     };
     let result = write_index(
-        path, dim, metric, ids, &vec, r, entry, pq_ref, &merged, meta_of, params.storage,
+        path,
+        dim,
+        metric,
+        ids,
+        &vec,
+        r,
+        entry,
+        pq_ref,
+        &merged,
+        meta_of,
+        params.storage,
     );
     drop(files);
     for p in tmp_paths {
@@ -1247,7 +1280,17 @@ pub(crate) fn update_and_write(
             .collect()
     };
     let result = write_index(
-        path, dim, metric, &ids, &vec_new, r, entry_new, pq_ref, &edges, meta_of, params.storage,
+        path,
+        dim,
+        metric,
+        &ids,
+        &vec_new,
+        r,
+        entry_new,
+        pq_ref,
+        &edges,
+        meta_of,
+        params.storage,
     );
     if let Some((m, tmp)) = expanded {
         drop(m);
@@ -1325,7 +1368,8 @@ fn write_index(
     // Attribute columns, 8-aligned, found by readers through their trailer.
     let aligned = pos.next_multiple_of(8);
     w.write_all(&vec![0u8; aligned - pos])?;
-    let (attr_len, attrs_table) = attrs::write(&mut w, aligned as u64, n, &|s| meta_of(ids[s as usize]))?;
+    let (attr_len, attrs_table) =
+        attrs::write(&mut w, aligned as u64, n, &|s| meta_of(ids[s as usize]))?;
     // Sorted id table: ids ascending, then the matching slots.
     let idtab = (aligned as u64 + attr_len).next_multiple_of(8);
     w.write_all(&vec![0u8; (idtab - aligned as u64 - attr_len) as usize])?;

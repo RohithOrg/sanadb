@@ -146,7 +146,9 @@ impl FileIdent {
         }
         #[cfg(not(unix))]
         {
-            FileIdent { created: m.created().ok() }
+            FileIdent {
+                created: m.created().ok(),
+            }
         }
     }
 }
@@ -235,7 +237,10 @@ impl Wal {
             // A batch whose Commit never made it is a crash mid-batch: drop
             // its frames and write the next ones over them.
             if let Some(cut) = dangling_batch(&entries) {
-                let begin = entries.iter().position(|e| matches!(e, Replayed::Begin { at } if *at == cut)).unwrap();
+                let begin = entries
+                    .iter()
+                    .position(|e| matches!(e, Replayed::Begin { at } if *at == cut))
+                    .unwrap();
                 entries.truncate(begin);
                 len = cut;
             }
@@ -507,7 +512,9 @@ fn parse_frames(bytes: &[u8], from: usize, dim: u32) -> (Vec<Replayed>, u64) {
         if len == 0 || !len.is_multiple_of(4) {
             break;
         }
-        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else { break };
+        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else {
+            break;
+        };
         if crc32fast::hash(body) != crc {
             break;
         }

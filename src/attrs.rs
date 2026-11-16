@@ -410,20 +410,34 @@ impl Attrs {
     /// Dictionary entry for a code. Every read is bounds-checked against the
     /// dictionary region: a damaged file yields "" rather than a panic.
     fn dict_str<'b>(&self, b: &'b [u8], a: usize, code: u32) -> &'b str {
-        let Some((d, len)) = self.attrs[a].dict else { return "" };
+        let Some((d, len)) = self.attrs[a].dict else {
+            return "";
+        };
         let region = &b[d..(d + len).min(b.len())];
-        let Some(count) = u32_at(region, 0) else { return "" };
+        let Some(count) = u32_at(region, 0) else {
+            return "";
+        };
         let offs = 8;
         let heap = offs + (count as usize + 1) * 8;
-        let (Some(lo), Some(hi)) = (u64_at(region, offs + code as usize * 8), u64_at(region, offs + (code as usize + 1) * 8)) else { return "" };
+        let (Some(lo), Some(hi)) = (
+            u64_at(region, offs + code as usize * 8),
+            u64_at(region, offs + (code as usize + 1) * 8),
+        ) else {
+            return "";
+        };
         let (lo, hi) = (lo as usize, hi as usize);
         if lo > hi {
             return "";
         }
-        region.get(heap + lo..heap + hi).and_then(|s| std::str::from_utf8(s).ok()).unwrap_or("")
+        region
+            .get(heap + lo..heap + hi)
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .unwrap_or("")
     }
     fn dict_int(&self, b: &[u8], a: usize, i: u32) -> i64 {
-        let Some((d, len)) = self.attrs[a].dict else { return 0 };
+        let Some((d, len)) = self.attrs[a].dict else {
+            return 0;
+        };
         u64_at(&b[d..(d + len).min(b.len())], 8 + i as usize * 8).map_or(0, |v| v as i64)
     }
     /// Binary search a dictionary: `Ok(code)` or `Err(insertion point)`.
@@ -453,13 +467,25 @@ impl Attrs {
         if c as usize >= nd {
             return &[];
         }
-        let (Some(lo), Some(hi)) = (u64_at(b, p + c as usize * 8), u64_at(b, p + (c as usize + 1) * 8)) else { return &[] };
+        let (Some(lo), Some(hi)) = (
+            u64_at(b, p + c as usize * 8),
+            u64_at(b, p + (c as usize + 1) * 8),
+        ) else {
+            return &[];
+        };
         let (lo, hi) = (lo as usize, hi as usize);
         let slots = p + (nd + 1) * 8;
         // Offsets must be ordered, inside the file and 4-aligned; the slots
         // they name are checked by the caller against `n`.
-        match (lo <= hi).then(|| b.get(slots + lo * 4..slots + hi * 4)).flatten() {
-            Some(bytes) if bytes.len().is_multiple_of(4) && (bytes.as_ptr() as usize).is_multiple_of(4) => bytemuck::cast_slice(bytes),
+        match (lo <= hi)
+            .then(|| b.get(slots + lo * 4..slots + hi * 4))
+            .flatten()
+        {
+            Some(bytes)
+                if bytes.len().is_multiple_of(4) && (bytes.as_ptr() as usize).is_multiple_of(4) =>
+            {
+                bytemuck::cast_slice(bytes)
+            }
             _ => &[],
         }
     }
@@ -702,7 +728,11 @@ impl Attrs {
     pub(crate) fn candidates(&self, b: &[u8], p: &Pred) -> Option<Vec<u32>> {
         let seed = self.seed(b, p)?;
         let n = self.n as u32;
-        Some(seed.into_iter().filter(|&s| s < n && self.pass(b, p, s)).collect())
+        Some(
+            seed.into_iter()
+                .filter(|&s| s < n && self.pass(b, p, s))
+                .collect(),
+        )
     }
 
     /// Smallest posting-backed superset of the slots passing `p`.
@@ -920,8 +950,17 @@ mod tests {
     #[test]
     fn damaged_table_is_corrupt_not_a_panic() {
         let (b, _) = build(&recs());
-        assert!(Attrs::parse(&b, 64, b.len() + 8, 200).is_err(), "table offset past the end");
-        assert!(Attrs::parse(&b, 64, 8, 200).is_err(), "table offset inside the fixed sections");
-        assert!(Attrs::parse(&b, 64, 72, 200).is_err(), "garbage where the table should be");
+        assert!(
+            Attrs::parse(&b, 64, b.len() + 8, 200).is_err(),
+            "table offset past the end"
+        );
+        assert!(
+            Attrs::parse(&b, 64, 8, 200).is_err(),
+            "table offset inside the fixed sections"
+        );
+        assert!(
+            Attrs::parse(&b, 64, 72, 200).is_err(),
+            "garbage where the table should be"
+        );
     }
 }

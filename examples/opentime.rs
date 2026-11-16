@@ -6,8 +6,15 @@ use std::time::Instant;
 use sanadb::{Db, Options};
 
 fn rss_mb() -> f64 {
-    let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0)
+        / 1024.0
 }
 
 fn main() {
@@ -19,8 +26,16 @@ fn main() {
     let t = Instant::now();
     let db = Db::open(path, Options::new(dim).auto_checkpoint_delta(0)).unwrap();
     let open = t.elapsed();
-    println!("open: {open:.2?}  len={}  stats={:?}  rss {before:.0} MB -> {:.0} MB", db.len(), db.index_stats(), rss_mb());
-    let q = db.get(0).map(|(v, _)| v).unwrap_or_else(|| vec![0.0; dim as usize]);
+    println!(
+        "open: {open:.2?}  len={}  stats={:?}  rss {before:.0} MB -> {:.0} MB",
+        db.len(),
+        db.index_stats(),
+        rss_mb()
+    );
+    let q = db
+        .get(0)
+        .map(|(v, _)| v)
+        .unwrap_or_else(|| vec![0.0; dim as usize]);
     let t = Instant::now();
     for _ in 0..1000 {
         db.search(&q, 10).unwrap();

@@ -215,7 +215,16 @@ fn graph_survives_reopen_upsert_delete_and_recheckpoint() {
     {
         let db = Db::open(&path, Options::new(dim as u32)).unwrap();
         let idx = db.index_path().expect("index exists after checkpoint");
-        assert!(idx.exists() && idx.file_name().unwrap().to_str().unwrap().starts_with("v.sana.idx."), "{idx:?}");
+        assert!(
+            idx.exists()
+                && idx
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("v.sana.idx."),
+            "{idx:?}"
+        );
     }
 
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
@@ -1223,7 +1232,11 @@ fn opens_and_migrates_a_level_1_log() {
     drop(db);
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..8], b"SANADB02");
-    assert!(bytes[13] >= 2, "header now at the current reader level, got {}", bytes[13]);
+    assert!(
+        bytes[13] >= 2,
+        "header now at the current reader level, got {}",
+        bytes[13]
+    );
     let db = Db::open(&path, Options::new(4)).unwrap();
     assert_eq!(db.len(), 2);
 }
@@ -1423,21 +1436,40 @@ fn metadata_lives_in_columns_after_checkpoint() {
     }
     // Types are known from the columns alone: no log entry mentions them.
     assert!(matches!(
-        db.insert(n, &vec_of(dim, n), HashMap::from([("i".to_string(), Value::from("x"))])),
+        db.insert(
+            n,
+            &vec_of(dim, n),
+            HashMap::from([("i".to_string(), Value::from("x"))])
+        ),
         Err(sanadb::Error::TypeMismatch { .. })
     ));
     // Deleting and overwriting graph records, then reading back.
     assert!(db.delete(2).unwrap());
     assert!(!db.delete(2).unwrap());
     assert!(db.get(2).is_none());
-    db.insert(3, &vec_of(dim, 3), HashMap::from([("i".to_string(), Value::from(-3i64))])).unwrap();
+    db.insert(
+        3,
+        &vec_of(dim, 3),
+        HashMap::from([("i".to_string(), Value::from(-3i64))]),
+    )
+    .unwrap();
     assert_eq!(db.get(3).unwrap().1["i"], Value::Int(-3));
     assert_eq!(db.len(), n as usize - 1);
     // Closure filters read the columns; expression filters use them directly.
     let q = vec_of(dim, 7_000_000);
-    let a: Vec<u64> = db.search_filtered(&q, 5, |m| m.get("flag").is_some()).unwrap().iter().map(|h| h.id).collect();
+    let a: Vec<u64> = db
+        .search_filtered(&q, 5, |m| m.get("flag").is_some())
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
     assert!(a.iter().all(|&i| i % 3 == 0));
-    let b: Vec<u64> = db.search_where(&q, 5, &Filter::eq("flag", true)).unwrap().iter().map(|h| h.id).collect();
+    let b: Vec<u64> = db
+        .search_where(&q, 5, &Filter::eq("flag", true))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
     assert!(b.iter().all(|&i| i % 3 == 0) && b.len() == 5);
     assert!(db.search(&q, 10).unwrap().iter().all(|h| h.id != 2));
     drop(db);
@@ -1466,11 +1498,15 @@ fn reader_in_the_same_process_follows_the_writer() {
     // A reader opens beside the writer: no lock conflict either way.
     let r = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(r.len(), 500);
-    assert!(matches!(r.insert(9, &vec_of(dim, 9), HashMap::new()), Err(sanadb::Error::ReadOnly)));
+    assert!(matches!(
+        r.insert(9, &vec_of(dim, 9), HashMap::new()),
+        Err(sanadb::Error::ReadOnly)
+    ));
     assert!(matches!(r.delete(9), Err(sanadb::Error::ReadOnly)));
     assert!(matches!(r.checkpoint(), Err(sanadb::Error::ReadOnly)));
     // Appended frames are visible on the reader's next read.
-    w.insert(500, &vec_of(dim, 500), meta(&[("k", "b")])).unwrap();
+    w.insert(500, &vec_of(dim, 500), meta(&[("k", "b")]))
+        .unwrap();
     w.delete(3).unwrap();
     assert_eq!(r.len(), 500);
     assert_eq!(r.get(500).unwrap().1["k"], "b");
@@ -1496,7 +1532,12 @@ fn reader_in_the_same_process_follows_the_writer() {
     let idx_files: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name().to_str().unwrap().starts_with("shared.sana.idx"))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("shared.sana.idx")
+        })
         .collect();
     assert_eq!(idx_files.len(), 1, "{idx_files:?}");
     assert_eq!(idx_files[0].path(), w.index_path().unwrap());
@@ -1526,16 +1567,37 @@ fn orphan_index_files_are_collected_on_open() {
     std::fs::write(dir.path().join("gc.sana.vec.tmp"), b"junk").unwrap();
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(db.get(1).unwrap().0, vec_of(dim, 1));
-    let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_str().unwrap().to_string()).collect();
-    assert!(!names.iter().any(|n| n.ends_with("deadbeef") || n == "gc.sana.idx" || n.ends_with(".vec.tmp")), "{names:?}");
-    assert!(names.contains(&db.index_path().unwrap().file_name().unwrap().to_str().unwrap().to_string()));
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.ends_with("deadbeef") || n == "gc.sana.idx" || n.ends_with(".vec.tmp")),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(
+            &db.index_path()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        )
+    );
 }
 
 /// Child half of the cross-process reader test: read until the parent's
 /// stop file appears, checking every answer for internal consistency.
 #[test]
 fn reader_child_reads_until_told_to_stop() {
-    let Ok(path) = std::env::var("SANADB_READER_CHILD") else { return };
+    let Ok(path) = std::env::var("SANADB_READER_CHILD") else {
+        return;
+    };
     let path = std::path::PathBuf::from(path);
     let stop = path.with_extension("stop");
     let dim = 8usize;
@@ -1574,12 +1636,22 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
     let dim = 8usize;
     let w = Db::open(&path, Options::new(dim as u32)).unwrap();
     for i in 0..300u64 {
-        w.insert(i, &vec_of(dim, i), HashMap::from([("i".to_string(), Value::from(i as i64))])).unwrap();
+        w.insert(
+            i,
+            &vec_of(dim, i),
+            HashMap::from([("i".to_string(), Value::from(i as i64))]),
+        )
+        .unwrap();
     }
     w.checkpoint().unwrap();
     let exe = std::env::current_exe().unwrap();
     let mut child = std::process::Command::new(&exe)
-        .args(["reader_child_reads_until_told_to_stop", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "reader_child_reads_until_told_to_stop",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("SANADB_READER_CHILD", &path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
@@ -1591,7 +1663,12 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
     let mut round = 0;
     while t.elapsed() < std::time::Duration::from_millis(1500) {
         for _ in 0..50 {
-            w.insert(next, &vec_of(dim, next), HashMap::from([("i".to_string(), Value::from(next as i64))])).unwrap();
+            w.insert(
+                next,
+                &vec_of(dim, next),
+                HashMap::from([("i".to_string(), Value::from(next as i64))]),
+            )
+            .unwrap();
             next += 1;
         }
         w.delete(round * 7 % 300).unwrap_or(false);
@@ -1604,8 +1681,14 @@ fn reader_in_another_process_survives_writes_and_checkpoints() {
     std::fs::write(path.with_extension("stop"), b"").unwrap();
     let status = child.wait().unwrap();
     assert!(status.success(), "reader child failed: {status}");
-    let rounds: u64 = std::fs::read_to_string(path.with_extension("rounds")).unwrap().parse().unwrap();
-    eprintln!("writer: {round} rounds, {} records; reader: {rounds} rounds", w.len());
+    let rounds: u64 = std::fs::read_to_string(path.with_extension("rounds"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    eprintln!(
+        "writer: {round} rounds, {} records; reader: {rounds} rounds",
+        w.len()
+    );
     assert!(rounds > 10);
 }
 
@@ -1650,7 +1733,11 @@ fn corrupted_indexes_never_panic() {
         // Mostly the header, tables and footer: the parts that steer reads.
         let hot = [(0usize, 64usize), (bytes.len() - 4096, bytes.len())];
         for _ in 0..1 + next() % 4 {
-            let (lo, hi) = if next() % 4 == 0 { (0, bytes.len()) } else { hot[(next() % 2) as usize] };
+            let (lo, hi) = if next() % 4 == 0 {
+                (0, bytes.len())
+            } else {
+                hot[(next() % 2) as usize]
+            };
             let pos = lo + (next() % (hi - lo) as u64) as usize;
             bytes[pos] ^= 1 << (next() % 8);
         }
@@ -1667,19 +1754,32 @@ fn corrupted_indexes_never_panic() {
                 }
                 let _ = db.search(&vec_of(dim, 3), 5);
                 let _ = db.search_where(&vec_of(dim, 3), 5, &Filter::eq("k", "b"));
-                let _ = db.search_where(&vec_of(dim, 3), 5, &Filter::and([Filter::gt("n", 100i64), Filter::lt("f", 400.0f64), Filter::eq("b", true)]));
+                let _ = db.search_where(
+                    &vec_of(dim, 3),
+                    5,
+                    &Filter::and([
+                        Filter::gt("n", 100i64),
+                        Filter::lt("f", 400.0f64),
+                        Filter::eq("b", true),
+                    ]),
+                );
                 let _ = db.search_filtered(&vec_of(dim, 3), 5, |m| m.contains_key("k"));
                 let _ = db.len();
                 outcomes[0] += 1;
             }
-            Err(sanadb::Error::Corrupt(_)) | Err(sanadb::Error::NeedsNewerVersion { .. }) | Err(sanadb::Error::HeaderMismatch { .. }) => outcomes[1] += 1,
+            Err(sanadb::Error::Corrupt(_))
+            | Err(sanadb::Error::NeedsNewerVersion { .. })
+            | Err(sanadb::Error::HeaderMismatch { .. }) => outcomes[1] += 1,
             Err(e) => {
                 eprintln!("iteration {iter}: unexpected error class: {e}");
                 outcomes[2] += 1;
             }
         }
     }
-    eprintln!("index fuzz outcomes: ok={} corrupt={} other={}", outcomes[0], outcomes[1], outcomes[2]);
+    eprintln!(
+        "index fuzz outcomes: ok={} corrupt={} other={}",
+        outcomes[0], outcomes[1], outcomes[2]
+    );
     assert_eq!(outcomes[2], 0);
 }
 
@@ -1690,17 +1790,26 @@ fn corrupted_indexes_never_panic() {
 /// current layout and reopen.
 #[test]
 fn opens_stores_written_by_every_published_version() {
-    let vec_of4 = |i: u64| -> Vec<f32> { (0..4u64).map(|d| ((i * 7 + d * 13) % 101) as f32 / 101.0).collect() };
+    let vec_of4 = |i: u64| -> Vec<f32> {
+        (0..4u64)
+            .map(|d| ((i * 7 + d * 13) % 101) as f32 / 101.0)
+            .collect()
+    };
     for version in ["0.1.1", "0.1.3", "0.1.4"] {
         let dir = tempfile::tempdir().unwrap();
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(format!("v{version}"));
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("v{version}"));
         for name in ["fixture.sana", "fixture.sana.idx"] {
             std::fs::copy(src.join(name), dir.path().join(name)).unwrap();
         }
         let path = dir.path().join("fixture.sana");
         let check = |db: &Db, stage: &str, len: usize| {
             assert_eq!(db.len(), len, "{version} {stage}: len");
-            assert!(db.get(5).is_none() && db.get(7).is_none(), "{version} {stage}: deletes");
+            assert!(
+                db.get(5).is_none() && db.get(7).is_none(),
+                "{version} {stage}: deletes"
+            );
             let (v, m) = db.get(1).unwrap();
             assert_eq!(v, vec_of4(1), "{version} {stage}: vector");
             assert_eq!(m["k"], "v1", "{version} {stage}: metadata");
@@ -1710,19 +1819,45 @@ fn opens_stores_written_by_every_published_version() {
             } else {
                 assert_eq!(m["i"], "1", "{version} {stage}");
             }
-            assert_eq!(db.get(6).unwrap().1["k"], "over", "{version} {stage}: overwrite");
-            assert_eq!(db.get(65).unwrap().1["k"], "tail", "{version} {stage}: log tail");
-            assert_eq!(db.search(&vec_of4(40), 1).unwrap()[0].id, 40, "{version} {stage}: search");
-            let hits = db.search_filtered(&vec_of4(40), 3, |m| m["k"] == "v2").unwrap();
-            assert!(!hits.is_empty() && hits.iter().all(|h| db.get(h.id).unwrap().1["k"] == "v2"), "{version} {stage}: filter");
+            assert_eq!(
+                db.get(6).unwrap().1["k"],
+                "over",
+                "{version} {stage}: overwrite"
+            );
+            assert_eq!(
+                db.get(65).unwrap().1["k"],
+                "tail",
+                "{version} {stage}: log tail"
+            );
+            assert_eq!(
+                db.search(&vec_of4(40), 1).unwrap()[0].id,
+                40,
+                "{version} {stage}: search"
+            );
+            let hits = db
+                .search_filtered(&vec_of4(40), 3, |m| m["k"] == "v2")
+                .unwrap();
+            assert!(
+                !hits.is_empty() && hits.iter().all(|h| db.get(h.id).unwrap().1["k"] == "v2"),
+                "{version} {stage}: filter"
+            );
         };
-        let db = Db::open(&path, Options::new(4)).unwrap_or_else(|e| panic!("{version}: open: {e}"));
+        let db =
+            Db::open(&path, Options::new(4)).unwrap_or_else(|e| panic!("{version}: open: {e}"));
         check(&db, "opened", 68);
         // Write with the current version, then move everything into the new layout.
-        db.insert(100, &vec_of4(100), HashMap::from([("k".to_string(), Value::from("new"))])).unwrap();
+        db.insert(
+            100,
+            &vec_of4(100),
+            HashMap::from([("k".to_string(), Value::from("new"))]),
+        )
+        .unwrap();
         db.checkpoint().unwrap();
         assert_eq!(db.get(100).unwrap().1["k"], "new");
-        assert!(db.index_path().unwrap().to_str().unwrap().contains(".idx."), "{version}: new-style index name");
+        assert!(
+            db.index_path().unwrap().to_str().unwrap().contains(".idx."),
+            "{version}: new-style index name"
+        );
         drop(db);
         let db = Db::open(&path, Options::new(4)).unwrap();
         check(&db, "after checkpoint and reopen", 69);
@@ -1740,17 +1875,34 @@ fn write_batch_is_all_or_nothing() {
     let dim = 4usize;
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
     for i in 0..10u64 {
-        db.insert(i, &vec_of(dim, i), meta(&[("k", "old")])).unwrap();
+        db.insert(i, &vec_of(dim, i), meta(&[("k", "old")]))
+            .unwrap();
     }
     // A bad vector anywhere leaves the store untouched.
-    let bad = Batch::new().insert(100, &vec_of(dim, 100), HashMap::new()).insert(101, &[f32::NAN; 4], HashMap::new());
-    assert!(matches!(db.write_batch(bad), Err(sanadb::Error::InvalidVector)));
+    let bad = Batch::new()
+        .insert(100, &vec_of(dim, 100), HashMap::new())
+        .insert(101, &[f32::NAN; 4], HashMap::new());
+    assert!(matches!(
+        db.write_batch(bad),
+        Err(sanadb::Error::InvalidVector)
+    ));
     assert!(db.get(100).is_none());
     // A type conflict within the batch too.
     let bad = Batch::new()
-        .insert(100, &vec_of(dim, 100), HashMap::from([("n".to_string(), Value::from(1i64))]))
-        .insert(101, &vec_of(dim, 101), HashMap::from([("n".to_string(), Value::from("1"))]));
-    assert!(matches!(db.write_batch(bad), Err(sanadb::Error::TypeMismatch { .. })));
+        .insert(
+            100,
+            &vec_of(dim, 100),
+            HashMap::from([("n".to_string(), Value::from(1i64))]),
+        )
+        .insert(
+            101,
+            &vec_of(dim, 101),
+            HashMap::from([("n".to_string(), Value::from("1"))]),
+        );
+    assert!(matches!(
+        db.write_batch(bad),
+        Err(sanadb::Error::TypeMismatch { .. })
+    ));
     assert!(db.get(100).is_none() && db.len() == 10);
     // A good batch: inserts, an overwrite and deletes, visible together.
     let r = Db::open_read_only(&path, Options::new(dim as u32)).unwrap();
@@ -1782,13 +1934,22 @@ fn write_batch_is_all_or_nothing() {
     drop(db);
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(db.len(), 11);
-    assert!(db.get(200).is_some() && db.get(100).is_none(), "the cut-off batch stays gone after more writes");
+    assert!(
+        db.get(200).is_some() && db.get(100).is_none(),
+        "the cut-off batch stays gone after more writes"
+    );
     assert_eq!(r.len(), 11);
     assert!(r.get(200).is_some() && r.get(100).is_none());
     // Batches survive checkpoint and are part of the compacted log's tail.
-    db.write_batch(Batch::new().insert(300, &vec_of(dim, 300), HashMap::new()).delete(0)).unwrap();
+    db.write_batch(
+        Batch::new()
+            .insert(300, &vec_of(dim, 300), HashMap::new())
+            .delete(0),
+    )
+    .unwrap();
     db.checkpoint().unwrap();
-    db.write_batch(Batch::new().insert(301, &vec_of(dim, 301), HashMap::new())).unwrap();
+    db.write_batch(Batch::new().insert(301, &vec_of(dim, 301), HashMap::new()))
+        .unwrap();
     drop(db);
     let db = Db::open(&path, Options::new(dim as u32)).unwrap();
     assert_eq!(db.len(), 12);
@@ -1813,12 +1974,19 @@ fn int8_storage_keeps_recall_and_shrinks_the_index() {
     let (f32db, f32_size) = build("f32.sana", Storage::F32);
     let (i8db, i8_size) = build("i8.sana", Storage::I8);
     assert_eq!(i8db.index_stats().unwrap().storage, Storage::I8);
-    assert!(i8_size < f32_size * 3 / 4, "int8 index {i8_size} vs f32 {f32_size}");
+    assert!(
+        i8_size < f32_size * 3 / 4,
+        "int8 index {i8_size} vs f32 {f32_size}"
+    );
     // get() returns the dequantised vector: close, not exact.
     let (v, m) = i8db.get(123).unwrap();
     assert_eq!(m["k"], "v");
     let truth = vec_of(dim, 123);
-    let err = v.iter().zip(&truth).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let err = v
+        .iter()
+        .zip(&truth)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
     assert!(err > 0.0 && err < 0.01, "max abs error {err}");
     // Recall against brute force, both storages.
     let recall = |db: &Db| {
@@ -1826,7 +1994,12 @@ fn int8_storage_keeps_recall_and_shrinks_the_index() {
         for qi in 0..100u64 {
             let q = vec_of(dim, 7_000_000 + qi);
             let want = brute(dim, n, &q, 10, |_| true);
-            hit += db.search(&q, 10).unwrap().iter().filter(|h| want.contains(&h.id)).count();
+            hit += db
+                .search(&q, 10)
+                .unwrap()
+                .iter()
+                .filter(|h| want.contains(&h.id))
+                .count();
         }
         hit as f64 / 1000.0
     };
@@ -1850,8 +2023,20 @@ fn int8_storage_keeps_recall_and_shrinks_the_index() {
     assert!(recall(&db) >= rf - 0.03);
     // A second checkpoint of the same data reproduces the same codes.
     let before = db.get(123).unwrap().0;
-    db.insert(n + 1000, &vec_of(dim, n + 1000), HashMap::new()).unwrap();
+    db.insert(n + 1000, &vec_of(dim, n + 1000), HashMap::new())
+        .unwrap();
     db.checkpoint().unwrap();
-    assert_eq!(db.get(123).unwrap().0, before, "requantisation must not drift");
-    assert!(!dir.path().join("i8.sana.f32.tmp").exists() && std::fs::read_dir(dir.path()).unwrap().flatten().all(|e| !e.file_name().to_str().unwrap().ends_with(".f32.tmp")));
+    assert_eq!(
+        db.get(123).unwrap().0,
+        before,
+        "requantisation must not drift"
+    );
+    assert!(
+        !dir.path().join("i8.sana.f32.tmp").exists()
+            && std::fs::read_dir(dir.path()).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".f32.tmp"))
+    );
 }

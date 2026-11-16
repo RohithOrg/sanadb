@@ -80,8 +80,7 @@ fn main() {
         println!(
             "build + attribute columns: {:.1?}, index {:.0} MB",
             t.elapsed(),
-            fs::metadata(db.index_path().unwrap()).unwrap().len() as f64
-                / 1e6
+            fs::metadata(db.index_path().unwrap()).unwrap().len() as f64 / 1e6
         );
     }
     let k = 10;

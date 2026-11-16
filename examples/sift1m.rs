@@ -45,7 +45,11 @@ fn main() {
     let n_queries: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
     let use_pq = args.get(4).is_none_or(|s| s != "pq:off");
     let prune_slack: f32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1.3);
-    let storage = if args.get(6).is_some_and(|s| s == "i8") { Storage::I8 } else { Storage::F32 };
+    let storage = if args.get(6).is_some_and(|s| s == "i8") {
+        Storage::I8
+    } else {
+        Storage::F32
+    };
 
     let (dim, base) = read_vecs::<f32, 4>(&dir.join("sift_base.fvecs"), f32::from_le_bytes);
     let n_total = base.len() / dim;

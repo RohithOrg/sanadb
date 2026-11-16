@@ -72,7 +72,10 @@ fn main() {
             let path = store_path(dir, n, pq);
             let _ = fs::remove_file(&path);
             for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-                if e.file_name().to_string_lossy().starts_with(&format!("{}.idx", path.file_name().unwrap().to_string_lossy())) {
+                if e.file_name().to_string_lossy().starts_with(&format!(
+                    "{}.idx",
+                    path.file_name().unwrap().to_string_lossy()
+                )) {
                     let _ = fs::remove_file(e.path());
                 }
             }

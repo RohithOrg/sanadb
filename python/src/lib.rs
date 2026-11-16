@@ -218,7 +218,11 @@ impl PyDb {
         let storage = match storage {
             "f32" => Storage::F32,
             "int8" | "i8" => Storage::I8,
-            other => return Err(PyValueError::new_err(format!("unknown storage {other:?}; use \"f32\" or \"int8\""))),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown storage {other:?}; use \"f32\" or \"int8\""
+                )));
+            }
         };
         let opts = Options::new(dim)
             .metric(metric)
@@ -235,7 +239,13 @@ impl PyDb {
                 ..GraphParams::default()
             });
         let db = py
-            .allow_threads(|| if read_only { sanadb_core::Db::open_read_only(path, opts) } else { sanadb_core::Db::open(path, opts) })
+            .allow_threads(|| {
+                if read_only {
+                    sanadb_core::Db::open_read_only(path, opts)
+                } else {
+                    sanadb_core::Db::open(path, opts)
+                }
+            })
             .map_err(err)?;
         Ok(PyDb {
             inner: Arc::new(db),
@@ -329,7 +339,10 @@ impl PyDb {
     /// Delete several records atomically. Ids that do not exist are ignored.
     fn delete_many(&self, py: Python<'_>, ids: Vec<u64>) -> PyResult<()> {
         let db = self.inner.clone();
-        py.allow_threads(move || db.write_batch(ids.into_iter().fold(Batch::new(), |b, id| b.delete(id)))).map_err(err)
+        py.allow_threads(move || {
+            db.write_batch(ids.into_iter().fold(Batch::new(), |b, id| b.delete(id)))
+        })
+        .map_err(err)
     }
 
     /// `(vector, meta)` or `None`.
@@ -461,7 +474,13 @@ impl PyDb {
                 d.set_item("nodes", s.nodes)?;
                 d.set_item("pq_subspaces", s.pq_subspaces)?;
                 d.set_item("tombstones", s.tombstones)?;
-            d.set_item("storage", match s.storage { Storage::F32 => "f32", Storage::I8 => "int8" })?;
+                d.set_item(
+                    "storage",
+                    match s.storage {
+                        Storage::F32 => "f32",
+                        Storage::I8 => "int8",
+                    },
+                )?;
                 Ok(Some(d))
             }
         }

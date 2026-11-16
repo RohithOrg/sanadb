@@ -39,7 +39,9 @@ mod tests {
 
     #[test]
     fn round_trip_error_is_within_half_a_step_and_stable() {
-        let v: Vec<f32> = (0..128).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.731).collect();
+        let v: Vec<f32> = (0..128)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.731)
+            .collect();
         let mut codes = vec![0u8; 128];
         let (min, scale) = quantize(&v, &mut codes);
         let mut back = vec![0f32; 128];

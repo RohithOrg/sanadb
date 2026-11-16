@@ -303,8 +303,14 @@ pub struct Batch {
 
 #[derive(Debug, Clone, PartialEq)]
 enum BatchOp {
-    Insert { id: u64, vector: Vec<f32>, meta: Metadata },
-    Delete { id: u64 },
+    Insert {
+        id: u64,
+        vector: Vec<f32>,
+        meta: Metadata,
+    },
+    Delete {
+        id: u64,
+    },
 }
 
 impl Batch {
@@ -476,7 +482,8 @@ impl Db {
             Replayed::Snapshot { id } => Some(*id),
             _ => None,
         });
-        let graph = GraphIndex::open(&index_path_for(path, snapshot), header.dim, header.metric)?.map(Arc::new);
+        let graph = GraphIndex::open(&index_path_for(path, snapshot), header.dim, header.metric)?
+            .map(Arc::new);
         let mut inner = Inner {
             wal,
             graph,
@@ -518,13 +525,22 @@ impl Db {
     fn collect_orphans(path: &Path, current: Option<u64>) {
         let keep = index_path_for(path, current);
         let Some(dir) = path.parent() else { return };
-        let Some(stem) = path.file_name().and_then(|n| n.to_str()) else { return };
+        let Some(stem) = path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
         let prefix = format!("{stem}.idx");
-        let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }) else { return };
+        let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        }) else {
+            return;
+        };
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
-            let is_index = name == prefix || (name.starts_with(&prefix) && name[prefix.len()..].starts_with('.'));
+            let is_index = name == prefix
+                || (name.starts_with(&prefix) && name[prefix.len()..].starts_with('.'));
             if is_index && e.path() != keep {
                 let _ = std::fs::remove_file(e.path());
             }
@@ -559,7 +575,9 @@ impl Db {
     /// Path of the current index file, if a checkpoint has produced one.
     pub fn index_path(&self) -> Option<PathBuf> {
         let i = self.inner.read();
-        i.graph.as_ref().map(|_| index_path_for(&self.path, i.snapshot))
+        i.graph
+            .as_ref()
+            .map(|_| index_path_for(&self.path, i.snapshot))
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, Inner>> {
@@ -742,7 +760,11 @@ impl Db {
         }
         let g = i.graph.as_ref()?;
         let slot = g.slot(id).filter(|s| !i.tombstones.contains(s))?;
-        let meta = i.meta.get(&id).map(|m| (**m).clone()).or_else(|| g.metadata(slot))?;
+        let meta = i
+            .meta
+            .get(&id)
+            .map(|m| (**m).clone())
+            .or_else(|| g.metadata(slot))?;
         Some((g.vector(slot).into_owned(), meta))
     }
 
@@ -948,7 +970,8 @@ impl Db {
                     // until a rebuild adds them.
                     && (g.pq_subspaces() > 0 || !self.opts.graph.use_pq || total < pq::MIN_N)
             });
-            let mut ids: Vec<u64> = Vec::with_capacity(if incremental { i.delta.len() } else { i.len() });
+            let mut ids: Vec<u64> =
+                Vec::with_capacity(if incremental { i.delta.len() } else { i.len() });
             let mut w = std::io::BufWriter::new(io_ctx(
                 std::fs::File::create(&vec_tmp),
                 "create snapshot",
@@ -1084,7 +1107,8 @@ impl Db {
         // the deletes.
         let names = std::iter::once(Entry::Snapshot { id: snap_id });
         let deletes = dead.iter().map(|&id| Entry::Delete { id });
-        let new_offs = wal::write_snapshot(&log_tmp, self.header, names.chain(inserts).chain(deletes))?;
+        let new_offs =
+            wal::write_snapshot(&log_tmp, self.header, names.chain(inserts).chain(deletes))?;
         // Same Windows rule for the log: close the old one before replacing
         // it. If the rename fails, reopen the old log (its contents are
         // unchanged, so the delta's offsets stay valid) and report the error.
@@ -1191,7 +1215,10 @@ impl Inner {
 
     /// Live records: graph slots not superseded, plus the delta.
     fn len(&self) -> usize {
-        self.graph.as_ref().map_or(0, |g| g.len() - self.tombstones.len()) + self.delta.len()
+        self.graph
+            .as_ref()
+            .map_or(0, |g| g.len() - self.tombstones.len())
+            + self.delta.len()
     }
 
     fn is_live(&self, id: u64) -> bool {

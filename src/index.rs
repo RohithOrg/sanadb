@@ -216,63 +216,89 @@ mod x86 {
     /// Four 8-lane accumulators, 32 floats per iteration, scalar tail.
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn l2_sq_avx2(a: &[f32], b: &[f32]) -> f32 {
-        let n = a.len().min(b.len());
-        let (pa, pb) = (a.as_ptr(), b.as_ptr());
-        let mut acc = [_mm256_setzero_ps(); 4];
-        let mut i = 0;
-        while i + 32 <= n {
-            for k in 0..4 {
-                let d = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + k * 8)), _mm256_loadu_ps(pb.add(i + k * 8)));
-                acc[k] = _mm256_fmadd_ps(d, d, acc[k]);
+        // Safety: callers checked for AVX2 and FMA; loads are bounded by `n`.
+        unsafe {
+            let n = a.len().min(b.len());
+            let (pa, pb) = (a.as_ptr(), b.as_ptr());
+            let mut acc = [_mm256_setzero_ps(); 4];
+            let mut i = 0;
+            while i + 32 <= n {
+                for k in 0..4 {
+                    let d = _mm256_sub_ps(
+                        _mm256_loadu_ps(pa.add(i + k * 8)),
+                        _mm256_loadu_ps(pb.add(i + k * 8)),
+                    );
+                    acc[k] = _mm256_fmadd_ps(d, d, acc[k]);
+                }
+                i += 32;
             }
-            i += 32;
+            while i + 8 <= n {
+                let d = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+                acc[0] = _mm256_fmadd_ps(d, d, acc[0]);
+                i += 8;
+            }
+            let mut s = hsum(_mm256_add_ps(
+                _mm256_add_ps(acc[0], acc[1]),
+                _mm256_add_ps(acc[2], acc[3]),
+            ));
+            while i < n {
+                let d = a[i] - b[i];
+                s += d * d;
+                i += 1;
+            }
+            s
         }
-        while i + 8 <= n {
-            let d = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
-            acc[0] = _mm256_fmadd_ps(d, d, acc[0]);
-            i += 8;
-        }
-        let mut s = hsum(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])));
-        while i < n {
-            let d = a[i] - b[i];
-            s += d * d;
-            i += 1;
-        }
-        s
     }
 
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
-        let n = a.len().min(b.len());
-        let (pa, pb) = (a.as_ptr(), b.as_ptr());
-        let mut acc = [_mm256_setzero_ps(); 4];
-        let mut i = 0;
-        while i + 32 <= n {
-            for k in 0..4 {
-                acc[k] = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + k * 8)), _mm256_loadu_ps(pb.add(i + k * 8)), acc[k]);
+        // Safety: callers checked for AVX2 and FMA; loads are bounded by `n`.
+        unsafe {
+            let n = a.len().min(b.len());
+            let (pa, pb) = (a.as_ptr(), b.as_ptr());
+            let mut acc = [_mm256_setzero_ps(); 4];
+            let mut i = 0;
+            while i + 32 <= n {
+                for k in 0..4 {
+                    acc[k] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(pa.add(i + k * 8)),
+                        _mm256_loadu_ps(pb.add(i + k * 8)),
+                        acc[k],
+                    );
+                }
+                i += 32;
             }
-            i += 32;
+            while i + 8 <= n {
+                acc[0] = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(pa.add(i)),
+                    _mm256_loadu_ps(pb.add(i)),
+                    acc[0],
+                );
+                i += 8;
+            }
+            let mut s = hsum(_mm256_add_ps(
+                _mm256_add_ps(acc[0], acc[1]),
+                _mm256_add_ps(acc[2], acc[3]),
+            ));
+            while i < n {
+                s += a[i] * b[i];
+                i += 1;
+            }
+            s
         }
-        while i + 8 <= n {
-            acc[0] = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc[0]);
-            i += 8;
-        }
-        let mut s = hsum(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])));
-        while i < n {
-            s += a[i] * b[i];
-            i += 1;
-        }
-        s
     }
 
     #[target_feature(enable = "avx2")]
     unsafe fn hsum(v: __m256) -> f32 {
-        let lo = _mm256_castps256_ps128(v);
-        let hi = _mm256_extractf128_ps(v, 1);
-        let s = _mm_add_ps(lo, hi);
-        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-        _mm_cvtss_f32(s)
+        // Safety: callers checked for AVX2 and FMA; loads are bounded by `n`.
+        unsafe {
+            let lo = _mm256_castps256_ps128(v);
+            let hi = _mm256_extractf128_ps(v, 1);
+            let s = _mm_add_ps(lo, hi);
+            let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+            _mm_cvtss_f32(s)
+        }
     }
 }
 
@@ -293,14 +319,19 @@ mod kernel_tests {
             x ^= x << 17;
             (x >> 40) as f32 / 16777216.0 - 0.5
         };
-        for len in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 100, 128, 129, 768, 1536] {
+        for len in [
+            0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 100, 128, 129, 768, 1536,
+        ] {
             let a: Vec<f32> = (0..len).map(|_| rnd()).collect();
             let b: Vec<f32> = (0..len).map(|_| rnd()).collect();
             let (l, ls) = (l2_sq(&a, &b), l2_sq_scalar(&a, &b));
             let (d, ds) = (dot(&a, &b), dot_scalar(&a, &b));
             let tol = 1e-4 * (1.0 + ls.abs());
             assert!((l - ls).abs() <= tol, "l2 len {len}: {l} vs {ls}");
-            assert!((d - ds).abs() <= 1e-4 * (1.0 + ds.abs()), "dot len {len}: {d} vs {ds}");
+            assert!(
+                (d - ds).abs() <= 1e-4 * (1.0 + ds.abs()),
+                "dot len {len}: {d} vs {ds}"
+            );
         }
     }
 }
