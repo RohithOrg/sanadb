@@ -48,6 +48,10 @@ class Db:
     def delta_len(self) -> int:
         """Records written since the last checkpoint (searched exactly)."""
     def __len__(self) -> int: ...
+    def neighbors(self, id: int) -> Optional[list[int]]:
+        """The out-edges of `id`'s node in the graph index, as ids; None when
+        the record has no node (in the tail since the last checkpoint,
+        deleted, or absent). For tooling that draws the graph."""
     def insert(self, id: int, vector: npt.ArrayLike, meta: Optional[Metadata] = None) -> None:
         """Insert or replace one record. A key's type is fixed by its first value."""
     def insert_many(

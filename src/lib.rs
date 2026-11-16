@@ -826,6 +826,28 @@ impl Db {
         ids
     }
 
+    /// The out-edges of `id`'s node in the graph index: the ids its node
+    /// links to, in stored order, tombstoned targets left out. `None` when
+    /// `id` is not in the index (not inserted, deleted, or written since the
+    /// last checkpoint). For tooling that draws the graph; a record
+    /// overwritten since the checkpoint keeps its node's edges until the next.
+    pub fn neighbors(&self, id: u64) -> Option<Vec<u64>> {
+        let _ = self.refresh();
+        let i = self.inner.read();
+        let g = i.graph.as_ref()?;
+        let slot = g.slot(id)?;
+        if i.tombstones.contains(&slot) {
+            return None;
+        }
+        Some(
+            g.neighbors(slot)
+                .iter()
+                .filter(|s| !i.tombstones.contains(s))
+                .map(|&s| g.id(s))
+                .collect(),
+        )
+    }
+
     /// Every metadata key written to the store with its type.
     pub fn keys(&self) -> Vec<(String, Kind)> {
         let _ = self.refresh();

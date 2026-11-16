@@ -132,6 +132,25 @@ canvas{display:block;width:100%;height:100%;cursor:crosshair}
 .hud select option{color:#0B1220}
 .hud.empty{left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;padding:12px 16px;color:var(--stage-ink);max-width:340px;line-height:1.5}
 .hud.empty[hidden]{display:none}
+.pop{position:absolute;z-index:3;width:260px;background:rgba(12,19,34,.94);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.14);border-radius:var(--r);padding:9px 11px 10px;color:var(--stage-ink);font-size:12px;box-shadow:var(--shadow);transform:translate(14px,-50%)}
+.pop[hidden]{display:none}
+.pop .pname{font-weight:600;color:#fff;font-size:13px;line-height:1.3;margin-right:18px;word-break:break-word}
+.pop .pid{font:11.5px var(--mono);color:var(--stage-muted);margin:2px 0 7px}
+.pop .pid b{color:#fff;font-weight:500}
+.pop dl{display:grid;grid-template-columns:auto 1fr;column-gap:10px;row-gap:2px;margin:0 0 8px;font-size:12px}
+.pop dt{color:var(--stage-muted);white-space:nowrap}
+.pop dd{margin:0;font:11.5px var(--mono);color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pop .edges{color:var(--stage-muted);margin-bottom:8px}
+.pop .edges b{color:var(--walk);font-weight:500}
+.pop .acts{display:flex;gap:6px}
+.pop .acts button{height:24px;padding:0 9px;font-size:12px;background:transparent;color:var(--stage-ink);border-color:rgba(255,255,255,.22)}
+.pop .acts button:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.4)}
+.pop .x{position:absolute;right:6px;top:5px;width:20px;height:20px;padding:0;border:0;background:transparent;color:var(--stage-muted);font-size:14px;line-height:1}
+.pop .x:hover{color:#fff}
+.hud.graphctl{left:12px;display:flex;gap:10px;align-items:center;color:var(--stage-muted)}
+.hud.graphctl[hidden]{display:none}
+.hud.graphctl b{color:#fff}
+.hud.graphctl button{height:22px;padding:0 8px;font-size:12px;background:transparent;color:var(--stage-ink);border-color:rgba(255,255,255,.22)}
 .tip{position:absolute;pointer-events:none;background:#fff;color:#0B1220;font:11.5px var(--mono);padding:3px 7px;border-radius:var(--r);transform:translate(12px,-50%);white-space:nowrap;display:none;box-shadow:var(--shadow)}
 
 /* right */
@@ -263,10 +282,13 @@ footer b{color:var(--ink);font:12px var(--mono);font-weight:500}
       <button id="replay" title="from the start">Replay</button>
       <select id="speed" title="animation speed; Instant draws the whole walk at once"><option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option><option value="instant">Instant</option></select>
     </div>
+    <div class="hud graphctl" id="graphctl" hidden><span>graph: <b id="gnodes">0</b> nodes · <b id="gedges">0</b> edges shown</span><button id="gclear" title="remove the expanded nodes and their edges">Clear</button></div>
+    <div class="pop" id="pop" hidden></div>
     <div class="hud empty" id="mapempty" hidden>Search from a record to see its neighbours and the path the graph walk took to reach them.</div>
     <div class="hud legend">
       <span><i style="background:#fff;box-shadow:0 0 0 2px #3B6CFF inset"></i>result</span>
       <span><i style="background:var(--walk)"></i>expanded by the walk</span>
+      <span><i style="background:transparent;border:1.5px solid rgba(255,255,255,.7);width:6px;height:6px"></i>graph neighbour</span>
       <span><i style="background:transparent;border:2px solid #fff;width:7px;height:7px"></i>query</span>
       <span>zoom · pan · click to inspect</span>
     </div>
@@ -564,6 +586,7 @@ async function search() {
     for (const tr of tb.querySelectorAll("tr")) tr.onclick = () => inspect(+tr.dataset.id);
     $("mapempty").hidden = true;
     if (j.walk.length) { $("walkctl").hidden = false; startAnim(); } else { $("walkctl").hidden = true; anim.running = false; draw(); }
+    placeGraphHud();
     loadInfo();
   } catch (e) { $("qmsg").className = "msg err"; $("qmsg").textContent = e.message; }
   $("go").disabled = false;
@@ -627,6 +650,70 @@ function idleTick(now) {
   if (now - idle.last > 2500 && !drag && !anim.running && !matchMedia("(prefers-reduced-motion: reduce)").matches) { view.yaw += dt * 0.12; draw(); }
   idle.raf = requestAnimationFrame(idleTick);
 }
+/* The graph around clicked nodes: each expanded node's out-edges in the
+   index, with the neighbours as nodes of their own that can be expanded
+   in turn. Positions come from the server's projection. */
+const graph = {nodes: new Map(), edges: [], expanded: new Set()};
+async function expand(id) {
+  if (graph.expanded.has(id)) return;
+  let r;
+  try { r = await api(`/api/neighbors?id=${id}`); } catch (e) { return; }
+  if (!r.indexed) { popNote(`record ${id} is in the tail since the last checkpoint: no graph node yet`); return; }
+  graph.expanded.add(id);
+  for (const n of r.neighbors) {
+    if (!graph.nodes.has(n.id)) graph.nodes.set(n.id, n);
+    graph.edges.push([id, n.id]);
+  }
+  if (!graph.nodes.has(id)) {
+    const p = (mapData && mapData.points.find(p => p[0] === id)) || result.hits.find(h => h.id === id) || result.walk.find(h => h.id === id);
+    if (p) graph.nodes.set(id, Array.isArray(p) ? {id, x: p[1], y: p[2], z: p[3]} : {id, x: p.x, y: p.y, z: p.z});
+  }
+  $("graphctl").hidden = false; placeGraphHud(); $("gnodes").textContent = graph.nodes.size; $("gedges").textContent = graph.edges.length;
+  draw();
+}
+function clearGraph() { graph.nodes.clear(); graph.edges = []; graph.expanded.clear(); $("graphctl").hidden = true; hidePop(); draw(); }
+$("gclear").onclick = clearGraph;
+function placeGraphHud() { $("graphctl").style.top = ($("walkctl").hidden ? 42 : 74) + "px"; }
+/* the popover: a node's name, id, metadata and what it links to, pinned
+   beside the point as the view moves */
+let pop = null;   // {id}
+function posOf(id) {
+  const g = graph.nodes.get(id); if (g && g.x !== undefined) return [g.x, g.y, g.z];
+  const p = mapData && mapData.points.find(p => p[0] === id); if (p) return [p[1], p[2], p[3]];
+  const h = result.hits.find(h => h.id === id) || result.walk.find(h => h.id === id); if (h && h.x !== undefined) return [h.x, h.y, h.z];
+  return null;
+}
+function showPop(id, meta) {
+  pop = {id};
+  const nm = meta ? nameOf(meta) : null;
+  const rows = meta ? Object.entries(meta).filter(([k]) => !nm || k !== nm.key).slice(0, 6) : [];
+  const deg = graph.edges.filter(e => e[0] === id).length;
+  $("pop").innerHTML = `<button class="x" id="popx" aria-label="close">×</button>
+    <div class="pname">${nm ? esc(short(nm.text, 80)) : `Record ${id}`}</div>
+    <div class="pid">id <b>${id}</b></div>
+    ${rows.length ? `<dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(fmtv(v))}">${esc(fmtv(v))}</dd>`).join("")}</dl>` : ""}
+    <div class="edges" id="popedges">${graph.expanded.has(id) ? `links to <b>${deg}</b> nodes in the index` : "click a point to open it; its graph edges are drawn"}</div>
+    <div class="acts"><button id="popmore">${graph.expanded.has(id) ? "Expanded" : "Show its edges"}</button><button id="popsearch">Search from here</button></div>`;
+  $("pop").hidden = false;
+  $("popx").onclick = hidePop;
+  $("popmore").onclick = () => expand(id).then(() => showPop(id, meta));
+  $("popsearch").onclick = () => { hidePop(); $("qid").value = id; $("qembed").value = ""; $("qtext").value = ""; $("qsparse").value = ""; search(); };
+  placePop();
+}
+function popNote(text) { if ($("pop").hidden) return; const e = $("popedges"); if (e) e.textContent = text; }
+function hidePop() { pop = null; $("pop").hidden = true; }
+function placePop() {
+  if (!pop) return;
+  const xyz = posOf(pop.id); if (!xyz) return;
+  const dpr = window.devicePixelRatio || 1, [sx, sy] = toScreen(xyz[0], xyz[1], xyz[2]);
+  const el = $("pop"), r = canvas.getBoundingClientRect();
+  const left = sx / dpr, top = sy / dpr;
+  // beside the point: to its right, or to its left when there is no room
+  const flip = left + 300 > r.width;
+  el.style.transform = flip ? "translate(calc(-100% - 14px), -50%)" : "translate(14px, -50%)";
+  el.style.left = left + "px"; el.style.top = Math.max(70, Math.min(top, r.height - 110)) + "px";
+}
+const fmtv = (v) => Array.isArray(v) ? `sparse[${(v[0] || []).length}]` : typeof v === "number" ? (Number.isInteger(v) ? fmt(v) : v.toFixed(3)) : String(v);
 let clusterLabels = [];
 async function loadLabels() {
   const key = $("labelkey").value;
@@ -701,6 +788,23 @@ function draw() {
       ctx.fillStyle = "rgba(11,18,32,.78)"; ctx.strokeStyle = "rgba(255,255,255,.14)"; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.roundRect(sx - wdt / 2, sy - 10 * dpr, wdt, 20 * dpr, 4 * dpr); ctx.fill(); ctx.stroke();
       ctx.fillStyle = "#fff"; ctx.fillText(text, sx, sy);
+    }
+  }
+  // the graph around expanded nodes: out-edges as thin lines, neighbours as rings
+  if (graph.edges.length) {
+    ctx.lineWidth = 1 * dpr; ctx.strokeStyle = "rgba(255,255,255,.28)";
+    for (const [a, b] of graph.edges) {
+      const pa = graph.nodes.get(a), pb = graph.nodes.get(b);
+      if (!pa || !pb || pa.x === undefined || pb.x === undefined) continue;
+      const [x0, y0] = toScreen(pa.x, pa.y, pa.z), [x1, y1] = toScreen(pb.x, pb.y, pb.z);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    }
+    for (const g of graph.nodes.values()) {
+      if (g.x === undefined) continue;
+      const [sx, sy, f] = toScreen(g.x, g.y, g.z), ex = graph.expanded.has(g.id);
+      ctx.strokeStyle = ex ? "#fff" : "rgba(255,255,255,.7)"; ctx.lineWidth = (ex ? 2 : 1.5) * dpr;
+      ctx.fillStyle = "rgba(12,19,34,.9)";
+      ctx.beginPath(); ctx.arc(sx, sy, (ex ? 5 : 3.4) * dpr * (f || 1), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     }
   }
   // walk: trail in expansion order up to the animation step, older segments dimmer
@@ -779,6 +883,7 @@ function draw() {
     const p = mapData.points.find(p => p[0] === selected) || result.hits.find(h => h.id === selected) || result.walk.find(h => h.id === selected);
     if (p) { const [x, y, z] = Array.isArray(p) ? [p[1], p[2], p[3]] : [p.x, p.y, p.z]; if (x !== undefined) { const [sx, sy] = toScreen(x, y, z); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5 * dpr; ctx.setLineDash([3 * dpr, 3 * dpr]); ctx.beginPath(); ctx.arc(sx, sy, 10 * dpr, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); } }
   }
+  placePop();
 }
 /* walk animation: `anim.t` expansions are drawn; play advances it at
    `speed` × 40 expansions per second, scrub and step set it directly. */
@@ -861,7 +966,23 @@ window.addEventListener("mousemove", e => {
   if (near) { tip.style.display = "block"; const r = canvas.getBoundingClientRect(); tip.style.left = (e.clientX - r.left) + "px"; tip.style.top = (e.clientY - r.top) + "px"; tip.textContent = `record ${near.id}` + (near.score !== undefined ? ` · score ${fscore(near.score)}` : "") + " · click to inspect"; }
   else tip.style.display = "none";
 });
-window.addEventListener("mouseup", e => { if (drag && !drag.moved) { const near = nearest(e); if (near) inspect(near.id); } drag = null; });
+window.addEventListener("mouseup", e => {
+  if (drag && !drag.moved) {
+    const near = nearest(e);
+    if (near) openNode(near.id); else if (e.target === canvas) hidePop();
+  }
+  drag = null;
+});
+/* a click on a point: the record panel, the popover, and its graph edges */
+async function openNode(id) {
+  inspect(id);
+  const g = graph.nodes.get(id);
+  let meta = g && g.meta;
+  if (!meta) { try { meta = (await api(`/api/record?id=${id}`)).meta; } catch (e) {} }
+  showPop(id, meta);
+  await expand(id);
+  showPop(id, meta);
+}
 function nearest(e) {
   if (!mapData) return null;
   const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
@@ -870,6 +991,7 @@ function nearest(e) {
   const consider = (id, x, y, z, score) => { if (x === undefined) return; const [sx, sy] = toScreen(x, y, z); const d = (sx - mx) ** 2 + (sy - my) ** 2; if (d < bd) { bd = d; best = {id, score}; } };
   for (const h of result.hits) consider(h.id, h.x, h.y, h.z, h.score);
   for (const h of result.walk) consider(h.id, h.x, h.y, h.z, h.score);
+  for (const g of graph.nodes.values()) consider(g.id, g.x, g.y, g.z);
   for (const [id, x, y, z] of mapData.points) consider(id, x, y, z);
   return best;
 }

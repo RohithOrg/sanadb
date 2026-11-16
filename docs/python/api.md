@@ -50,6 +50,12 @@ Records written since the last checkpoint (searched exactly).
 
 ### `__len__() -> int`
 
+### `neighbors(id: int) -> Optional[list[int]]`
+
+The out-edges of `id`'s node in the graph index, as ids; None when
+the record has no node (in the tail since the last checkpoint,
+deleted, or absent). For tooling that draws the graph.
+
 ### `insert(id: int, vector: npt.ArrayLike, meta: Optional[Metadata] = None) -> None`
 
 Insert or replace one record. A key's type is fixed by its first value.

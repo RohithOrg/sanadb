@@ -3354,3 +3354,34 @@ fn store_properties_survive_checkpoints_reopen_and_reach_readers() {
     let second = 16 + 8 + u32::from_le_bytes(log[16..20].try_into().unwrap()) as usize;
     assert_eq!(log[second + 8], 7, "then the property frame");
 }
+
+#[test]
+fn neighbors_follow_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n.sana");
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    for i in 0..200u64 {
+        db.insert(i, &vec_of(4, i), HashMap::new()).unwrap();
+    }
+    assert_eq!(
+        db.neighbors(3),
+        None,
+        "no graph before the first checkpoint"
+    );
+    db.checkpoint().unwrap();
+    let ids = db.ids();
+    for &id in &ids {
+        let n = db.neighbors(id).unwrap();
+        assert!(!n.is_empty() && n.len() <= 32, "{id}: {} edges", n.len());
+        assert!(n.iter().all(|t| ids.contains(t) && *t != id));
+    }
+    db.delete(7).unwrap();
+    assert_eq!(db.neighbors(7), None, "a deleted record has no node");
+    assert!(
+        db.neighbors(8).unwrap().iter().all(|&t| t != 7),
+        "tombstoned targets are left out"
+    );
+    db.insert(500, &vec_of(4, 500), HashMap::new()).unwrap();
+    assert_eq!(db.neighbors(500), None, "a tail record has no node yet");
+    assert_eq!(db.neighbors(9999), None);
+}

@@ -396,7 +396,7 @@ impl GraphIndex {
         self.storage
     }
 
-    fn neighbors(&self, slot: u32) -> &[u32] {
+    pub(crate) fn neighbors(&self, slot: u32) -> &[u32] {
         let o = self.blocks_off + slot as usize * self.block + self.storage.vector_bytes(self.dim);
         let count = u32::from_le_bytes(self.mmap[o..o + 4].try_into().unwrap()) as usize;
         bytemuck::cast_slice(&self.mmap[o + 4..o + 4 + count.min(self.r) * 4])

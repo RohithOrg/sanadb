@@ -364,6 +364,13 @@ impl PyDb {
         self.inner.delta_len()
     }
 
+    /// The out-edges of `id`'s node in the graph index, as ids; None when
+    /// the record has no node (written since the last checkpoint, deleted,
+    /// or absent). For tooling that draws the graph.
+    fn neighbors(&self, id: u64) -> Option<Vec<u64>> {
+        self.inner.neighbors(id)
+    }
+
     /// Insert or replace one record. `meta` values are stored as strings.
     #[pyo3(signature = (id, vector, meta = None))]
     fn insert(

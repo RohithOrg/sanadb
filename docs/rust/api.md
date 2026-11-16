@@ -68,6 +68,7 @@ closer) unless noted.
 | [`get(id) -> Option<(Vec<f32>, Metadata)>`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.get) | the stored vector (normalised under cosine) and metadata |
 | [`len()`, `is_empty()`, `dim()`, `delta_len()`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.len) | counts; `delta_len` is the tail since the last checkpoint |
 | [`ids() -> Vec<u64>`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.ids) | every live id |
+| [`neighbors(id) -> Option<Vec<u64>>`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.neighbors) | the out-edges of `id`'s node in the graph index; `None` when it has no node (tail, deleted, absent) |
 | [`keys() -> Vec<(String, Kind)>`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.keys) | metadata keys and their types |
 | [`stats() -> Stats`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.stats) | counters since open: searches by regime, text and sparse searches, inserts, deletes, batches, checkpoints, refreshes |
 | [`index_stats() -> Option<IndexStats>`](https://docs.rs/sanadb/latest/sanadb/struct.Db.html#method.index_stats) | `nodes`, `pq_subspaces`, `tombstones`, `storage` |

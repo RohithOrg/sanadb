@@ -326,6 +326,7 @@ fn handle(app: Arc<App>, mut req: Request) {
         (Method::Post, "/api/add") => add(&app, &body),
         (Method::Get, "/api/map") => map(&app, &query),
         (Method::Get, "/api/labels") => labels(&app, &query),
+        (Method::Get, "/api/neighbors") => neighbors(&app, &query),
         (Method::Get, "/api/files") => Ok(files(&app)),
         (Method::Post, "/api/checkpoint") => checkpoint(&app),
         _ => Err("not found".to_string()),
@@ -480,6 +481,35 @@ fn record(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
         .ok_or("id required")?;
     let (v, m) = app.db.get(id).ok_or("no such record")?;
     Ok(json!({"id": id, "vector": v, "meta": meta_json(&m)}))
+}
+
+/// The out-edges of a record's node in the graph index, each neighbour
+/// with its metadata and its position on the current map, so the page can
+/// draw the graph around a node.
+fn neighbors(app: &App, q: &HashMap<String, String>) -> Result<J, String> {
+    let id: u64 = q
+        .get("id")
+        .and_then(|s| s.parse().ok())
+        .ok_or("id required")?;
+    let Some(ids) = app.db.neighbors(id) else {
+        return Ok(json!({"id": id, "indexed": false, "neighbors": []}));
+    };
+    let st = app.map.lock().unwrap();
+    let out: Vec<J> = ids
+        .iter()
+        .filter_map(|&n| {
+            let (v, m) = app.db.get(n)?;
+            let mut o = json!({"id": n, "meta": meta_json(&m)});
+            if let Some(s) = st.as_ref() {
+                let [x, y, z] = project(s, &v);
+                o["x"] = json!(x);
+                o["y"] = json!(y);
+                o["z"] = json!(z);
+            }
+            Some(o)
+        })
+        .collect();
+    Ok(json!({"id": id, "indexed": true, "neighbors": out}))
 }
 
 fn update(app: &App, q: &HashMap<String, String>, body: &str) -> Result<J, String> {

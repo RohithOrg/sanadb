@@ -8,6 +8,13 @@ the new version migrates old stores on open.
 ## [Unreleased]
 
 ### Added
+- `Db::neighbors(id)` (Python `Db.neighbors(id)`): the out-edges of a
+  record's node in the graph index, for tooling that draws the graph.
+- studio: click a point to expand its node: its graph edges are drawn
+  to the records they reach, a popover shows the name, id and metadata
+  with "Show its edges" and "Search from here", each neighbour expands
+  in turn, a HUD counts nodes and edges with Clear. Works in 2D and 3D.
+  `/api/neighbors?id=` returns the edges with projected positions.
 - studio: a 3D map. The server computes a third principal component and
   the share of variance each axis carries; the page has a 2D / 3D switch,
   orbit by drag, zoom, shift-drag pan, a slow idle rotation that stops on

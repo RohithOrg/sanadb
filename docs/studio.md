@@ -140,6 +140,23 @@ can be far apart in the store. Use the view to see which regions exist,
 where a query landed and how a walk moved between them, not to judge
 distances; the score column is the distance.
 
+### Walk the graph by hand
+
+![a node expanded: its edges in the index and a popover with its metadata](img/studio-10-graph.png)
+
+Click any point and two things happen: the record panel on the right
+fills, and a popover opens beside the point with the record's name, id
+and metadata, and its out-edges in the graph index are drawn to the
+nodes they reach (up to 32 per node, the `max_degree` the store was
+built with). Each neighbour is a point you can click in turn, so you
+can follow the index the way the walk does, one hop at a time, in 2D or
+3D. The HUD under the walk bar counts the nodes and edges shown; Clear
+removes them. A record written since the last checkpoint has no node
+yet and the popover says so. This is the structure the search actually
+traverses, so a neighbour that lands far away on the map is a real
+long-range edge, the kind the graph keeps so a walk can cross the set
+in a few hops.
+
 ## 4. Inspect and edit a record
 
 ![results table and the record panel](img/studio-4-results-record.png)
