@@ -3,17 +3,17 @@
 A reviewer asked these questions of sanadb as a candidate for production
 use. Each gets one of three answers. **Yes**: proven, with where the
 proof lives. **Partly**: true in part, with what is missing. **No**: a
-gap. The gaps feed the [roadmap](roadmap.md). Answers are as of 0.2.7,
+gap. The gaps feed the [roadmap](roadmap.md). Answers are as of 0.2.8,
 17 November 2026; the test names are in `tests/db.rs`.
 
-Tally: 37 yes, 50 partly, 17 no.
+Tally: 49 yes, 40 partly, 15 no.
 
 ## 1. Purpose and positioning
 
-1. **Who is the primary user.** Partly. The README says what it is and the goal ("the SQLite of vector search"); the audience, people embedding search in an application, an agent or a service without running a vector server, is implied, not stated. One sentence to add.
+1. **Who is the primary user.** Yes. The README now opens with who it is for: people embedding search in an application, an agent or a service without running a vector server.
 2. **What it solves better.** Yes. A single file, crash-safe by construction, with a disk-first graph index for sets larger than RAM, filters evaluated on index columns rather than after the fact, and keyword and sparse search in the same file. README, "What it is".
-3. **Why over SQLite with sqlite-vec.** No, not written. The answer: sqlite-vec scans every vector per query, which is fine to about 100,000 rows and not beyond; sanadb's graph answers a million in 150 µs and five million from a cold disk in 3 ms, with metadata filters that stay exact. sqlite-vec wins when the data is small and already in SQLite. A comparison page is on the roadmap.
-4. **Why over LanceDB.** Partly. The README names LanceDB as the closest embedded alternative and says it is the one to pick when dependability this quarter matters. No feature or number comparison.
+3. **Why over SQLite with sqlite-vec.** Yes. [Compared with the alternatives](compare.md): sqlite-vec scans every vector per query, exact and fine to about 100,000 rows; sanadb's graph at a million is 150 µs, with filters on index columns. sqlite-vec wins when the data is small and already in SQLite.
+4. **Why over LanceDB.** Yes. [Compared with the alternatives](compare.md): index design, data model, write path, maturity, and when to pick each.
 5. **When not to use it.** Yes. README, "Should you use it" and "What sanadb does not do": no second writer, no replication, no encryption, no GPU, network filesystems, and anything that cannot afford a 0.x bug.
 6. **What "SQLite-like" means.** Partly. Embedded (a library, one file per store), reliable by design (log, atomic checkpoint, fault injection), portable (little-endian format, opens on Linux, macOS, Windows) are each documented; installation is a `pip install` or `cargo add`. The four are not spelled out together.
 7. **Understood in five minutes.** Partly. The README's quick start, feature table, numbers and guarantees are written for that; it has not been tested on someone who did not write it.
@@ -22,10 +22,10 @@ Tally: 37 yes, 50 partly, 17 no.
 
 8. **Acknowledged write readable after a process crash.** Yes. `survives_being_killed_mid_write`, `crash_child_writes_until_killed`; [operations](operations.md), Durability.
 9. **Insert, overwrite, delete identical before and after checkpoint and reopen.** Yes. `graph_survives_reopen_upsert_delete_and_recheckpoint`, `random_operations_agree_with_a_model`, `incremental_checkpoint_matches_full_rebuild`.
-10. **Same id twice in one batch.** Partly. Frames replay in order inside the batch, so the last one wins, but there is no test or doc line saying so.
+10. **Same id twice in one batch.** Yes. The last frame for an id wins, in replay order; `batch_edge_cases_and_missing_ids` covers insert-then-insert and insert-then-delete of the same id in one batch, before and after a checkpoint and a reopen.
 11. **Deleted or overwritten records reappearing after recovery.** Yes, they do not: `reopen_replays_log`, the crash tests, the model test.
 12. **Vector and metadata updated atomically.** Yes. One log frame carries both; a reader sees the frame or not.
-13. **Empty store, empty batch, missing id, k larger than the count.** Partly. Empty store: `checkpoint_of_empty_store_is_fine`, search returns nothing. Missing id: `get` returns `None`, `delete` returns false. k larger than the count: fewer results. An empty batch writes nothing. Only the first is a test; the rest are behaviour without a test or a doc line.
+13. **Empty store, empty batch, missing id, k larger than the count.** Yes. `checkpoint_of_empty_store_is_fine`, and `batch_edge_cases_and_missing_ids`: an empty batch writes nothing, `get` of a missing id is `None`, `delete` of one is false, `k` above the count returns every record and nothing more.
 14. **NaN, infinity, zero-norm, extreme values.** Partly. NaN and infinity are refused (`InvalidVector`), a zero vector under cosine too; `cosine_normalises_and_rejects_non_finite`. Very large finite values are not tested.
 15. **Quantized storage and `get()`.** Partly. `get` returns the dequantised vector under int8, stated in the Rust docs and the Python docstring; not in the operations page.
 
@@ -33,13 +33,13 @@ Tally: 37 yes, 50 partly, 17 no.
 
 16. **What a successful write guarantees by default.** Yes. Survives a process crash (in the page cache), not power loss. [Operations](operations.md), Durability.
 17. **What `sync()` adds.** Yes. fsync of the log: survives power loss from there; `sync_every_write` does it per write.
-18. **A new store's directory entry.** Partly. The checkpoint's renames fsync the directory on Unix; the first creation of the log file does not fsync the directory, so a new, never-checkpointed store can vanish on power loss before its first `sync()`. Not documented.
+18. **A new store's directory entry.** Yes. Creating a store now fsyncs the directory entry on Unix as well as the file, so a new store survives a power cut before its first checkpoint.
 19. **Crash at every checkpoint stage.** Partly. Fault injection covers index write (disk full mid-build), index fsync, log rename and log append (`injected_io_failures_leave_the_store_consistent`); a process kill is tested mid-write, not at each checkpoint stage.
 20. **Partial write.** Yes. A torn tail is trimmed on open: `torn_tail_is_truncated_not_fatal`, shown on [failure modes](failure-modes.md).
-21. **fsync failing after bytes reached disk.** Partly. The index fsync fault is injected and the store stays on the old index; a failing `sync()` on the log returns the error and the data stays in the page cache. Not written down.
-22. **Same handle after an I/O error.** Yes. The fault tests keep using the handle after a failed checkpoint, append and rename; `failed_checkpoints` counts them. The failure-modes page should say "keep the handle".
+21. **fsync failing after bytes reached disk.** Yes. A failing log fsync (`Fault::LogSync`) returns the error, the data stays, the handle keeps working and the next `sync()` succeeds: `failed_log_sync_keeps_the_data_and_the_handle`. A failing index fsync keeps the old index.
+22. **Same handle after an I/O error.** Yes. The fault tests keep using the handle after a failed checkpoint, append, rename and fsync; [failure modes](failure-modes.md) says keep the handle, reopen only after `Corrupt`.
 23. **Torn final record versus corruption mid-log.** Partly. Both stop replay at the first frame that fails its CRC; a mid-log corruption truncates everything after it, which the store cannot tell from a torn tail. Documented on the failure-modes page as "trimmed there"; the loss should be reported, see 24.
-24. **Recovery silently discarding acknowledged data.** Partly. A torn tail holds at most the write that had not returned, and a write that returned but was not synced can be lost to power loss, both documented. Mid-log corruption discards acknowledged frames after it without a message; a counter or a `tracing` event is missing.
+24. **Recovery silently discarding acknowledged data.** Yes. Nothing is dropped silently any more: `stats().log_truncated_bytes` reports the bytes of torn or damaged frames dropped at open (0 after a clean shutdown), and the `tracing` feature logs a warning; `dropped_log_bytes_are_counted`. What is dropped is still the write in flight at a crash, or everything after a mid-log corruption.
 25. **Recovery and migration safe to interrupt repeatedly.** Partly. Recovery is idempotent (it only truncates and re-reads). Migration from 0.1 layouts converts on open; stores from every version are fixtures, but interrupting a migration is not tested.
 26. **Disk full during insert, checkpoint, migration, backup.** Partly. Checkpoint and insert are covered by fault injection; migration and backup are not.
 
@@ -118,11 +118,11 @@ Tally: 37 yes, 50 partly, 17 no.
 79. **Install and run an example without troubleshooting.** Yes. Wheels for every platform, numpy the only dependency, the semantic search example with its output; verified in a fresh environment at each release.
 80. **Safe defaults, docs matching code.** Partly. The outputs in the docs are regenerated by script and the Python API page is generated from the stubs; but this review found the Python auto-checkpoint defaults at 0 since 0.2.4 against Rust's 250,000 and 100,000, fixed on master and released next.
 81. **Trade-offs visible in the API.** Yes. `sync()`, `checkpoint()`, `search_beam`, `storage`, `exact_filter_scan`.
-82. **Actionable errors, retry versus reopen.** Partly. The failure-modes page has the table; "keep the handle after an I/O error, reopen only after `Corrupt`" is not stated in those words.
-83. **Explicit resource cleanup in Python.** No. No `close()` or context manager; the lock is released when the object is collected. Roadmap.
+82. **Actionable errors, retry versus reopen.** Yes. [Failure modes](failure-modes.md) now says it: keep the handle after an I/O error, reopen only after `Corrupt`, and read `log_truncated_bytes` after a crash.
+83. **Explicit resource cleanup in Python.** Yes. `Db.close()`, a `closed` property and `with sanadb.Db(...) as db:`; later calls raise `ValueError`; `test_close_releases_the_lock_and_the_context_manager`.
 84. **Large imports and queries bounded in memory.** Partly. `insert_many` materialises its arrays; `search_many` is bounded by `n × k`. Streaming import is not documented.
 85. **Inspecting health without reading Rust.** Yes. `stats()`, `index_stats()`, `properties()`, studio, `tracing` events.
-86. **Exporting data.** Partly. `ids()` and `get()` reach every record; no export command.
+86. **Exporting data.** Yes. Studio's Files tab has an export of every record as JSON lines (`/api/export`, streamed, a million records in one request), and the Python recipes show the same loop in five lines.
 
 ## 11. Compatibility and portability
 
@@ -132,13 +132,13 @@ Tally: 37 yes, 50 partly, 17 no.
 90. **Moving stores between operating systems.** Partly. The format is fixed-endian with no paths inside, so it should; not tested as such.
 91. **Endianness, alignment, integer widths, maximum sizes.** Yes. [FORMAT.md](FORMAT.md): little-endian throughout, u32 record count, 65,535-byte metadata limits.
 92. **Wheels across platforms and Python versions.** Partly. abi3 wheels for Python 3.9 and later on seven targets; the test suite runs on 3.12 only.
-93. **Optional features and bindings in CI.** Partly. Python runs in CI; the `embed-http` and `tracing` features are not built there.
+93. **Optional features and bindings in CI.** Yes. CI and the Docker script build and test with `--all-features` (`embed-http`, `tracing`); Python runs in both.
 94. **Fixtures covering every format.** Yes.
 
 ## 12. Testing and long-term trust
 
 95. **Randomised tests against a reference model.** Yes. `random_operations_agree_with_a_model`.
-96. **Failures at individual I/O boundaries, partial writes, post-commit.** Partly. Four injected points plus the torn tail; nothing after a `Commit` that then fails to fsync.
+96. **Failures at individual I/O boundaries, partial writes, post-commit.** Partly. Five injected points (index write, index fsync, log append, log rename, log fsync) plus the torn tail; a failure between a `Commit` frame and its fsync is the log fsync case, now covered.
 97. **Crash tests verifying the exact acknowledged set.** Partly. The child reports its progress and the parent checks every acknowledged id is present; it does not check that nothing unacknowledged appears.
 98. **Fuzzing parsers for crashes, allocation, hangs.** Partly. 400 random bit-flips over an index and a log per run, asserting no panic; no coverage-guided fuzzer, no allocation or time bound.
 99. **Long mixed workloads run routinely.** Partly. `scripts/soak.sh` exists and a short version runs in the suite; hours-long runs are manual.

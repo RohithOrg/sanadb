@@ -3,7 +3,7 @@
 What goes wrong, what the library says, and what to do. Everything on
 this page was produced by running
 [`python/examples/failure_modes.py`](https://github.com/RohithOrg/sanadb/blob/master/python/examples/failure_modes.py)
-against a throwaway store on 16 November 2026 with sanadb 0.2.7; the
+against a throwaway store on 16 November 2026 with sanadb 0.2.8; the
 Rust errors are the same cases under their `Error` variant names. The
 guarantees these cases rest on are in [operating a store](operations.md).
 
@@ -67,6 +67,22 @@ requires open, search and get to return a result or an error, never
 panic. A damaged index is recovered from a `backup`, or, when the log
 still holds every record (it does until the first checkpoint after the
 damage), by deleting the index file and checkpointing again from the log.
+
+## After an error: keep the handle or reopen?
+
+Keep the handle after an I/O error. A failed checkpoint leaves the
+previous index in place and counts in `stats().failed_checkpoints`; a
+failed append writes nothing; a failed `sync()` reports the error and the
+data stays in the page cache, so the next `sync()` can succeed. All three
+are exercised with fault injection on a live handle that keeps serving.
+Reopen only after `Corrupt`, which means the index file failed a check
+and the store needs a restore or a fresh checkpoint from the log.
+
+After a crash, `stats().log_truncated_bytes` on the reopened handle says
+how many bytes of torn or damaged frames were dropped: 0 after a clean
+shutdown, the size of one write after a crash mid-append, and more than
+one frame when the damage was in the middle of the log, in which case
+everything after it is gone and the `tracing` feature logs a warning.
 
 ## Wrong dimension, type or value
 

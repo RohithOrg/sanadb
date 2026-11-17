@@ -211,10 +211,23 @@ fn to_filter(d: &Bound<'_, PyDict>) -> PyResult<Expr> {
 
 #[pyclass(name = "Db", module = "sanadb")]
 struct PyDb {
-    inner: Arc<sanadb_core::Db>,
+    /// `None` once `close()` ran: the lock and files are released as soon as
+    /// the last in-flight call on another thread finishes.
+    inner: std::sync::Mutex<Option<Arc<sanadb_core::Db>>>,
     /// A callable `list[str] -> array-like (n, dim)`, when the user gave one.
     embed: Option<PyObject>,
     text_key: String,
+}
+
+impl PyDb {
+    /// The store, or a ValueError after `close()`.
+    fn db(&self) -> PyResult<Arc<sanadb_core::Db>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("store is closed"))
+    }
 }
 
 /// Call the embedding function on `texts` and return one f32 vector each.
@@ -345,32 +358,53 @@ impl PyDb {
             })
             .map_err(err)?;
         Ok(PyDb {
-            inner: Arc::new(db),
+            inner: std::sync::Mutex::new(Some(Arc::new(db))),
             embed: embedding_function,
             text_key,
         })
     }
 
-    #[getter]
-    fn dim(&self) -> u32 {
-        self.inner.dim()
+    /// Release the store: the writer lock and the files, once any call in
+    /// flight on another thread returns. Every later call raises ValueError.
+    /// Closing twice is fine. `with sanadb.Db(...) as db:` closes on exit.
+    fn close(&self) {
+        *self.inner.lock().unwrap() = None;
     }
 
-    fn __len__(&self) -> usize {
-        self.inner.len()
+    #[getter]
+    fn closed(&self) -> bool {
+        self.inner.lock().unwrap().is_none()
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, _args: &Bound<'_, pyo3::types::PyTuple>) {
+        self.close();
+    }
+
+    #[getter]
+    fn dim(&self) -> PyResult<u32> {
+        Ok(self.db()?.dim())
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.db()?.len())
     }
 
     /// Records held in the in-RAM delta (written since the last checkpoint).
     #[getter]
-    fn delta_len(&self) -> usize {
-        self.inner.delta_len()
+    fn delta_len(&self) -> PyResult<usize> {
+        Ok(self.db()?.delta_len())
     }
 
     /// The out-edges of `id`'s node in the graph index, as ids; None when
     /// the record has no node (written since the last checkpoint, deleted,
     /// or absent). For tooling that draws the graph.
-    fn neighbors(&self, id: u64) -> Option<Vec<u64>> {
-        self.inner.neighbors(id)
+    fn neighbors(&self, id: u64) -> PyResult<Option<Vec<u64>>> {
+        Ok(self.db()?.neighbors(id))
     }
 
     /// Insert or replace one record. `meta` values are stored as strings.
@@ -384,7 +418,7 @@ impl PyDb {
     ) -> PyResult<()> {
         let v = to_vec(vector)?;
         let m = to_meta(meta)?;
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.insert(id, &v, m)).map_err(err)
     }
 
@@ -424,7 +458,7 @@ impl PyDb {
         };
         let dim = shape[1];
         let flat: Vec<f32> = vectors.as_array().iter().copied().collect();
-        let db = self.inner.clone();
+        let db = self.db()?;
         // One atomic batch: all rows land or none does, and a reader never
         // sees part of them.
         py.allow_threads(move || {
@@ -440,31 +474,31 @@ impl PyDb {
     /// Set a store-level property (a string kept with the file, such as the
     /// embedding model's name). An empty value removes it.
     fn set_property(&self, py: Python<'_>, key: String, value: String) -> PyResult<()> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.set_property(key, value))
             .map_err(err)
     }
 
-    fn property(&self, key: String) -> Option<String> {
-        self.inner.property(&key)
+    fn property(&self, key: String) -> PyResult<Option<String>> {
+        Ok(self.db()?.property(&key))
     }
 
     fn properties<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
-        for (k, v) in self.inner.properties() {
+        for (k, v) in self.db()?.properties() {
             d.set_item(k, v)?;
         }
         Ok(d)
     }
 
     fn delete(&self, py: Python<'_>, id: u64) -> PyResult<bool> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.delete(id)).map_err(err)
     }
 
     /// Delete several records atomically. Ids that do not exist are ignored.
     fn delete_many(&self, py: Python<'_>, ids: Vec<u64>) -> PyResult<()> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || {
             db.write_batch(ids.into_iter().fold(Batch::new(), |b, id| b.delete(id)))
         })
@@ -473,7 +507,7 @@ impl PyDb {
 
     /// `(vector, meta)` or `None`.
     fn get<'py>(&self, py: Python<'py>, id: u64) -> PyResult<Option<Bound<'py, PyTuple>>> {
-        match self.inner.get(id) {
+        match self.db()?.get(id) {
             None => Ok(None),
             Some((v, m)) => {
                 let arr = PyArray1::from_vec(py, v);
@@ -517,7 +551,7 @@ impl PyDb {
                 return Err(PyValueError::new_err("pass text or sparse, not both"));
             }
             let sp = sparse.map(to_sparse).transpose()?;
-            let db = self.inner.clone();
+            let db = self.db()?;
             let hits = py
                 .allow_threads(move || match (text, sp) {
                     (Some(text), _) => db.search_hybrid(&q, &text, k, f.as_ref()),
@@ -535,7 +569,7 @@ impl PyDb {
             Some(f) if f.is_callable() => Some(Filter::Callable(f.clone().unbind())),
             Some(_) => return Err(PyValueError::new_err("filter must be a dict or a callable")),
         };
-        let db = self.inner.clone();
+        let db = self.db()?;
         let hits = match filter {
             None => py.allow_threads(move || db.search(&q, k)).map_err(err)?,
             Some(Filter::Expr(f)) => py
@@ -579,7 +613,7 @@ impl PyDb {
         let n = queries.shape()[0];
         let flat: Vec<f32> = queries.as_slice()?.to_vec();
         let f = filter.map(to_filter).transpose()?;
-        let db = self.inner.clone();
+        let db = self.db()?;
         let hits = py
             .allow_threads(move || match f {
                 None => db.search_many(&flat, k),
@@ -610,7 +644,7 @@ impl PyDb {
         filter: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<(u64, f32)>> {
         let f = filter.map(to_filter).transpose()?;
-        let db = self.inner.clone();
+        let db = self.db()?;
         let hits = py
             .allow_threads(move || db.search_text(&text, k, f.as_ref()))
             .map_err(err)?;
@@ -642,7 +676,7 @@ impl PyDb {
             }
             Some(i) => i,
             None => {
-                let next = self.inner.ids().last().map_or(0, |m| m + 1);
+                let next = self.db()?.ids().last().map_or(0, |m| m + 1);
                 (next..next + documents.len() as u64).collect()
             }
         };
@@ -670,7 +704,7 @@ impl PyDb {
             m.entry(self.text_key.clone())
                 .or_insert_with(|| Value::Str(d.clone()));
         }
-        let db = self.inner.clone();
+        let db = self.db()?;
         let out = ids.clone();
         py.allow_threads(move || {
             let mut b = Batch::new();
@@ -697,7 +731,7 @@ impl PyDb {
         })?;
         let flt = filter.map(to_filter).transpose()?;
         let vectors = call_embed(py, f, &texts)?;
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || {
             vectors
                 .iter()
@@ -723,7 +757,7 @@ impl PyDb {
     ) -> PyResult<Vec<(u64, f32)>> {
         let q = to_sparse(query)?;
         let f = filter.map(to_filter).transpose()?;
-        let db = self.inner.clone();
+        let db = self.db()?;
         let hits = py
             .allow_threads(move || db.search_sparse(&q, k, f.as_ref()))
             .map_err(err)?;
@@ -731,7 +765,7 @@ impl PyDb {
     }
 
     fn backup(&self, py: Python<'_>, dir: String) -> PyResult<String> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.backup(dir))
             .map_err(err)
             .map(|p| p.to_string_lossy().into_owned())
@@ -740,26 +774,26 @@ impl PyDb {
     /// Read-only stores: bring the view up to date with the writer now. Every
     /// read does this anyway; call it to pick up writes without reading.
     fn refresh(&self, py: Python<'_>) -> PyResult<()> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.refresh()).map_err(err)
     }
 
     /// fsync the log so acknowledged writes survive power loss.
     fn sync(&self, py: Python<'_>) -> PyResult<()> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.sync()).map_err(err)
     }
 
     /// Rebuild the graph index over all live records and compact the log.
     /// Reads and writes from other threads continue while it runs.
     fn checkpoint(&self, py: Python<'_>) -> PyResult<()> {
-        let db = self.inner.clone();
+        let db = self.db()?;
         py.allow_threads(move || db.checkpoint()).map_err(err)
     }
 
     /// `{"nodes", "pq_subspaces", "tombstones"}` or `None` before the first checkpoint.
     fn index_stats<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        match self.inner.index_stats() {
+        match self.db()?.index_stats() {
             None => Ok(None),
             Some(s) => {
                 let d = PyDict::new(py);
@@ -780,7 +814,7 @@ impl PyDb {
 
     /// Operation counters since open, as a dict (see `sanadb::Stats`).
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let s = self.inner.stats();
+        let s = self.db()?.stats();
         let d = PyDict::new(py);
         for (k, v) in [
             ("searches", s.searches),
@@ -799,6 +833,7 @@ impl PyDb {
             ("last_checkpoint_ms", s.last_checkpoint_ms),
             ("refresh_appended", s.refresh_appended),
             ("refresh_reloaded", s.refresh_reloaded),
+            ("log_truncated_bytes", s.log_truncated_bytes),
         ] {
             d.set_item(k, v)?;
         }
@@ -806,12 +841,15 @@ impl PyDb {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "sanadb.Db(dim={}, len={}, delta={})",
-            self.inner.dim(),
-            self.inner.len(),
-            self.inner.delta_len()
-        )
+        match self.db() {
+            Ok(db) => format!(
+                "sanadb.Db(dim={}, len={}, delta={})",
+                db.dim(),
+                db.len(),
+                db.delta_len()
+            ),
+            Err(_) => "sanadb.Db(closed)".to_string(),
+        }
     }
 }
 

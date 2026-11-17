@@ -1,6 +1,8 @@
 # sanadb
 
-An embedded vector store in Rust, with Python bindings: a write-ahead log,
+For people who embed search in an application, an agent or a service and
+do not want to run a vector server: an embedded vector store in Rust,
+with Python bindings. A write-ahead log,
 a memory-mapped graph index that keeps working when the data is larger
 than RAM, typed metadata with filter-aware search, keyword and sparse
 search beside the vectors. One dependency, a few files, no server.
@@ -163,6 +165,7 @@ The detail behind each of these is in [docs/operations.md](docs/operations.md).
   filters, concurrency, keyword and sparse search.
 - [Operating a store](docs/operations.md): durability, processes, backup,
   compatibility, observability, knobs.
+- [Compared with the alternatives](docs/compare.md): sqlite-vec, LanceDB, Chroma, faiss and the servers.
 - [Failure modes](docs/failure-modes.md): the lock, a torn log, a newer file, a damaged index, with the library's output for each.
 - [Benchmarks](docs/benchmarks.md): every table with method and caveats.
 - [File format](docs/FORMAT.md): the byte layout, frozen for 0.x.

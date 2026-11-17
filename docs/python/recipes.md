@@ -99,6 +99,29 @@ copying the directory back and opening it; the backup is itself a
 complete store that opens read-only or as a new writer. Replication is
 the same operation shipped over the network.
 
+## Export everything
+
+The store is not a lock-in: every record is reachable, and studio's
+Files tab has an "Export every record as JSON lines" link that streams
+the same thing. In Python:
+
+```python
+import json
+with open("kb.jsonl", "w") as out:
+    for id_ in db.ids():
+        vec, meta = db.get(id_)
+        out.write(json.dumps({"id": id_, "vector": vec.tolist(), "meta": meta}) + "\n")
+```
+
+`get` returns the dequantised vector under `storage="int8"`.
+
+## Closing a store
+
+`db.close()` releases the writer lock and the files; later calls raise
+`ValueError`. `with sanadb.Db(...) as db:` closes on exit. A store that
+is simply garbage-collected is released too; `close()` is for when the
+next opener must not wait on the collector.
+
 ## Durability settings
 
 A write that returned survives a process crash. For power loss too,

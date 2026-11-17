@@ -12,7 +12,7 @@ leaves the machine.
 ```bash
 pip install "sanadb[studio]"       # the binary as a console script; or cargo install sanadb-studio,
 sanadb-studio data/vectors.sana    # or a prebuilt binary from the GitHub release
-# sanadb studio 0.2.7: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
+# sanadb studio 0.2.8: data/vectors.sana (1000000 records, dim 128, L2) at http://127.0.0.1:7070/
 ```
 
 ```

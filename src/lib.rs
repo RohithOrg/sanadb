@@ -365,6 +365,11 @@ pub struct Stats {
     pub refresh_appended: u64,
     /// Read-only refreshes that reloaded after the writer's checkpoint.
     pub refresh_reloaded: u64,
+    /// Bytes of torn or damaged log frames dropped when this handle opened
+    /// the store: 0 after a clean shutdown; the size of the write that was in
+    /// flight after a crash; more than one frame means damage in the middle
+    /// of the log, and everything after it is gone.
+    pub log_truncated_bytes: u64,
 }
 
 #[derive(Default)]
@@ -385,6 +390,7 @@ struct Counters {
     last_checkpoint_ms: AtomicU64,
     refresh_appended: AtomicU64,
     refresh_reloaded: AtomicU64,
+    log_truncated_bytes: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -411,6 +417,7 @@ impl Counters {
             last_checkpoint_ms: g(&self.last_checkpoint_ms),
             refresh_appended: g(&self.refresh_appended),
             refresh_reloaded: g(&self.refresh_reloaded),
+            log_truncated_bytes: g(&self.log_truncated_bytes),
         }
     }
 }
@@ -563,6 +570,15 @@ impl Db {
         // a new index and swapping the log, or by a checkpoint whose delete
         // of the old index failed because a reader still mapped it.
         Self::collect_orphans(&path, inner.snapshot);
+        let counters = Counters::default();
+        let truncated = wal::TRUNCATED.with(|t| t.replace(0));
+        if truncated > 0 {
+            counters
+                .log_truncated_bytes
+                .store(truncated, Ordering::Relaxed);
+            event!(warn, path = %path.display(), bytes = truncated,
+                "dropped a torn or damaged log tail on open");
+        }
         Ok(Db {
             path,
             header,
@@ -571,7 +587,7 @@ impl Db {
             checkpoint_lock: Mutex::new(()),
             _file_lock: Some(file_lock),
             read_only: false,
-            counters: Counters::default(),
+            counters,
         })
     }
 
@@ -1463,6 +1479,7 @@ impl Db {
 
     /// fsync the log so acknowledged writes survive power loss.
     pub fn sync(&self) -> Result<()> {
+        fault::log_sync(&self.path)?;
         self.write()?.wal.sync()
     }
 

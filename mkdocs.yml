@@ -38,6 +38,7 @@ nav:
   - Failure modes: failure-modes.md
   - Benchmarks: benchmarks.md
   - File format: FORMAT.md
+  - Compared with the alternatives: compare.md
   - Status, limits and roadmap: roadmap.md
   - 104 questions, answered: questions.md
   - Design notes:

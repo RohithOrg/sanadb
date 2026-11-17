@@ -52,6 +52,18 @@ Records written since the last checkpoint (searched exactly).
 
 ### `__len__() -> int`
 
+### `close() -> None`
+
+Release the store: the writer lock and the files, once any call in
+flight on another thread returns. Later calls raise ValueError.
+Closing twice is fine; `with sanadb.Db(...) as db:` closes on exit.
+
+### `closed` (property)
+
+### `__enter__() -> 'Db'`
+
+### `__exit__() -> None`
+
 ### `neighbors(id: int) -> Optional[list[int]]`
 
 The out-edges of `id`'s node in the graph index, as ids; None when

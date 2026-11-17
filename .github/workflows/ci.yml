@@ -28,9 +28,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --all-features
       - name: Build example
         run: cargo build --release --example sift1m
 

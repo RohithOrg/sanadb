@@ -262,16 +262,35 @@ impl Wal {
         } else {
             write_header(&mut file, wanted)?;
             file.sync_all()?;
+            // The new file's directory entry too, so a store created and
+            // written before any checkpoint survives a power cut.
+            #[cfg(unix)]
+            if let Some(dir) = path.parent() {
+                let dir = if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                };
+                File::open(dir).and_then(|d| d.sync_all())?;
+            }
             (Vec::new(), HEADER_LEN)
         };
-        // Drop any torn tail or growth slack; it is re-added on the next append.
-        if len != file.metadata()?.len() {
+        // Drop any torn tail or growth slack; it is re-added on the next
+        // append. Slack is zeros; anything else past the last good frame is
+        // a torn or damaged frame, which the caller reports.
+        let file_len = file.metadata()?.len();
+        let mut truncated = 0u64;
+        if len != file_len {
+            if exists {
+                truncated = damaged_bytes(&mut file, len, file_len)?;
+            }
             file.set_len(len)?;
         }
         // Safety: this process holds the store's exclusive lock, and the only
         // writer appends past `len`; bytes below `len` never change.
         let map = unsafe { Mmap::map(&file)? };
         file.seek(SeekFrom::Start(len))?;
+        TRUNCATED.with(|t| t.set(truncated));
         Ok((
             Wal {
                 writer: Some(BufWriter::new(file)),
@@ -535,6 +554,23 @@ fn dangling_batch(entries: &[Replayed]) -> Option<u64> {
         }
     }
     open
+}
+
+thread_local! {
+    /// Bytes of torn or damaged frames the last `Wal::open` on this thread
+    /// dropped, for the store's counters and a `tracing` event.
+    pub(crate) static TRUNCATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many bytes in `[from, to)` are not growth slack (zeros): the size of
+/// the torn or damaged tail being dropped.
+fn damaged_bytes(file: &mut File, from: u64, to: u64) -> Result<u64> {
+    use std::io::Read;
+    file.seek(SeekFrom::Start(from))?;
+    let mut rest = Vec::with_capacity((to - from).min(1 << 20) as usize);
+    file.take(to - from).read_to_end(&mut rest)?;
+    let last_nonzero = rest.iter().rposition(|&b| b != 0);
+    Ok(last_nonzero.map_or(0, |i| i as u64 + 1))
 }
 
 /// Parse the frames in `bytes` starting at `from`, stopping at the first

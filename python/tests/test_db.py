@@ -313,3 +313,24 @@ def test_auto_checkpoint_defaults_match_rust(tmp_path):
     off.insert_many(list(range(250_000)), vectors)
     assert off.stats()["checkpoints"] == 0
     assert off.delta_len == 250_000
+
+
+def test_close_releases_the_lock_and_the_context_manager(tmp_path):
+    path = str(tmp_path / "close.sana")
+    db = sanadb.Db(path, dim=2)
+    db.insert(1, np.ones(2, dtype="f4"))
+    assert not db.closed
+    db.close()
+    assert db.closed
+    db.close()  # twice is fine
+    with pytest.raises(ValueError):
+        db.insert(2, np.ones(2, dtype="f4"))
+    with pytest.raises(ValueError):
+        len(db)
+    assert repr(db) == "sanadb.Db(closed)"
+    # The lock is released: a second writer opens at once, and the data is there.
+    with sanadb.Db(path, dim=2) as again:
+        assert len(again) == 1
+        assert not again.closed
+    assert again.closed
+    sanadb.Db(path, dim=2)  # released again by the context manager

@@ -19,6 +19,8 @@ pub enum Fault {
     LogAppend,
     /// The rename that replaces the log at the end of a checkpoint fails.
     LogRename,
+    /// The log's fsync (`Db::sync`) fails.
+    LogSync,
 }
 
 /// The armed fault and the store it applies to: every file of a store
@@ -70,6 +72,14 @@ fn injected(what: &str) -> std::io::Error {
 pub(crate) fn log_append(log: &Path) -> std::io::Result<()> {
     match take_if(log, |f| f == Fault::LogAppend) {
         Some(_) => Err(injected("log append")),
+        None => Ok(()),
+    }
+}
+
+/// Fail if the armed fault is `LogSync`.
+pub(crate) fn log_sync(log: &Path) -> std::io::Result<()> {
+    match take_if(log, |f| f == Fault::LogSync) {
+        Some(_) => Err(injected("log fsync")),
         None => Ok(()),
     }
 }

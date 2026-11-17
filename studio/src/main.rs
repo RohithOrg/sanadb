@@ -328,6 +328,52 @@ fn handle(app: Arc<App>, mut req: Request) {
         (Method::Get, "/api/labels") => labels(&app, &query),
         (Method::Get, "/api/neighbors") => neighbors(&app, &query),
         (Method::Get, "/api/files") => Ok(files(&app)),
+        (Method::Get, "/api/export") => {
+            // Every live record as JSON lines: id, vector, metadata. Streamed
+            // so a million records do not sit in RAM first.
+            let ids = app.db.ids();
+            let app2 = app.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+            std::thread::spawn(move || {
+                for chunk in ids.chunks(1000) {
+                    let mut buf = Vec::with_capacity(1 << 16);
+                    for &id in chunk {
+                        if let Some((v, m)) = app2.db.get(id) {
+                            let line = json!({"id": id, "vector": v, "meta": meta_json(&m)});
+                            buf.extend_from_slice(line.to_string().as_bytes());
+                            buf.push(b'\n');
+                        }
+                    }
+                    if tx.send(buf).is_err() {
+                        return;
+                    }
+                }
+            });
+            let name = std::path::Path::new(&app.path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "store".into());
+            let r = Response::new(
+                tiny_http::StatusCode(200),
+                vec![
+                    Header::from_bytes("Content-Type", "application/x-ndjson").unwrap(),
+                    Header::from_bytes(
+                        "Content-Disposition",
+                        format!("attachment; filename=\"{name}.jsonl\""),
+                    )
+                    .unwrap(),
+                ],
+                ChannelReader {
+                    rx,
+                    cur: Vec::new(),
+                    pos: 0,
+                },
+                None,
+                None,
+            );
+            let _ = req.respond(r);
+            return;
+        }
         (Method::Post, "/api/checkpoint") => checkpoint(&app),
         _ => Err("not found".to_string()),
     };
@@ -1124,4 +1170,29 @@ fn checkpoint(app: &App) -> Result<J, String> {
     app.db.checkpoint().map_err(|e| e.to_string())?;
     *app.map.lock().unwrap() = None;
     Ok(json!({"ms": t.elapsed().as_millis() as u64}))
+}
+
+/// A `Read` over chunks arriving on a channel, for streaming responses.
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    cur: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.cur.len() {
+            match self.rx.recv() {
+                Ok(next) => {
+                    self.cur = next;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = (self.cur.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }

@@ -7,6 +7,34 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-11-17
+
+The fixes and additions that fell out of answering the reviewer's 104
+questions (`docs/questions.md`).
+
+### Added
+- Python: `Db.close()`, `Db.closed` and the context manager
+  (`with sanadb.Db(...) as db:`); later calls raise `ValueError`.
+- `Stats::log_truncated_bytes` (Python `stats()["log_truncated_bytes"]`):
+  bytes of torn or damaged log frames dropped when the handle opened the
+  store, with a `tracing` warning; nothing is dropped silently any more.
+- Studio: export every record as JSON lines from the Files tab
+  (`GET /api/export`, streamed).
+- Tests: the same id twice in a batch, an empty batch, missing ids, `k`
+  above the count, a failing log fsync (`Fault::LogSync`), the dropped
+  bytes counter.
+- `docs/compare.md`: sanadb next to sqlite-vec, LanceDB, Chroma, the
+  in-RAM indexes and the servers.
+
+### Fixed
+- Creating a store fsyncs its directory entry on Unix, so a new store
+  survives a power cut before its first checkpoint.
+
+### Changed
+- CI and `scripts/ci-local.sh` build and test with every feature.
+- Failure modes: keep the handle after an I/O error, reopen only after
+  `Corrupt`; README says who the project is for.
+
 ## [0.2.7] - 2026-11-17
 
 ### Fixed

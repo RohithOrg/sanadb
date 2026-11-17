@@ -18,8 +18,8 @@ run() {
     rust:1-slim bash -c '
       set -e
       rustup component add clippy >/dev/null 2>&1 || true
-      cargo clippy --release --all-targets -- -D warnings
-      cargo test --release
+      cargo clippy --release --all-targets --all-features -- -D warnings
+      cargo test --release --all-features
       cargo build --release --examples
       # Python bindings: wheel from source, then the test suite.
       apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv > /dev/null

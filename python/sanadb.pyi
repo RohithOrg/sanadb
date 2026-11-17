@@ -50,6 +50,14 @@ class Db:
     def delta_len(self) -> int:
         """Records written since the last checkpoint (searched exactly)."""
     def __len__(self) -> int: ...
+    def close(self) -> None:
+        """Release the store: the writer lock and the files, once any call in
+        flight on another thread returns. Later calls raise ValueError.
+        Closing twice is fine; `with sanadb.Db(...) as db:` closes on exit."""
+    @property
+    def closed(self) -> bool: ...
+    def __enter__(self) -> "Db": ...
+    def __exit__(self, *args: Any) -> None: ...
     def neighbors(self, id: int) -> Optional[list[int]]:
         """The out-edges of `id`'s node in the graph index, as ids; None when
         the record has no node (in the tail since the last checkpoint,

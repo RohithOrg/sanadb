@@ -69,14 +69,12 @@ feed this list.
    budget at build (ACORN-style) or a smaller result heap for filtered
    walks; a scan-or-walk threshold that accounts for the vector width;
    measure on the YFCC filter track at 10M.
-4. **Comparisons people ask for.** A page against SQLite with sqlite-vec
-   and against LanceDB; the VectorDBBench client in
+4. **Comparisons people ask for.** The VectorDBBench client in
    `benchmarks/vectordbbench/` run against the harness; a 768- or
    1536-dimensional dataset; a first x86 table; the cold int8 comparison
    at 5M; memory at 384 to 3072 dimensions.
-5. **Operations.** A `close()` and context manager in Python; an export
-   command; a checkpoint that runs off the write path instead of inside
-   the insert that triggers it; incremental index maintenance so a
+5. **Operations.** A checkpoint that runs off the write path instead of
+   inside the insert that triggers it; incremental index maintenance so a
    long-running store does not need a full rebuild per checkpoint; a
    documented backup and restore drill; a support policy for corruption
    reports and compatibility regressions.

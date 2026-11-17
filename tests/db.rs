@@ -3385,3 +3385,94 @@ fn neighbors_follow_the_graph() {
     assert_eq!(db.neighbors(500), None, "a tail record has no node yet");
     assert_eq!(db.neighbors(9999), None);
 }
+
+#[test]
+fn batch_edge_cases_and_missing_ids() {
+    use sanadb::Batch;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edge.sana");
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    // An empty batch writes nothing and is not an error.
+    db.write_batch(Batch::new()).unwrap();
+    assert_eq!(db.stats().batches, 0);
+    // The same id twice in one batch: the last frame wins, as in replay order.
+    db.write_batch(
+        Batch::new()
+            .insert(7, &vec_of(4, 7), meta(&[("v", "first")]))
+            .insert(7, &vec_of(4, 70), meta(&[("v", "second")]))
+            .insert(8, &vec_of(4, 8), HashMap::new())
+            .delete(8),
+    )
+    .unwrap();
+    assert_eq!(db.len(), 1);
+    assert_eq!(db.get(7).unwrap().0, vec_of(4, 70));
+    assert_eq!(db.get(7).unwrap().1["v"], "second");
+    assert!(db.get(8).is_none(), "insert then delete in one batch: gone");
+    // Missing ids: get is None, delete is false, neighbors is None.
+    assert!(db.get(999).is_none());
+    assert!(!db.delete(999).unwrap());
+    assert_eq!(db.neighbors(999), None);
+    // k larger than the store: every record, nothing more, before and after a checkpoint.
+    assert_eq!(db.search(&vec_of(4, 7), 50).unwrap().len(), 1);
+    db.checkpoint().unwrap();
+    assert_eq!(db.search(&vec_of(4, 7), 50).unwrap().len(), 1);
+    assert_eq!(db.get(7).unwrap().1["v"], "second");
+    // The same after a reopen: replay agrees with the live store.
+    drop(db);
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    assert_eq!(db.len(), 1);
+    assert_eq!(db.get(7).unwrap().0, vec_of(4, 70));
+    assert!(db.get(8).is_none());
+}
+
+#[test]
+fn failed_log_sync_keeps_the_data_and_the_handle() {
+    use sanadb::fault::{Fault, set_fault};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.sana");
+    let db = Db::open(&path, Options::new(4)).unwrap();
+    db.write_batch(
+        sanadb::Batch::new()
+            .insert(1, &vec_of(4, 1), HashMap::new())
+            .insert(2, &vec_of(4, 2), HashMap::new()),
+    )
+    .unwrap();
+    // The fsync after a committed batch fails: the error is reported, the
+    // data is still there, the handle keeps working, the next sync succeeds.
+    set_fault(&path, Some(Fault::LogSync));
+    assert!(matches!(db.sync(), Err(sanadb::Error::Io(_))));
+    assert_eq!(db.len(), 2);
+    db.insert(3, &vec_of(4, 3), HashMap::new()).unwrap();
+    db.sync().unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(db.len(), 3);
+    drop(db);
+    assert_eq!(Db::open(&path, Options::new(4)).unwrap().len(), 3);
+}
+
+#[test]
+fn dropped_log_bytes_are_counted() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("count.sana");
+    {
+        let db = Db::open(&path, Options::new(2)).unwrap();
+        db.insert(1, &[1.0, 1.0], HashMap::new()).unwrap();
+        db.sync().unwrap();
+    }
+    // A clean reopen drops nothing: growth slack is zeros, not damage.
+    {
+        let db = Db::open(&path, Options::new(2)).unwrap();
+        assert_eq!(db.stats().log_truncated_bytes, 0);
+    }
+    // Seven bytes of a frame that never completed.
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&[0x20, 0, 0, 0, 1, 2, 3])
+        .unwrap();
+    let db = Db::open(&path, Options::new(2)).unwrap();
+    assert_eq!(db.len(), 1);
+    assert_eq!(db.stats().log_truncated_bytes, 7);
+}
