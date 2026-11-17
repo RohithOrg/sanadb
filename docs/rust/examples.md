@@ -1,7 +1,7 @@
 # Rust examples
 
 Complete programs with the output they printed, run on 16 November 2026
-with sanadb 0.2.6. Every file is in the repository under `examples/`;
+with sanadb 0.2.7. Every file is in the repository under `examples/`;
 `cargo run --release --example <name>` runs one. Copy one and change the
 data.
 

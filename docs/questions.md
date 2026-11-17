@@ -3,7 +3,7 @@
 A reviewer asked these questions of sanadb as a candidate for production
 use. Each gets one of three answers. **Yes**: proven, with where the
 proof lives. **Partly**: true in part, with what is missing. **No**: a
-gap. The gaps feed the [roadmap](roadmap.md). Answers are as of 0.2.6,
+gap. The gaps feed the [roadmap](roadmap.md). Answers are as of 0.2.7,
 17 November 2026; the test names are in `tests/db.rs`.
 
 Tally: 37 yes, 50 partly, 17 no.

@@ -1,6 +1,6 @@
 [package]
 name = "sanadb-studio"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.89"
 description = "Local web UI for a sanadb store: browse, search, map, watch the walk, edit metadata"
@@ -16,7 +16,7 @@ name = "sanadb-studio"
 path = "src/main.rs"
 
 [dependencies]
-sanadb = { path = "..", version = "0.2.6" }
+sanadb = { path = "..", version = "0.2.7" }
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -7,10 +7,24 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-17
+
 ### Fixed
 - Python: `auto_checkpoint_delta` and `auto_checkpoint_garbage` defaulted
   to 0 since 0.2.4, which turned automatic checkpoints off for Python
-  stores (Rust kept 250,000 and 100,000). The Python defaults now match.
+  stores (Rust kept 250,000 and 100,000). The Python defaults now match,
+  with a test that the default checkpoints and that 0 turns it off.
+
+### Added
+- `docs/questions.md`: 104 reviewer questions, each answered yes,
+  partly or no with the proof or the gap; the roadmap is rewritten from
+  the gaps. `scripts/ci-local.sh` now builds the Python bindings from
+  source in Docker and runs their tests on both architectures.
+
+### Changed
+- Documented that an automatic checkpoint runs inside the write that
+  triggers it; the knob table had the defaults wrong (0 instead of
+  250,000 and 100,000).
 
 ## [0.2.6] - 2026-11-16
 

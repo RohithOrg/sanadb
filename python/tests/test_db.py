@@ -298,3 +298,18 @@ def test_embedding_function_add_and_query(tmp_path):
     plain = sanadb.Db(str(tmp_path / "p.sana"), dim=16)
     with pytest.raises(ValueError):
         plain.add(["x"])
+
+
+def test_auto_checkpoint_defaults_match_rust(tmp_path):
+    """The Python defaults are Rust's: 250,000 records in the tail (and a
+    tail at least as large as the index) checkpoints on their own. 0.2.4
+    to 0.2.6 shipped with 0, which turned the automatic checkpoint off."""
+    db = sanadb.Db(str(tmp_path / "auto.sana"), dim=2)
+    vectors = np.random.rand(250_000, 2).astype("f4")
+    db.insert_many(list(range(250_000)), vectors)
+    assert db.stats()["checkpoints"] == 1
+    assert db.delta_len == 0
+    off = sanadb.Db(str(tmp_path / "off.sana"), dim=2, auto_checkpoint_delta=0, auto_checkpoint_garbage=0)
+    off.insert_many(list(range(250_000)), vectors)
+    assert off.stats()["checkpoints"] == 0
+    assert off.delta_len == 250_000
