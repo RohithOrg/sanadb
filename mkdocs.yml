@@ -39,6 +39,7 @@ nav:
   - Benchmarks: benchmarks.md
   - File format: FORMAT.md
   - Status, limits and roadmap: roadmap.md
+  - 104 questions, answered: questions.md
   - Design notes:
       - Snapshot and tail: design/snapshot-and-tail.md
       - Typed metadata and filtered search: design/typed-metadata-and-filtered-search.md

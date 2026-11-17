@@ -34,13 +34,15 @@ Filter = Union[Mapping[str, Any], Callable[[Metadata], bool]]
 A disk-first vector + metadata store at `path` (a file; the index
 lives beside it as `<path>.idx.<id>`).
 
-### `__init__(path: str, dim: int, *, metric: str = 'l2', search_beam: int = 64, max_search_beam: int = 4096, io_width: int = 4, sync_every_write: bool = False, pq: bool = True, max_degree: int = 32, build_beam: int = 100, alpha: float = 1.2, read_only: bool = False, storage: str = 'f32', text_field: Optional[str] = None, embedding_function: Optional[Callable[[list[str]], npt.ArrayLike]] = None, auto_checkpoint_delta: int = 0, auto_checkpoint_garbage: int = 0) -> None`
+### `__init__(path: str, dim: int, *, metric: str = 'l2', search_beam: int = 64, max_search_beam: int = 4096, io_width: int = 4, sync_every_write: bool = False, pq: bool = True, max_degree: int = 32, build_beam: int = 100, alpha: float = 1.2, read_only: bool = False, storage: str = 'f32', text_field: Optional[str] = None, embedding_function: Optional[Callable[[list[str]], npt.ArrayLike]] = None, auto_checkpoint_delta: int = 250000, auto_checkpoint_garbage: int = 100000) -> None`
 
 `embedding_function` maps a list of texts to an (n, dim) array; it
 enables `add()` and `query()`, like Chroma's embedding functions.
 `auto_checkpoint_delta` checkpoints once that many records sit in the
-tail; `auto_checkpoint_garbage` once the log holds that many more
-entries than live records. 0 is off.
+tail (and the tail is at least as large as the index);
+`auto_checkpoint_garbage` once the log holds that many more entries
+than live records. 0 turns one off. The checkpoint runs inside the
+insert that triggers it, so that one insert takes as long as a build.
 
 ### `dim` (property)
 

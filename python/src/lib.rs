@@ -266,13 +266,15 @@ impl PyDb {
     ///
     /// auto_checkpoint_delta=N checkpoints once N records sit in the tail
     /// (and the tail is at least as large as the index); auto_checkpoint_garbage=N
-    /// once the log holds N more entries than live records. 0 (default) is off.
+    /// once the log holds N more entries than live records. Defaults 250,000
+    /// and 100,000, as in Rust; 0 turns one off. The checkpoint runs inside
+    /// the insert that triggers it, so that insert takes as long as a build.
     ///
     /// read_only=True opens an existing store beside its writer (any process):
     /// no lock is taken, reads follow the writer's appends and checkpoints,
     /// and writes raise PermissionError.
     #[new]
-    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None, embedding_function = None, auto_checkpoint_delta = 0, auto_checkpoint_garbage = 0))]
+    #[pyo3(signature = (path, dim, *, metric = "l2", search_beam = 64, max_search_beam = 4096, io_width = 4, sync_every_write = false, pq = true, max_degree = 32, build_beam = 100, alpha = 1.2, read_only = false, storage = "f32", text_field = None, embedding_function = None, auto_checkpoint_delta = 250_000, auto_checkpoint_garbage = 100_000))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,

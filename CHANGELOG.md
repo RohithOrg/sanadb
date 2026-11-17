@@ -7,6 +7,11 @@ the new version migrates old stores on open.
 
 ## [Unreleased]
 
+### Fixed
+- Python: `auto_checkpoint_delta` and `auto_checkpoint_garbage` defaulted
+  to 0 since 0.2.4, which turned automatic checkpoints off for Python
+  stores (Rust kept 250,000 and 100,000). The Python defaults now match.
+
 ## [0.2.6] - 2026-11-16
 
 No code changes: the first release after the return to PyPI trusted

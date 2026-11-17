@@ -139,12 +139,15 @@ its map.
 | `graph.build_beam` (L) | 100 | candidate list during build |
 | `graph.use_pq` | true | 32 bytes of codes per node in RAM; the walk scores from them and re-ranks exactly |
 | `storage` | f32 | `Storage::I8` halves the index file; recall within a point on SIFT |
-| `auto_checkpoint_delta` | 0 | checkpoint once the tail holds this many records and is at least as large as the index |
-| `auto_checkpoint_garbage` | 0 | checkpoint once the log holds this many more entries than live records |
+| `auto_checkpoint_delta` | 250,000 | checkpoint once the tail holds this many records and is at least as large as the index; 0 turns it off |
+| `auto_checkpoint_garbage` | 100,000 | checkpoint once the log holds this many more entries than live records; 0 turns it off |
 | `text_field` | none | metadata key indexed for keyword search |
 | `sync_every_write` | false | fsync every write |
 
 A checkpoint is the one heavy operation: it builds the graph over every
 record (or updates it in place when the tail is smaller than the indexed
 set) with all cores, and writes a new index file of about `n × block`
-bytes. Run it on a schedule, on `auto_checkpoint_*`, or after a bulk load.
+bytes. An automatic checkpoint runs inside the write that triggers it, so
+that one write takes as long as a build; call `checkpoint()` yourself
+from a timer or after a bulk load if that pause must not land on a
+request.

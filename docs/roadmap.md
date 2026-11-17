@@ -2,20 +2,25 @@
 
 ## Where it stands
 
-0.2.0 is the first release with the on-disk format frozen, a byte-level
-specification, readers in other processes, atomic batches, typed metadata
-with filter-aware search, keyword and sparse search with hybrid fusion,
-int8 storage, fault-injection and soak tests, and stores from every
-published version opened by the test suite. The numbers in
-[benchmarks.md](benchmarks.md) are measured, reproducible, and from one
-laptop.
+0.2.x has the on-disk format frozen and specified byte for byte, readers
+in other processes, atomic batches, typed metadata with filter-aware
+search, keyword and sparse search with hybrid fusion, int8 storage,
+store properties, an embedding hook in both languages, fault-injection
+and soak tests, stores from every published version opened by the test
+suite, and studio: a local page that maps a store in 2D or 3D, searches
+it every way, draws the walk and the graph, and edits records. The
+numbers in [benchmarks.md](benchmarks.md) are measured, reproducible,
+and from one laptop; dense retrieval with a real model reproduces the
+model's published quality.
 
 What it does not have is a track record. Nobody has run it in production;
-the project is a few weeks old. Treat 0.2.0 as a serious beta: keep
+the project is a few weeks old. Treat 0.2.x as a serious beta: keep
 backups (`Db::backup`), run the soak script against your own workload
-shape, and read the limits below before depending on it.
+shape, and read the limits below before depending on it. A reviewer's
+104 questions, each answered with what is proven, what is partly there
+and what is missing, are on [questions.md](questions.md).
 
-## Limits as of 0.2.0
+## Limits as of 0.2.6
 
 - One writer per store. Readers in any number of processes, but a second
   writer is refused. No streaming replication; replication is backup and
@@ -45,30 +50,43 @@ shape, and read the limits below before depending on it.
 
 ## Roadmap
 
-In rough order.
+What stands between 0.2.6 and something you would run in production, in
+the order it is being worked. The gaps in [questions.md](questions.md)
+feed this list.
 
-1. **0.2.0 release.** The checklist is done except the cold int8
-   comparison at 5M.
-2. **Hybrid search, the rest.** MaxScore for long posting lists, weighted
-   fusion as an alternative to reciprocal rank, a BEIR number for sparse
-   retrieval with a SPLADE encoding. Design note:
+1. **Evidence under load.** A longer soak (hours, not minutes) with the
+   writer, checkpoints and readers in separate processes on a store
+   larger than RAM, with latency percentiles recorded during the writes;
+   the rare `Locked`-with-no-writer case chased to its cause instead of a
+   retry window; crash tests on Linux x86 as well as arm64. These
+   produce the track record; nothing else does.
+2. **Hybrid search, the rest.** MaxScore for long posting lists (keyword
+   search at millions of documents is unmeasured), weighted fusion as an
+   alternative to reciprocal rank, a BEIR number for hybrid and for
+   sparse retrieval with a SPLADE encoding. Design note:
    [design/hybrid-search.md](design/hybrid-search.md).
-3. **Filtered search at moderate selectivity.** A filter-aware edge budget
-   at build (ACORN-style) or a smaller result heap for filtered walks;
+3. **Filtered search at moderate selectivity.** A filter-aware edge
+   budget at build (ACORN-style) or a smaller result heap for filtered
+   walks; a scan-or-walk threshold that accounts for the vector width;
    measure on the YFCC filter track at 10M.
-4. **More comparisons.** The VectorDBBench client in
-   `benchmarks/vectordbbench/` run against the harness; more
-   ann-benchmarks datasets; a first x86 table.
-5. **x86 kernels** for build, exact scan and re-ranking, and a fused int8
+4. **Comparisons people ask for.** A page against SQLite with sqlite-vec
+   and against LanceDB; the VectorDBBench client in
+   `benchmarks/vectordbbench/` run against the harness; a 768- or
+   1536-dimensional dataset; a first x86 table; the cold int8 comparison
+   at 5M; memory at 384 to 3072 dimensions.
+5. **Operations.** A `close()` and context manager in Python; an export
+   command; a checkpoint that runs off the write path instead of inside
+   the insert that triggers it; incremental index maintenance so a
+   long-running store does not need a full rebuild per checkpoint; a
+   documented backup and restore drill; a support policy for corruption
+   reports and compatibility regressions.
+6. **x86 kernels** for build, exact scan and re-ranking, and a fused int8
    kernel. Query latency is memory-bound and will not move; builds and
    scans will.
-6. **1.0.** Same format, the promise extended to a major version; what
+7. **Studio.** Import from JSONL and CSV; a diff of two stores; an
+   embedding model chosen from the page rather than the command line.
+8. **1.0.** Same format, the promise extended to a major version; what
    remains is a year of other people's workloads.
-7. **sanadb studio**, the rest. The first version ([studio.md](studio.md))
-   opens a store, maps it, searches it every way, shows the walk and edits
-   records. Next: sparse-vector queries from the page, cluster labels
-   from metadata, a view of the log and index files, and shipping it as a
-   release binary.
 
 ## Not planned
 
